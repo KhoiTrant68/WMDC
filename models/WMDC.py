@@ -329,9 +329,7 @@ class WMDC(CompressionModel):
         non_anchor_split = non_anchor.chunk(self.num_slices, 1)
 
         ctx_params_anchor_split = torch.split(
-            torch.zeros(B, self.slice_ch_lf * 2, y_shape[0] // 2, y_shape[1] // 2).to(
-                x.device
-            ),
+            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, y_shape[0] // 2, y_shape[1] // 2).to(x.device),
             [2 * self.slice_ch_lf for _ in range(self.num_slices)],
             1,
         )
@@ -512,7 +510,7 @@ class WMDC(CompressionModel):
         y_lf_hat_slices = []
 
         ctx_params_anchor_split = torch.split(
-            torch.zeros(B, self.slice_ch_lf * 2, H_wave, W_wave).to(x.device),
+            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(x.device),
             [2 * self.slice_ch_lf for _ in range(self.num_slices)],
             1,
         )
@@ -742,7 +740,7 @@ class WMDC(CompressionModel):
         y_lf_hat_slices = []
 
         ctx_params_anchor_split = torch.split(
-            torch.zeros(B, self.slice_ch_lf * 2, H_wave, W_wave).to(z_hat.device),
+            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(z_hat.device),
             [2 * self.slice_ch_lf for _ in range(self.num_slices)],
             1,
         )
