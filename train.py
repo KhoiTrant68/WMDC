@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from compressai.datasets import ImageFolder
 from pytorch_msssim import ms_ssim
@@ -254,7 +254,8 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
 
     save_path = os.path.join(args.save_path, str(args.lmbda))
