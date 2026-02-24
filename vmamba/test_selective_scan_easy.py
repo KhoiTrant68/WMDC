@@ -213,7 +213,7 @@ class SelectiveScanEasy(torch.autograd.Function):
         return oys, hprefix.view(B, G * D, N)
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, doys: torch.Tensor, *args):
         DEBUG = getattr(ctx, "DEBUG", False)
         us, dts, As, Bs, Cs, Ds, delta_bias, ohs = ctx.saved_tensors
@@ -1008,7 +1008,7 @@ class SelectiveScanMatrix(torch.autograd.Function):
         )
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, doys: torch.Tensor, *args):
         mask, us, dts, As, Bs, Cs, Ds, delta_bias, ohs = ctx.saved_tensors
 

@@ -9,7 +9,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from torch.cuda.amp import custom_bwd, custom_fwd
 
 
 def build_selective_scan_fn(
