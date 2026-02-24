@@ -27,19 +27,20 @@ class SWAtten(AttentionBlock):
             self.non_local_block = SwinBlock(
                 inter_dim, inter_dim, head_dim, window_size, drop_path
             )
+            self.in_conv = conv1x1(input_dim, inter_dim)
+            self.out_conv = conv1x1(inter_dim, output_dim)
         else:
             super().__init__(N=input_dim)
             self.non_local_block = SwinBlock(
                 input_dim, input_dim, head_dim, window_size, drop_path
             )
-        if inter_dim is not None:
-            self.in_conv = conv1x1(input_dim, inter_dim)
-            self.out_conv = conv1x1(inter_dim, output_dim)
             
         self.window_size = window_size  # Save window size for dynamic padding
 
     def forward(self, x):
-        x = self.in_conv(x)
+        if hasattr(self, 'in_conv'):
+            x = self.in_conv(x)
+            
         identity = x
         
         # --- DYNAMIC PADDING FOR SWIN BLOCK ---
@@ -65,7 +66,10 @@ class SWAtten(AttentionBlock):
         b = self.conv_b(z)
         out = a * torch.sigmoid(b)
         out += identity
-        out = self.out_conv(out)
+        
+        if hasattr(self, 'out_conv'):
+            out = self.out_conv(out)
+            
         return out
 
 
