@@ -129,18 +129,20 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
+        unwrapped = accelerator.unwrap_model(model)
+        aux_loss = unwrapped.aux_loss()
+
         if torch.isnan(out_criterion["loss"]):
             continue
 
-        accelerator.backward(out_criterion["loss"])
-        if clip_max_norm > 0:
-            accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
-        optimizer.step()
+        total_loss = out_criterion["loss"] + aux_loss
+        accelerator.backward(total_loss)
 
-        # Update Aux Loss and EMA
-        unwrapped = accelerator.unwrap_model(model)
-        aux_loss = unwrapped.aux_loss()
-        accelerator.backward(aux_loss)
+        if clip_max_norm > 0:
+            main_params = [p for n, p in model.named_parameters() if not n.endswith(".quantiles")]
+            accelerator.clip_grad_norm_(main_params, clip_max_norm)
+        
+        optimizer.step()
         aux_optimizer.step()
 
         if ema_model is not None:
@@ -316,7 +318,6 @@ def main(argv):
             is_best = loss < best_loss
             best_loss = min(loss, best_loss)
             
-            # FIX: Store auxiliary optimizer so momentum for entropy bottlenecks is maintained
             state = {
                 "epoch": epoch,
                 "state_dict": accelerator.unwrap_model(net).state_dict(),
