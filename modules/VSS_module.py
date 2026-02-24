@@ -1276,17 +1276,25 @@ class SwinBlock(nn.Module):
         self.window_size = window_size
 
     def forward(self, x):
+        B, C, H, W = x.shape
+        # Calculate padding needed to make dimensions divisible by window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+
         resize = False
-        if (x.size(-1) <= self.window_size) or (x.size(-2) <= self.window_size):
-            padding_row = (self.window_size - x.size(-2)) // 2
-            padding_col = (self.window_size - x.size(-1)) // 2
-            x = F.pad(x, (padding_col, padding_col + 1, padding_row, padding_row + 1))
+        # Pad if necessary
+        if pad_b > 0 or pad_r > 0:
+            x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
+            resize = True
+
+        # Convert CHW to HWC
         trans_x = Rearrange("b c h w -> b h w c")(x)
         trans_x = self.block_1(trans_x)
         trans_x = self.block_2(trans_x)
         trans_x = Rearrange("b h w c -> b c h w")(trans_x)
+
+        # Crop back to original dimensions if padding was applied
         if resize:
-            x = F.pad(
-                x, (-padding_col, -padding_col - 1, -padding_row, -padding_row - 1)
-            )
+            trans_x = trans_x[:, :, :H, :W]
+
         return trans_x

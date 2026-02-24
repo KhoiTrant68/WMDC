@@ -34,42 +34,42 @@ class SWAtten(AttentionBlock):
             self.non_local_block = SwinBlock(
                 input_dim, input_dim, head_dim, window_size, drop_path
             )
-            
+
         self.window_size = window_size  # Save window size for dynamic padding
 
     def forward(self, x):
-        if hasattr(self, 'in_conv'):
+        if hasattr(self, "in_conv"):
             x = self.in_conv(x)
-            
+
         identity = x
-        
+
         # --- DYNAMIC PADDING FOR SWIN BLOCK ---
         B, C, H, W = x.shape
         pad_r = (self.window_size - x.size(-1) % self.window_size) % self.window_size
         pad_b = (self.window_size - x.size(-2) % self.window_size) % self.window_size
-        
+
         # Pad tensor if H or W is not a multiple of window_size
         if pad_r > 0 or pad_b > 0:
             x_padded = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
         else:
             x_padded = x
-            
+
         # Process through SwinBlock
         z = self.non_local_block(x_padded)
-        
+
         # Crop back to original exact dimensions
         if pad_r > 0 or pad_b > 0:
             z = z[:, :, :H, :W]
         # --------------------------------------
-        
+
         a = self.conv_a(x)
         b = self.conv_b(z)
         out = a * torch.sigmoid(b)
         out += identity
-        
-        if hasattr(self, 'out_conv'):
+
+        if hasattr(self, "out_conv"):
             out = self.out_conv(out)
-            
+
         return out
 
 
@@ -354,7 +354,12 @@ class WMDC(CompressionModel):
         non_anchor_split = non_anchor.chunk(self.num_slices, 1)
 
         ctx_params_anchor_split = torch.split(
-            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, y_shape[0] // 2, y_shape[1] // 2).to(x.device),
+            torch.zeros(
+                B,
+                self.slice_ch_lf * 2 * self.num_slices,
+                y_shape[0] // 2,
+                y_shape[1] // 2,
+            ).to(x.device),
             [2 * self.slice_ch_lf for _ in range(self.num_slices)],
             1,
         )
@@ -535,7 +540,9 @@ class WMDC(CompressionModel):
         y_lf_hat_slices = []
 
         ctx_params_anchor_split = torch.split(
-            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(x.device),
+            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(
+                x.device
+            ),
             [2 * self.slice_ch_lf for _ in range(self.num_slices)],
             1,
         )
@@ -765,7 +772,9 @@ class WMDC(CompressionModel):
         y_lf_hat_slices = []
 
         ctx_params_anchor_split = torch.split(
-            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(z_hat.device),
+            torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(
+                z_hat.device
+            ),
             [2 * self.slice_ch_lf for _ in range(self.num_slices)],
             1,
         )

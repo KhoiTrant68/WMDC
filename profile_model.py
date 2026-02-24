@@ -1,7 +1,8 @@
 import torch
 from calflops import calculate_flops
 
-from models.WMDC import WMDC 
+from models.WMDC import WMDC
+
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -9,7 +10,7 @@ def main():
 
     print("Initializing WMDC model...")
     model = WMDC(N=192, M=320, num_slices=5).to(device)
-    model.eval() 
+    model.eval()
 
     batch_size = 1
     input_shape = (batch_size, 3, 256, 256)
@@ -28,23 +29,21 @@ def main():
 
     print("\nCalculating FLOPs, MACs, and Params (this may take a few seconds)...")
     flops, macs, params = calculate_flops(
-        model=model, 
-        input_shape=input_shape,
-        output_as_string=True,
-        output_precision=4
+        model=model, input_shape=input_shape, output_as_string=True, output_precision=4
     )
-    
+
     # 5. Print Results
-    print("\n" + "="*40)
+    print("\n" + "=" * 40)
     print("          MODEL PROFILING RESULTS         ")
-    print("="*40)
+    print("=" * 40)
     print("Model:  WMDC(N=192, M=320)")
     print("Image:  256x256 RGB")
     print("-" * 40)
     print(f"FLOPs:  {flops}")
     print(f"MACs:   {macs}")
     print(f"Params: {params}")
-    print("="*40 + "\n")
+    print("=" * 40 + "\n")
+
 
 if __name__ == "__main__":
     main()
