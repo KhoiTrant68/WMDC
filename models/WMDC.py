@@ -45,8 +45,8 @@ class SWAtten(AttentionBlock):
         
         # --- DYNAMIC PADDING FOR SWIN BLOCK ---
         B, C, H, W = x.shape
-        pad_r = (self.window_size - W % self.window_size) % self.window_size
-        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        pad_r = (self.window_size - x.size(-1) % self.window_size) % self.window_size
+        pad_b = (self.window_size - x.size(-2) % self.window_size) % self.window_size
         
         # Pad tensor if H or W is not a multiple of window_size
         if pad_r > 0 or pad_b > 0:
