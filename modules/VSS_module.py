@@ -58,7 +58,7 @@ def deconv(in_channels, out_channels, kernel_size=5, stride=2):
 
 class SelectiveScanOflex(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         u,
@@ -258,7 +258,7 @@ def cross_selective_scan(
 
 class SelectiveScanMamba(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         u,
@@ -308,7 +308,7 @@ class SelectiveScanMamba(torch.autograd.Function):
 
 class SelectiveScanCore(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd
+    @torch.amp.custom_fwd(device_type="cuda")
     def forward(
         ctx,
         u,
