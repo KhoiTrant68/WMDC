@@ -265,7 +265,7 @@ def main(argv):
         writer = SummaryWriter(os.path.join(save_path, "tensorboard"))
 
     # Model + EMA Strategy
-    net = WMDC(N=args.N, M=args.M, num_slices=5).to(accelerator.device)
+    net = WMDC(N=args.N, M=args.M, num_slices=5)
     ema_model = ModelEmaV2(net, decay=0.999)
     ema_model.module.to(accelerator.device)
 
