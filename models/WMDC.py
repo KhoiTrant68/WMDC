@@ -35,11 +35,32 @@ class SWAtten(AttentionBlock):
         if inter_dim is not None:
             self.in_conv = conv1x1(input_dim, inter_dim)
             self.out_conv = conv1x1(inter_dim, output_dim)
+            
+        self.window_size = window_size  # Save window size for dynamic padding
 
     def forward(self, x):
         x = self.in_conv(x)
         identity = x
-        z = self.non_local_block(x)
+        
+        # --- DYNAMIC PADDING FOR SWIN BLOCK ---
+        B, C, H, W = x.shape
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        
+        # Pad tensor if H or W is not a multiple of window_size
+        if pad_r > 0 or pad_b > 0:
+            x_padded = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
+        else:
+            x_padded = x
+            
+        # Process through SwinBlock
+        z = self.non_local_block(x_padded)
+        
+        # Crop back to original exact dimensions
+        if pad_r > 0 or pad_b > 0:
+            z = z[:, :, :H, :W]
+        # --------------------------------------
+        
         a = self.conv_a(x)
         b = self.conv_b(z)
         out = a * torch.sigmoid(b)
@@ -79,21 +100,21 @@ class WMDC(CompressionModel):
         # C. HYPER-PRIOR AUTOENCODER (Mamba-Enhanced)
         # ----------------------------------------------------------------------
         self.h_a = nn.Sequential(
-            conv(4 * M, N, kernel_size=3, stride=2),
+            conv(4 * M, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
-            conv(N, 192, kernel_size=3, stride=2),
+            conv(N, 192, kernel_size=5, stride=2),
         )
         self.entropy_bottleneck = EntropyBottleneck(192)
 
         self.h_mean_s = nn.Sequential(
-            deconv(192, N, kernel_size=3, stride=2),
+            deconv(192, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
-            deconv(N, 4 * M, kernel_size=3, stride=2),
+            deconv(N, 4 * M, kernel_size=5, stride=2),
         )
         self.h_scale_s = nn.Sequential(
-            deconv(192, N, kernel_size=3, stride=2),
+            deconv(192, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
-            deconv(N, 4 * M, kernel_size=3, stride=2),
+            deconv(N, 4 * M, kernel_size=5, stride=2),
         )
 
         # ----------------------------------------------------------------------
