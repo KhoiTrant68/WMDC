@@ -1,9 +1,7 @@
 import argparse
 import math
-import random
 import sys
 import os
-import time
 import logging
 from datetime import datetime
 
@@ -17,15 +15,12 @@ from torchvision.utils import make_grid
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-# Accelerate Imports
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 
-# Import CompressAI datasets/utils
 from compressai.datasets import ImageFolder
 from pytorch_msssim import ms_ssim
 
-# Import your model
 from models.WMDC import WMDC
 
 # =========================================================
@@ -33,7 +28,6 @@ from models.WMDC import WMDC
 # =========================================================
 
 def setup_logger(log_dir):
-    # Only setup logger on main process
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     
@@ -158,19 +152,14 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
     loss_meter = AverageMeter()
     bpp_meter = AverageMeter()
     
-    # Only show progress bar on main process
     pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}", disable=not accelerator.is_local_main_process)
     
     for i, d in pbar:
-        # NOTE: No d.to(device) needed, Accelerator handles it
-        
-        # --- 1. Main Optimizer Step ---
         optimizer.zero_grad()
         out_net = model(d)
         
         out_criterion = criterion(out_net, d)
         
-        # Accelerate backward
         accelerator.backward(out_criterion["loss"])
         
         if clip_max_norm > 0:
@@ -178,8 +167,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
             
         optimizer.step()
 
-        # --- 2. Aux Optimizer Step (Entropy Bottleneck) ---
-        # We need to unwrap the model to access .aux_loss() because DDP wraps it
         unwrapped_model = accelerator.unwrap_model(model)
         aux_loss = unwrapped_model.aux_loss()
             
@@ -187,9 +174,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         accelerator.backward(aux_loss)
         aux_optimizer.step()
 
-        # --- 3. Logging ---
-        # Gather metrics across GPUs for accurate logging (optional but good for debugging)
-        # For speed, we often just log rank 0, but gathering ensures we see global stats
         loss_val = out_criterion["loss"].item()
         bpp_val = out_criterion["bpp_loss"].item()
         
@@ -222,10 +206,8 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             out_net = model(d_padded)
             out_net["x_hat"].clamp_(0, 1)
             
-            # Crop back
             x_hat = crop_image(out_net["x_hat"], padding)
             
-            # Loss Calc (Calculate per-image locally first)
             num_pixels = d.size(0) * d.size(2) * d.size(3)
             bpp_val = compute_bpp(out_net, num_pixels)
             mse_val = F.mse_loss(x_hat, d)
@@ -291,13 +273,11 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # --- ACCELERATOR SETUP ---
     # find_unused_parameters=True is CRITICAL for Mamba/VSS models in DDP
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
 
-    # Logging setup (Rank 0 only)
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
     logger = None
     writer = None
@@ -307,7 +287,6 @@ def main():
         writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
         logger.info(f"Training started with Accelerate. Config: {args}")
 
-    # Data Loading
     train_transforms = transforms.Compose([
         transforms.RandomCrop(args.patch_size),
         transforms.RandomHorizontalFlip(),
@@ -321,38 +300,31 @@ def main():
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
     
-    # NOTE: accelerator handles samplers/shuffling automatically
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    # Model Initialization
     if accelerator.is_main_process:
         logger.info("Initializing Model...")
         
     model = WMDC(N=args.N, M=args.M, num_slices=5)
     
-    # Optimizers
     optimizer, aux_optimizer = configure_optimizers(model, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 90], gamma=0.1)
     
-    # Prepare everything with Accelerate
-    # NOTE: Do NOT wrap model in DataParallel manually! Accelerate does DDP automatically.
     model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler = accelerator.prepare(
         model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
     )
 
     criterion = RateDistortionLoss(lmbda=args.lmbda, metric=args.metric)
 
-    # Resume Training
     start_epoch = 0
     best_loss = float("inf")
     
     if args.checkpoint:
         if accelerator.is_main_process:
             logger.info(f"Loading checkpoint: {args.checkpoint}")
-        # Unwrapped load for safety across different devices
         unwrapped_model = accelerator.unwrap_model(model)
-        ckpt = torch.load(args.checkpoint, map_location="cpu") # Load to CPU first
+        ckpt = torch.load(args.checkpoint, map_location="cpu") 
         
         unwrapped_model.load_state_dict(ckpt["state_dict"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -361,7 +333,6 @@ def main():
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("loss", float("inf"))
 
-    # Training Loop
     if accelerator.is_main_process:
         logger.info("Starting Training Loop...")
         
@@ -374,7 +345,6 @@ def main():
         test_loss = test_epoch(epoch, test_loader, model, criterion, logger, writer, accelerator)
         lr_scheduler.step()
 
-        # Save Checkpoint (Rank 0 only)
         if accelerator.is_main_process:
             state = {
                 "epoch": epoch,
