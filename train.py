@@ -17,6 +17,10 @@ from torchvision.utils import make_grid
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+# Accelerate Imports
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import set_seed
+
 # Import CompressAI datasets/utils
 from compressai.datasets import ImageFolder
 from pytorch_msssim import ms_ssim
@@ -29,6 +33,7 @@ from models.WMDC import WMDC
 # =========================================================
 
 def setup_logger(log_dir):
+    # Only setup logger on main process
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     
@@ -147,54 +152,61 @@ def configure_optimizers(net, args):
 #  TRAINING LOOP
 # =========================================================
 
-def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, logger, writer, device):
+def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, logger, writer, accelerator):
     model.train()
     
     loss_meter = AverageMeter()
     bpp_meter = AverageMeter()
     
-    pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}")
+    # Only show progress bar on main process
+    pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}", disable=not accelerator.is_local_main_process)
     
     for i, d in pbar:
-        d = d.to(device)
+        # NOTE: No d.to(device) needed, Accelerator handles it
         
         # --- 1. Main Optimizer Step ---
         optimizer.zero_grad()
         out_net = model(d)
         
         out_criterion = criterion(out_net, d)
-        out_criterion["loss"].backward()
+        
+        # Accelerate backward
+        accelerator.backward(out_criterion["loss"])
         
         if clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
+            accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
             
         optimizer.step()
 
         # --- 2. Aux Optimizer Step (Entropy Bottleneck) ---
-        # Handle DataParallel wrapping
-        if isinstance(model, nn.DataParallel):
-            aux_loss = model.module.aux_loss()
-        else:
-            aux_loss = model.aux_loss()
+        # We need to unwrap the model to access .aux_loss() because DDP wraps it
+        unwrapped_model = accelerator.unwrap_model(model)
+        aux_loss = unwrapped_model.aux_loss()
             
         aux_optimizer.zero_grad()
-        aux_loss.backward()
+        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         # --- 3. Logging ---
-        loss_meter.update(out_criterion["loss"].item())
-        bpp_meter.update(out_criterion["bpp_loss"].item())
+        # Gather metrics across GPUs for accurate logging (optional but good for debugging)
+        # For speed, we often just log rank 0, but gathering ensures we see global stats
+        loss_val = out_criterion["loss"].item()
+        bpp_val = out_criterion["bpp_loss"].item()
+        
+        loss_meter.update(loss_val)
+        bpp_meter.update(bpp_val)
 
         pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
         
-        step = epoch * len(train_dataloader) + i
-        if i % 100 == 0 and writer is not None:
-            writer.add_scalar("Train/Total_Loss", out_criterion["loss"].item(), step)
-            writer.add_scalar("Train/Bpp", out_criterion["bpp_loss"].item(), step)
+        if accelerator.is_main_process:
+            step = epoch * len(train_dataloader) + i
+            if i % 100 == 0 and writer is not None:
+                writer.add_scalar("Train/Total_Loss", loss_val, step)
+                writer.add_scalar("Train/Bpp", bpp_val, step)
 
     return loss_meter.avg
 
-def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, device):
+def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
     model.eval()
     
     psnr_meter = AverageMeter()
@@ -203,17 +215,17 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, device)
     
     with torch.no_grad():
         for i, d in enumerate(test_dataloader):
-            d = d.to(device)
-            # Pad to ensure Mamba/Swin compatibility (often requires div by 64 or 128)
+            # Pad to ensure Mamba/Swin compatibility
             d_padded, padding = pad_image(d, p=128) 
             
             out_net = model(d_padded)
             out_net["x_hat"].clamp_(0, 1)
             
-            # Crop back to original size for metric calculation
+            # Crop back
             x_hat = crop_image(out_net["x_hat"], padding)
             
             # Loss Calc
+            # Compute locally
             bpp_val = compute_bpp(out_net, d_padded.size(0) * d_padded.size(2) * d_padded.size(3))
             mse_val = F.mse_loss(x_hat, d)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100
@@ -223,24 +235,35 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, device)
             else:
                 loss_val = criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
 
-            psnr_meter.update(psnr_val)
-            bpp_meter.update(bpp_val.item())
-            loss_meter.update(loss_val.item())
+            # Gather metrics from all GPUs
+            # Stack metrics into a tensor [psnr, bpp, loss]
+            metrics = torch.tensor([psnr_val, bpp_val, loss_val], device=accelerator.device)
+            gathered_metrics = accelerator.gather(metrics) # Returns [num_gpus * 3] or [num_gpus, 3] depending on implementation
             
-            # Save first batch image to TensorBoard
-            if i == 0 and writer is not None:
+            # Average across GPUs
+            if gathered_metrics.ndim == 1:
+                gathered_metrics = gathered_metrics.view(-1, 3)
+            
+            avg_metrics = gathered_metrics.mean(dim=0)
+            
+            psnr_meter.update(avg_metrics[0].item())
+            bpp_meter.update(avg_metrics[1].item())
+            loss_meter.update(avg_metrics[2].item())
+            
+            # Save first batch image to TensorBoard (Rank 0 only)
+            if i == 0 and accelerator.is_main_process and writer is not None:
                 comparison = torch.cat([d, x_hat], dim=0)
                 grid = make_grid(comparison, nrow=d.size(0))
                 writer.add_image("Test/Reconstruction", grid, epoch)
 
-    logger.info(
-        f"Test Epoch {epoch}: Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
-    )
-    
-    if writer is not None:
-        writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
-        writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
-        writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
+    if accelerator.is_main_process:
+        logger.info(
+            f"Test Epoch {epoch}: Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
+        )
+        if writer is not None:
+            writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
+            writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
+            writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
 
     return loss_meter.avg
 
@@ -249,7 +272,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, device)
 # =========================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="WMDC Training (Stable)")
+    parser = argparse.ArgumentParser(description="WMDC Training (Accelerate)")
     parser.add_argument("-d", "--dataset", type=str, required=True, help="Path to dataset root")
     parser.add_argument("--save_path", type=str, default="checkpoints", help="Directory to save models")
     parser.add_argument("-e", "--epochs", type=int, default=100)
@@ -264,37 +287,27 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--N", type=int, default=192)
     parser.add_argument("--M", type=int, default=320)
-    parser.add_argument("--gpu-id", type=str, default="0, 1", help="GPU IDs (e.g., '0' or '0,1')")
     return parser.parse_args()
 
 def main():
-    # --- CRITICAL SAFETY CHECK ---
-    # This prevents using 'accelerate launch' which causes the "cuda:1 and cuda:0" error
-    if "LOCAL_RANK" in os.environ:
-        print("\n[ERROR] You are running with 'accelerate launch' or DDP environment.")
-        print("[ERROR] Please run this script with standard python command:")
-        print("[ERROR] python train.py -d /path/to/dataset\n")
-        sys.exit(1)
-    
     args = parse_args()
 
-    # Device Setup
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Seeding
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    
-    # Logging
+    # --- ACCELERATOR SETUP ---
+    # find_unused_parameters=True is CRITICAL for Mamba/VSS models in DDP
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    set_seed(args.seed)
+
+    # Logging setup (Rank 0 only)
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
-    logger = setup_logger(save_dir)
-    writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
+    logger = None
+    writer = None
     
-    logger.info(f"Training started on {device}")
-    
+    if accelerator.is_main_process:
+        logger = setup_logger(save_dir)
+        writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
+        logger.info(f"Training started with Accelerate. Config: {args}")
+
     # Data Loading
     train_transforms = transforms.Compose([
         transforms.RandomCrop(args.patch_size),
@@ -309,31 +322,26 @@ def main():
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
     
+    # NOTE: accelerator handles samplers/shuffling automatically
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
 
     # Model Initialization
-    logger.info("Initializing Model...")
-    model = WMDC(N=args.N, M=args.M, num_slices=5)
-    model = model.to(device)
-    
-    # Handle Multi-GPU (DataParallel)
-    # Note: We must create optimizer AFTER wrapping with DataParallel if we want to access module parameters correctly?
-    # Actually standard practice: Wrap model -> Optimizer uses model.parameters() or model.module.parameters()
-    # DataParallel wrapper handles parameter access transparently usually, but let's be explicit for safety.
-    
-    if torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        model = nn.DataParallel(model)
+    if accelerator.is_main_process:
+        logger.info("Initializing Model...")
         
-    # Optimizers
-    # If DataParallel, model.named_parameters() returns all params. 
-    # CompressAI models sometimes have issues if we don't access params correctly.
-    # We use the underlying module for optimizer configuration to be 100% safe regarding parameter names.
-    model_ref = model.module if isinstance(model, nn.DataParallel) else model
-    optimizer, aux_optimizer = configure_optimizers(model_ref, args)
+    model = WMDC(N=args.N, M=args.M, num_slices=5)
     
+    # Optimizers
+    optimizer, aux_optimizer = configure_optimizers(model, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 90], gamma=0.1)
+    
+    # Prepare everything with Accelerate
+    # NOTE: Do NOT wrap model in DataParallel manually! Accelerate does DDP automatically.
+    model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler = accelerator.prepare(
+        model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
+    )
+
     criterion = RateDistortionLoss(lmbda=args.lmbda, metric=args.metric)
 
     # Resume Training
@@ -341,15 +349,13 @@ def main():
     best_loss = float("inf")
     
     if args.checkpoint:
-        logger.info(f"Loading checkpoint: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location=device)
+        if accelerator.is_main_process:
+            logger.info(f"Loading checkpoint: {args.checkpoint}")
+        # Unwrapped load for safety across different devices
+        unwrapped_model = accelerator.unwrap_model(model)
+        ckpt = torch.load(args.checkpoint, map_location="cpu") # Load to CPU first
         
-        # Load weights
-        if isinstance(model, nn.DataParallel):
-            model.module.load_state_dict(ckpt["state_dict"])
-        else:
-            model.load_state_dict(ckpt["state_dict"])
-            
+        unwrapped_model.load_state_dict(ckpt["state_dict"])
         optimizer.load_state_dict(ckpt["optimizer"])
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
@@ -357,36 +363,41 @@ def main():
         best_loss = ckpt.get("loss", float("inf"))
 
     # Training Loop
-    logger.info("Starting Training Loop...")
+    if accelerator.is_main_process:
+        logger.info("Starting Training Loop...")
+        
     for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(
             model, criterion, train_loader, optimizer, aux_optimizer, 
-            epoch, args.clip_max_norm, logger, writer, device
+            epoch, args.clip_max_norm, logger, writer, accelerator
         )
         
-        test_loss = test_epoch(epoch, test_loader, model, criterion, logger, writer, device)
+        test_loss = test_epoch(epoch, test_loader, model, criterion, logger, writer, accelerator)
         lr_scheduler.step()
 
-        # Save Checkpoint
-        state = {
-            "epoch": epoch,
-            "state_dict": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "aux_optimizer": aux_optimizer.state_dict(),
-            "lr_scheduler": lr_scheduler.state_dict(),
-            "loss": test_loss,
-            "args": args
-        }
-        
-        torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
-        
-        if test_loss < best_loss:
-            best_loss = test_loss
-            torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
-            logger.info("New best model saved!")
+        # Save Checkpoint (Rank 0 only)
+        if accelerator.is_main_process:
+            state = {
+                "epoch": epoch,
+                "state_dict": accelerator.unwrap_model(model).state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "aux_optimizer": aux_optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "loss": test_loss,
+                "args": args
+            }
+            
+            torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
+            
+            if test_loss < best_loss:
+                best_loss = test_loss
+                torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
+                logger.info("New best model saved!")
 
-    writer.close()
-    logger.info("Training complete.")
+    if writer is not None:
+        writer.close()
+    if accelerator.is_main_process:
+        logger.info("Training complete.")
 
 if __name__ == "__main__":
     main()
