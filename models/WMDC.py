@@ -424,14 +424,14 @@ class WMDC(CompressionModel):
             )
 
             y_non_anchor = non_anchor_split[i]
-            y_non_anchor_quantilized = (
+            y_non_anchor_quantized = (
                 ste_round(y_non_anchor - means_non_anchor) + means_non_anchor
             )
-            y_non_anchor_quantilized[:, :, 0::2, 0::2] = 0
-            y_non_anchor_quantilized[:, :, 1::2, 1::2] = 0
+            y_non_anchor_quantized[:, :, 0::2, 0::2] = 0
+            y_non_anchor_quantized[:, :, 1::2, 1::2] = 0
 
             # LRP
-            y_hat_slice = y_anchor_quantized + y_non_anchor_quantilized
+            y_hat_slice = y_anchor_quantized + y_non_anchor_quantized
             lrp = 0.5 * torch.tanh(
                 self.lrp_transforms_lf[i](torch.cat([mean_support, y_hat_slice], dim=1))
             )

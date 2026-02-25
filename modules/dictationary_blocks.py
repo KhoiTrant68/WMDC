@@ -188,7 +188,6 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         k = self.k(dt)
         k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
         dt = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
-        self.scale = self.scale.to(q.device)
         sim = torch.einsum("benc,bedc->bend", q, k)
         sim = sim * self.scale
         probs = self.softmax(sim)
