@@ -1,5 +1,6 @@
 import math
 from functools import partial
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -8,8 +9,6 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from timm.layers import DropPath, trunc_normal_
 from torch.utils import checkpoint
-
-from typing import Any, Callable
 
 from modules.csm_triton import CrossMergeTriton, CrossScanTriton, CrossScanTriton1b1
 
