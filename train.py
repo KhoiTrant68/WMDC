@@ -277,7 +277,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--N", type=int, default=192)
     parser.add_argument("--M", type=int, default=320)
-    parser.add_argument("--gpu-id", type=str, default="0", help="GPU IDs (e.g., '0' or '0,1')")
+    parser.add_argument("--gpu-id", type=str, default="0, 1", help="GPU IDs (e.g., '0' or '0,1')")
     return parser.parse_args()
 
 def main():
