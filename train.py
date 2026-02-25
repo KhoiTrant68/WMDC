@@ -184,27 +184,14 @@ def configure_optimizers(net, args):
 # =========================================================
 
 
-def train_one_epoch(
-    model,
-    criterion,
-    train_dataloader,
-    optimizer,
-    aux_optimizer,
-    epoch,
-    clip_max_norm,
-    accelerator,
-    logger,
-    writer,
-    ema_model,
-    global_step,
-    args,
-):
+def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, 
+                    clip_max_norm, accelerator, logger, writer, ema_model, global_step, args):
     model.train()
-
+    
     loss_meter = AverageMeter()
     bpp_meter = AverageMeter()
     dist_meter = AverageMeter()
-
+    
     loop = tqdm(train_dataloader, disable=not accelerator.is_local_main_process)
 
     for i, d in enumerate(loop):
@@ -213,45 +200,44 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
+        # 1. Forward Pass
         out_net = model(d)
         out_criterion = criterion(out_net, d)
         loss = out_criterion["loss"]
 
+        # 2. Auxiliary Loss
         unwrapped = accelerator.unwrap_model(model)
         aux_loss = unwrapped.aux_loss()
 
-        # NaN protection (OOM stability feature)
+        # NaN protection
         if torch.isnan(loss) or torch.isnan(aux_loss):
             logging.warning(f"NaN loss detected at step {global_step}. Skipping step.")
             continue
 
-        accelerator.backward(loss)
+        # ========================================================
+        # DDP STABILITY FIX: Combine losses for a single backward pass
+        # ========================================================
+        total_loss = loss + aux_loss
+        accelerator.backward(total_loss)
 
+        # 3. Clip gradients for main parameters only (standard CompressAI behavior)
         if clip_max_norm > 0:
-            main_params = [
-                p for n, p in model.named_parameters() if not n.endswith(".quantiles")
-            ]
+            main_params = [p for n, p in model.named_parameters() if not n.endswith(".quantiles")]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
-
+        
+        # 4. Step BOTH optimizers (they automatically update their respective parameters)
         optimizer.step()
-
-        # Aux Loss Backward
-        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         if ema_model is not None:
             ema_model.update(model)
 
-        # Logging metrics
+        # 5. Logging metrics
         batch_size = d.size(0)
         loss_meter.update(loss.item(), batch_size)
         bpp_meter.update(out_criterion["bpp_loss"].item(), batch_size)
-
-        dist_metric = (
-            out_criterion["mse_loss"].item()
-            if "mse_loss" in out_criterion
-            else out_criterion["ms_ssim_loss"].item()
-        )
+        
+        dist_metric = out_criterion["mse_loss"].item() if "mse_loss" in out_criterion else out_criterion["ms_ssim_loss"].item()
         dist_meter.update(dist_metric, batch_size)
 
         if i % args.print_freq == 0 and accelerator.is_main_process:
