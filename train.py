@@ -213,9 +213,10 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
     bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
     
+    pbar = tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc=f"Test Epoch {epoch}", disable=not accelerator.is_local_main_process)
+    count_images = 0
     with torch.no_grad():
-        for i, d in enumerate(test_dataloader):
-            # Pad to ensure Mamba/Swin compatibility
+        for i, d in pbar:
             d_padded, padding = pad_image(d, p=128) 
             
             out_net = model(d_padded)
@@ -224,9 +225,9 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             # Crop back
             x_hat = crop_image(out_net["x_hat"], padding)
             
-            # Loss Calc
-            # Compute locally
-            bpp_val = compute_bpp(out_net, d_padded.size(0) * d_padded.size(2) * d_padded.size(3))
+            # Loss Calc (Calculate per-image locally first)
+            num_pixels = d.size(0) * d.size(2) * d.size(3)
+            bpp_val = compute_bpp(out_net, num_pixels)
             mse_val = F.mse_loss(x_hat, d)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100
             
@@ -235,12 +236,9 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             else:
                 loss_val = criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
 
-            # Gather metrics from all GPUs
-            # Stack metrics into a tensor [psnr, bpp, loss]
             metrics = torch.tensor([psnr_val, bpp_val, loss_val], device=accelerator.device)
-            gathered_metrics = accelerator.gather(metrics) # Returns [num_gpus * 3] or [num_gpus, 3] depending on implementation
+            gathered_metrics = accelerator.gather(metrics) 
             
-            # Average across GPUs
             if gathered_metrics.ndim == 1:
                 gathered_metrics = gathered_metrics.view(-1, 3)
             
@@ -249,14 +247,15 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             psnr_meter.update(avg_metrics[0].item())
             bpp_meter.update(avg_metrics[1].item())
             loss_meter.update(avg_metrics[2].item())
-            
-            # Save first batch image to TensorBoard (Rank 0 only)
+            count_images += d.size(0)
             if i == 0 and accelerator.is_main_process and writer is not None:
                 comparison = torch.cat([d, x_hat], dim=0)
                 grid = make_grid(comparison, nrow=d.size(0))
                 writer.add_image("Test/Reconstruction", grid, epoch)
 
     if accelerator.is_main_process:
+        total_saw = count_images * accelerator.num_processes
+        logger.info(f"[Sanity Check] Processed approximately {total_saw} images across {accelerator.num_processes} GPUs.")
         logger.info(
             f"Test Epoch {epoch}: Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
         )
@@ -324,7 +323,7 @@ def main():
     
     # NOTE: accelerator handles samplers/shuffling automatically
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # Model Initialization
     if accelerator.is_main_process:
