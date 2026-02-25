@@ -251,7 +251,7 @@ def parse_args(argv):
     parser.add_argument("--checkpoint", type=str)
     parser.add_argument("--type", type=str, default="mse", choices=["mse", "ms-ssim"])
     parser.add_argument("--save_path", type=str, default="checkpoints")
-    parser.add_argument("--N", type=int, default=192)
+    parser.add_argument("--N", type=int, default=128)
     parser.add_argument("--M", type=int, default=320)
     parser.add_argument("--lr_epoch", nargs="+", type=int, default=[35, 45])
     parser.add_argument("--continue_train", action="store_true", default=False)
