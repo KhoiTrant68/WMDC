@@ -1,9 +1,14 @@
+import os
+# STABILITY FIX: Prevent CUDA OOM Fragmentation at the system level
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import argparse
 import logging
 import math
-import os
 import sys
 import time
+import gc
 
 import torch
 import torch.nn as nn
@@ -132,7 +137,8 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         unwrapped = accelerator.unwrap_model(model)
         aux_loss = unwrapped.aux_loss()
 
-        if torch.isnan(out_criterion["loss"]):
+        if torch.isnan(out_criterion["loss"]) or torch.isnan(aux_loss):
+            logging.warning(f"NaN loss detected at step {global_step}. Skipping step.")
             continue
 
         total_loss = out_criterion["loss"] + aux_loss
@@ -175,6 +181,9 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, writer):
     bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
 
+    torch.cuda.empty_cache()
+    gc.collect()
+
     with torch.no_grad():
         for i, d in enumerate(test_dataloader):
             d_padded, padding = pad(d, p)
@@ -201,10 +210,15 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, writer):
             loss_meter.update(metrics[:, 2].mean().item(), metrics.size(0))
 
             if i == 0 and accelerator.is_main_process:
-                n = min(d.size(0), 8)
-                comparison = torch.cat([d[:n], out_net["x_hat"][:n]], dim=0)
+                n = min(d.size(0), 4) # Limit images
+                comparison = torch.cat([d[:n].cpu(), out_net["x_hat"][:n].cpu()], dim=0)
                 grid = make_grid(comparison, nrow=n)
                 writer.add_image("Test/Reconstruction", grid, epoch)
+                del comparison, grid
+
+            del d, d_padded, out_net
+            if i % 5 == 0:
+                torch.cuda.empty_cache()
 
     if accelerator.is_main_process:
         logging.info(f"Test Epoch {epoch}: Loss {loss_meter.avg:.4f} | PSNR {psnr_meter.avg:.2f} | Bpp {bpp_meter.avg:.4f}")
@@ -333,6 +347,9 @@ def main(argv):
                 torch.save(state, os.path.join(save_path, "checkpoint_best.pth.tar"))
 
     if writer: writer.close()
+    
+    accelerator.wait_for_everyone()
+    accelerator.end_training()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
