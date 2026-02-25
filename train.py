@@ -287,7 +287,7 @@ def main(argv):
     train_transforms = transforms.Compose([transforms.RandomCrop(args.patch_size), transforms.ToTensor()])
     test_transforms = transforms.Compose([transforms.ToTensor()])
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
+    test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
