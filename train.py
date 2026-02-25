@@ -1,19 +1,15 @@
-import os
-if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import argparse
 import logging
 import math
+import os
 import sys
 import time
-import gc
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from compressai.datasets import ImageFolder
 from pytorch_msssim import ms_ssim
@@ -68,6 +64,12 @@ def crop(x, padding):
 def compute_psnr(a, b):
     mse = torch.mean((a - b) ** 2).item()
     return -10 * math.log10(mse) if mse > 0 else 100
+
+def compute_bpp(out_net):
+    size = out_net["x_hat"].size()
+    num_pixels = size[0] * size[2] * size[3]
+    return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+              for likelihoods in out_net["likelihoods"].values()).item()
 
 # =========================================================
 #  LOSS & OPTIMIZER
@@ -130,10 +132,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         unwrapped = accelerator.unwrap_model(model)
         aux_loss = unwrapped.aux_loss()
 
-        if torch.isnan(out_criterion["loss"]) or torch.isnan(aux_loss):
-            logging.warning(f"NaN loss detected at step {global_step}. Skipping step.")
-            optimizer.zero_grad()
-            aux_optimizer.zero_grad()
+        if torch.isnan(out_criterion["loss"]):
             continue
 
         total_loss = out_criterion["loss"] + aux_loss
@@ -176,22 +175,22 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, writer):
     bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
 
-    # STABILITY FIX: Clear residual memory from training phase
-    torch.cuda.empty_cache()
-    gc.collect()
-
     with torch.no_grad():
         for i, d in enumerate(test_dataloader):
             d_padded, padding = pad(d, p)
-            
             out_net = model(d_padded)
             out_net["x_hat"].clamp_(0, 1)
             out_net["x_hat"] = crop(out_net["x_hat"], padding)
 
-            out_criterion = criterion(out_net, d)
             psnr_val = compute_psnr(d, out_net["x_hat"])
-            bpp_val = out_criterion["bpp_loss"].item()
-            loss_val = out_criterion["loss"].item()
+            bpp_val = compute_bpp(out_net)
+
+            if criterion.type == "mse":
+                mse_val = torch.mean((d - out_net["x_hat"]) ** 2).item()
+                loss_val = criterion.lmbda * (255 ** 2) * mse_val + bpp_val
+            else:
+                ms_ssim_val = 1 - ms_ssim(out_net["x_hat"], d, data_range=1.0).item()
+                loss_val = criterion.lmbda * ms_ssim_val + bpp_val
 
             metrics = torch.tensor([psnr_val, bpp_val, loss_val], device=accelerator.device)
             metrics = metrics.expand(d.size(0), -1) 
@@ -201,20 +200,11 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, writer):
             bpp_meter.update(metrics[:, 1].mean().item(), metrics.size(0))
             loss_meter.update(metrics[:, 2].mean().item(), metrics.size(0))
 
-            # Logging Images
             if i == 0 and accelerator.is_main_process:
-                n = min(d.size(0), 4) # Limit to 4 images max to save memory
-                comparison = torch.cat([d[:n].cpu(), out_net["x_hat"][:n].cpu()], dim=0)
+                n = min(d.size(0), 8)
+                comparison = torch.cat([d[:n], out_net["x_hat"][:n]], dim=0)
                 grid = make_grid(comparison, nrow=n)
                 writer.add_image("Test/Reconstruction", grid, epoch)
-                del comparison, grid # Free CPU memory
-
-            # STABILITY FIX: Aggressive VRAM cleanup per validation image
-            del d, d_padded, out_net, out_criterion
-            
-            if i % 5 == 0:
-                torch.cuda.empty_cache()
-                gc.collect()
 
     if accelerator.is_main_process:
         logging.info(f"Test Epoch {epoch}: Loss {loss_meter.avg:.4f} | PSNR {psnr_meter.avg:.2f} | Bpp {bpp_meter.avg:.4f}")
@@ -264,7 +254,8 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
 
     save_path = os.path.join(args.save_path, str(args.lmbda))
@@ -275,7 +266,7 @@ def main(argv):
         writer = SummaryWriter(os.path.join(save_path, "tensorboard"))
 
     # Model + EMA Strategy
-    net = WMDC(N=args.N, M=args.M, num_slices=5).to(accelerator.device)
+    net = WMDC(N=args.N, M=args.M, num_slices=5)
     ema_model = ModelEmaV2(net, decay=0.999)
     ema_model.module.to(accelerator.device)
 
@@ -342,9 +333,6 @@ def main(argv):
                 torch.save(state, os.path.join(save_path, "checkpoint_best.pth.tar"))
 
     if writer: writer.close()
-    
-    accelerator.wait_for_everyone()
-    accelerator.end_training()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
