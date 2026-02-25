@@ -245,7 +245,7 @@ def parse_args(argv):
     parser.add_argument("-n", "--num-workers", type=int, default=4)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--patch-size", type=int, default=512)
+    parser.add_argument("--patch-size", type=int, default=256)
     parser.add_argument("--aux-learning-rate", default=1e-3, type=float)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--clip_max_norm", default=1.0, type=float)
