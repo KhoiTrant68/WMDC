@@ -68,11 +68,15 @@ def pad_image(x, p=128):
     padding_right = new_w - w - padding_left
     padding_top = (new_h - h) // 2
     padding_bottom = new_h - h - padding_top
+    if padding_left == 0 and padding_right == 0 and padding_top == 0 and padding_bottom == 0:
+        return x, (0,0,0,0)
     x_padded = F.pad(x, (padding_left, padding_right, padding_top, padding_bottom), mode="constant", value=0)
     return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
 
 def crop_image(x, padding):
     """Crops back to original size"""
+    if sum(padding) == 0:
+        return x
     return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
 
 def compute_bpp(out_net, num_pixels):
@@ -86,12 +90,11 @@ def compute_bpp(out_net, num_pixels):
 # =========================================================
 
 class RateDistortionLoss(nn.Module):
-    def __init__(self, lmbda=1e-2, metric="mse", return_type="all"):
+    def __init__(self, lmbda=1e-2, metric="mse"):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.metric = metric
-        self.return_type = return_type
 
     def forward(self, output, target):
         N, _, H, W = target.size()
@@ -135,21 +138,8 @@ def configure_optimizers(net, args):
         if n.endswith(".quantiles") and p.requires_grad
     }
 
-    # Make sure we didn't miss anything
-    params_dict = dict(net.named_parameters())
-    missing = set(params_dict.keys()) - set(parameters.keys()) - set(aux_parameters.keys())
-    if missing:
-        print(f"Warning: The following parameters are not being optimized: {missing}")
-
-    optimizer = optim.Adam(
-        parameters.values(), 
-        lr=args.learning_rate
-    )
-    
-    aux_optimizer = optim.Adam(
-        aux_parameters.values(), 
-        lr=args.aux_learning_rate
-    )
+    optimizer = optim.Adam(parameters.values(), lr=args.learning_rate)
+    aux_optimizer = optim.Adam(aux_parameters.values(), lr=args.aux_learning_rate)
 
     return optimizer, aux_optimizer
 
@@ -162,7 +152,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
     
     loss_meter = AverageMeter()
     bpp_meter = AverageMeter()
-    mse_meter = AverageMeter()
     
     pbar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch}")
     
@@ -182,7 +171,12 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         optimizer.step()
 
         # --- 2. Aux Optimizer Step (Entropy Bottleneck) ---
-        aux_loss = model.aux_loss() # For DataParallel, use model.module.aux_loss()
+        # Handle DataParallel wrapping
+        if isinstance(model, nn.DataParallel):
+            aux_loss = model.module.aux_loss()
+        else:
+            aux_loss = model.aux_loss()
+            
         aux_optimizer.zero_grad()
         aux_loss.backward()
         aux_optimizer.step()
@@ -190,8 +184,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         # --- 3. Logging ---
         loss_meter.update(out_criterion["loss"].item())
         bpp_meter.update(out_criterion["bpp_loss"].item())
-        if "mse_loss" in out_criterion:
-            mse_meter.update(out_criterion["mse_loss"].item())
 
         pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
         
@@ -199,7 +191,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         if i % 100 == 0 and writer is not None:
             writer.add_scalar("Train/Total_Loss", out_criterion["loss"].item(), step)
             writer.add_scalar("Train/Bpp", out_criterion["bpp_loss"].item(), step)
-            writer.add_scalar("Train/Aux_Loss", aux_loss.item(), step)
 
     return loss_meter.avg
 
@@ -222,12 +213,8 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, device)
             # Crop back to original size for metric calculation
             x_hat = crop_image(out_net["x_hat"], padding)
             
-            # Recalculate BPP accurately on the padded size or original? 
-            # Usually BPP is calculated on the encoded size. 
-            # Here we approximate via likelihoods on the padded result for loss consistency.
+            # Loss Calc
             bpp_val = compute_bpp(out_net, d_padded.size(0) * d_padded.size(2) * d_padded.size(3))
-            
-            # MSE/PSNR on original dimensions
             mse_val = F.mse_loss(x_hat, d)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100
             
@@ -281,6 +268,14 @@ def parse_args():
     return parser.parse_args()
 
 def main():
+    # --- CRITICAL SAFETY CHECK ---
+    # This prevents using 'accelerate launch' which causes the "cuda:1 and cuda:0" error
+    if "LOCAL_RANK" in os.environ:
+        print("\n[ERROR] You are running with 'accelerate launch' or DDP environment.")
+        print("[ERROR] Please run this script with standard python command:")
+        print("[ERROR] python train.py -d /path/to/dataset\n")
+        sys.exit(1)
+    
     args = parse_args()
 
     # Device Setup
@@ -290,7 +285,8 @@ def main():
     # Seeding
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     
     # Logging
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
@@ -298,8 +294,7 @@ def main():
     writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
     
     logger.info(f"Training started on {device}")
-    logger.info(f"Config: {args}")
-
+    
     # Data Loading
     train_transforms = transforms.Compose([
         transforms.RandomCrop(args.patch_size),
@@ -307,7 +302,7 @@ def main():
         transforms.ToTensor()
     ])
     test_transforms = transforms.Compose([
-        transforms.CenterCrop(args.patch_size), # Or use RandomCrop/Full image with padding
+        transforms.CenterCrop(args.patch_size), 
         transforms.ToTensor()
     ])
 
@@ -318,16 +313,23 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True)
 
     # Model Initialization
+    logger.info("Initializing Model...")
     model = WMDC(N=args.N, M=args.M, num_slices=5)
     model = model.to(device)
     
-    # Handle Multi-GPU (DataParallel - simpler than DDP)
+    # Handle Multi-GPU (DataParallel)
+    # Note: We must create optimizer AFTER wrapping with DataParallel if we want to access module parameters correctly?
+    # Actually standard practice: Wrap model -> Optimizer uses model.parameters() or model.module.parameters()
+    # DataParallel wrapper handles parameter access transparently usually, but let's be explicit for safety.
+    
     if torch.cuda.device_count() > 1:
         logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
         model = nn.DataParallel(model)
         
     # Optimizers
-    # Important: If using DataParallel, access model.module
+    # If DataParallel, model.named_parameters() returns all params. 
+    # CompressAI models sometimes have issues if we don't access params correctly.
+    # We use the underlying module for optimizer configuration to be 100% safe regarding parameter names.
     model_ref = model.module if isinstance(model, nn.DataParallel) else model
     optimizer, aux_optimizer = configure_optimizers(model_ref, args)
     
@@ -355,6 +357,7 @@ def main():
         best_loss = ckpt.get("loss", float("inf"))
 
     # Training Loop
+    logger.info("Starting Training Loop...")
     for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(
             model, criterion, train_loader, optimizer, aux_optimizer, 
