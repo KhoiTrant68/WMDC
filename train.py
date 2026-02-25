@@ -130,26 +130,25 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         out_criterion = criterion(out_net, d)
         
         main_loss = out_criterion["loss"]
+        unwrapped = accelerator.unwrap_model(model)
+        aux_loss = unwrapped.aux_loss()
 
         if torch.isnan(main_loss):
             continue
 
-        # 1. Main Network Backward Pass
-        accelerator.backward(main_loss)
+        # Combine losses into a single backward pass (Required for Multi-GPU DDP)
+        total_loss = main_loss + aux_loss
+        accelerator.backward(total_loss)
 
         if clip_max_norm > 0:
             main_params = [p for n, p in model.named_parameters() if not n.endswith(".quantiles")]
-            torch.nn.utils.clip_grad_norm_(main_params, clip_max_norm)
+            # Must use accelerator's clip_grad_norm_ because gradients might be scaled by mixed-precision
+            accelerator.clip_grad_norm_(main_params, clip_max_norm)
         
         optimizer.step()
-
-        # 2. Aux Network Backward Pass (Entropy Bottleneck)
-        unwrapped = accelerator.unwrap_model(model)
-        aux_loss = unwrapped.aux_loss()
-        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
-        # 3. EMA Update
+        # EMA Update
         if ema_model is not None:
             ema_model.update(unwrapped)
 
