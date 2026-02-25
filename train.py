@@ -61,15 +61,15 @@ def pad(x, p):
 def crop(x, padding):
     return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
 
-def compute_psnr(a, b):
-    mse = torch.mean((a - b) ** 2).item()
-    return -10 * math.log10(mse) if mse > 0 else 100
+def compute_psnr_tensor(a, b):
+    mse = torch.mean((a - b) ** 2)
+    return -10 * torch.log10(mse) if mse > 0 else torch.tensor(100.0, device=a.device)
 
-def compute_bpp(out_net):
+def compute_bpp_tensor(out_net):
     size = out_net["x_hat"].size()
     num_pixels = size[0] * size[2] * size[3]
     return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
-              for likelihoods in out_net["likelihoods"].values()).item()
+              for likelihoods in out_net["likelihoods"].values())
 
 # =========================================================
 #  LOSS & OPTIMIZER
@@ -128,23 +128,28 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
 
         out_net = model(d)
         out_criterion = criterion(out_net, d)
+        
+        main_loss = out_criterion["loss"]
 
-        unwrapped = accelerator.unwrap_model(model)
-        aux_loss = unwrapped.aux_loss()
-
-        if torch.isnan(out_criterion["loss"]):
+        if torch.isnan(main_loss):
             continue
 
-        total_loss = out_criterion["loss"] + aux_loss
-        accelerator.backward(total_loss)
+        # 1. Main Network Backward Pass
+        accelerator.backward(main_loss)
 
         if clip_max_norm > 0:
             main_params = [p for n, p in model.named_parameters() if not n.endswith(".quantiles")]
-            accelerator.clip_grad_norm_(main_params, clip_max_norm)
+            torch.nn.utils.clip_grad_norm_(main_params, clip_max_norm)
         
         optimizer.step()
+
+        # 2. Aux Network Backward Pass (Entropy Bottleneck)
+        unwrapped = accelerator.unwrap_model(model)
+        aux_loss = unwrapped.aux_loss()
+        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
+        # 3. EMA Update
         if ema_model is not None:
             ema_model.update(unwrapped)
 
@@ -182,17 +187,18 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, writer):
             out_net["x_hat"].clamp_(0, 1)
             out_net["x_hat"] = crop(out_net["x_hat"], padding)
 
-            psnr_val = compute_psnr(d, out_net["x_hat"])
-            bpp_val = compute_bpp(out_net)
+            # Keep operations strictly on GPU using tensors to avoid syncing stalls
+            psnr_val = compute_psnr_tensor(d, out_net["x_hat"])
+            bpp_val = compute_bpp_tensor(out_net)
 
             if criterion.type == "mse":
-                mse_val = torch.mean((d - out_net["x_hat"]) ** 2).item()
+                mse_val = torch.mean((d - out_net["x_hat"]) ** 2)
                 loss_val = criterion.lmbda * (255 ** 2) * mse_val + bpp_val
             else:
-                ms_ssim_val = 1 - ms_ssim(out_net["x_hat"], d, data_range=1.0).item()
+                ms_ssim_val = 1 - ms_ssim(out_net["x_hat"], d, data_range=1.0)
                 loss_val = criterion.lmbda * ms_ssim_val + bpp_val
 
-            metrics = torch.tensor([psnr_val, bpp_val, loss_val], device=accelerator.device)
+            metrics = torch.stack([psnr_val, bpp_val, loss_val]) # Shape: (3,)
             metrics = metrics.expand(d.size(0), -1) 
             metrics = accelerator.gather_for_metrics(metrics)
             
@@ -239,7 +245,7 @@ def parse_args(argv):
     parser.add_argument("-n", "--num-workers", type=int, default=4)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--patch-size", type=int, default=256)
+    parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--aux-learning-rate", default=1e-3, type=float)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--clip_max_norm", default=1.0, type=float)
@@ -275,9 +281,9 @@ def main(argv):
 
     # Dataset
     train_transforms = transforms.Compose([transforms.RandomCrop(args.patch_size), transforms.ToTensor()])
-    test_transforms = transforms.Compose([transforms.ToTensor()])
+    test_transforms = transforms.Compose([transforms.RandomCrop(args.patch_size), transforms.ToTensor()])
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
+    test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
@@ -311,7 +317,8 @@ def main(argv):
             epoch, args.clip_max_norm, accelerator, writer, ema_model, global_step
         )
 
-        loss = test_epoch(epoch, test_dataloader, net, criterion, accelerator, writer)
+        # Ensure we test the EMA model instead of the noisy baseline
+        loss = test_epoch(epoch, test_dataloader, ema_model.module, criterion, accelerator, writer)
         lr_scheduler.step()
 
         if accelerator.is_main_process:
@@ -335,6 +342,3 @@ def main(argv):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
-
-
-
