@@ -1,9 +1,4 @@
 import os
-
-# STABILITY FIX: Prevent CUDA OOM Fragmentation at the system level
-if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import argparse
 import gc
 import logging
