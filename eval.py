@@ -56,7 +56,7 @@ def main():
     print(f"Loading model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
     
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
