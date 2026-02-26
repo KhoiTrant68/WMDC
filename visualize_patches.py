@@ -4,7 +4,6 @@ import math
 import torch.nn.functional as F
 from PIL import Image
 
-# Force matplotlib to not use any Xwindows backend (prevents showing/crashing)
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -33,7 +32,7 @@ def main():
     model = WMDC(N=args.N, M=args.M).to(device)
     print(f"Loading checkpoint: {args.checkpoint}")
     
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if "state_dict" in ckpt:
         model.load_state_dict(ckpt["state_dict"])
     else:
