@@ -60,7 +60,7 @@ def main():
         extracted_probs.append(output.detach().cpu())
 
     # Attach hook to the Softmax layer of the selected high-frequency slice
-    target_module = model.dt_cross_attention_hf[args.slice].softmax
+    target_module = model.dt_cross_attention_hf[args.slice].res_scale_1.softmax
     hook_handle = target_module.register_forward_hook(get_attention_probs)
 
     valid_exts = ('.png', '.jpg', '.jpeg')
