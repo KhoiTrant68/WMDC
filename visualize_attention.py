@@ -41,7 +41,7 @@ def main():
 
     print(f"Loading WMDC model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if "state_dict" in ckpt:
         model.load_state_dict(ckpt["state_dict"])
     else:
