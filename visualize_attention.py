@@ -38,11 +38,11 @@ def main():
         (50, 0), 
         (99, 0),
         (120, 0),
-        (0, 19), 
-        (10, 19), 
-        (50, 19), 
-        (99, 19),
-        (120, 19)
+        (0, 1), 
+        (10, 1), 
+        (50, 1), 
+        (99, 1),
+        (120, 1)
     ]
 
 
@@ -101,7 +101,6 @@ def main():
         # Reshape spatial dimension back to 2D
         # Shape:[head_num, latent_h, latent_w, dict_num]
         probs = probs.view(probs.size(0), latent_h, latent_w, probs.size(-1))
-        print(probs)
 
         ax_img = axes[row_idx][0]
         ax_img.imshow(orig_np)
@@ -124,7 +123,7 @@ def main():
             ax_map = axes[row_idx][col_idx + 1]
             
             # Use 'hot' colormap, matching Figure 8 exactly
-            im = ax_map.imshow(attn_map, cmap='hot', aspect='auto', interpolation='nearest')
+            im = ax_map.imshow(attn_map, cmap='autumn', aspect='auto', interpolation='nearest')
             
             # Format axes
             ax_map.tick_params(axis='both', which='major', labelsize=6)
