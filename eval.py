@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
+from torchvision.utils import save_image
 from PIL import Image
 from pytorch_msssim import ms_ssim
 
@@ -45,7 +46,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate WMDC performance")
     parser.add_argument("--dataset", type=str, required=True, help="Path to evaluation dataset (e.g., Kodak)")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model .pth.tar")
-    parser.add_argument("--output", type=str, default="results.json", help="Output JSON file")
+    parser.add_argument("--output", type=str, default="output", help="Directory to save images and RD_report.json")
     parser.add_argument("--N", type=int, default=192)
     parser.add_argument("--M", type=int, default=320)
     parser.add_argument("--cuda", action="store_true", help="Use GPU")
@@ -53,7 +54,12 @@ def main():
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    print(f"Loading model from {args.checkpoint}... to {device}")
+    # --- SETUP OUTPUT DIRECTORIES ---
+    os.makedirs(args.output, exist_ok=True)
+    img_dir = os.path.join(args.output, "images")
+    os.makedirs(img_dir, exist_ok=True)
+
+    print(f"Loading model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -75,6 +81,7 @@ def main():
     }
 
     print(f"Evaluating on {len(image_paths)} images from {args.dataset}")
+    print(f"Outputs will be saved to: {args.output}/")
     
     with torch.no_grad():
         for img_path in image_paths:
@@ -98,6 +105,11 @@ def main():
 
             x_hat = crop_image(out_dec["x_hat"], padding).clamp_(0, 1)
 
+            # --- DUMP OUTPUT IMAGE ---
+            img_filename = os.path.basename(img_path)
+            out_img_path = os.path.join(img_dir, img_filename)
+            save_image(x_hat, out_img_path)
+
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels)
             mse = F.mse_loss(x, x_hat)
             psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100
@@ -109,7 +121,7 @@ def main():
             results["enc_time"].append(enc_time)
             results["dec_time"].append(dec_time)
 
-            print(f"Image: {os.path.basename(img_path)} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | MS-SSIM: {msssim:.4f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s")
+            print(f"Image: {img_filename} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | MS-SSIM: {msssim:.4f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s")
 
     avg_results = {k: sum(v)/len(v) for k, v in results.items()}
     print("\n" + "="*50)
@@ -121,8 +133,11 @@ def main():
     print(f"Dec Time: {avg_results['dec_time']: .3f} s")
     print("="*50)
 
-    with open(args.output, "w") as f:
+    # --- DUMP JSON TO RD_report.json ---
+    json_path = os.path.join(args.output, "RD_report.json")
+    with open(json_path, "w") as f:
         json.dump(avg_results, f, indent=4)
+    print(f"Saved metrics to {json_path}")
 
 if __name__ == "__main__":
     main()
