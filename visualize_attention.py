@@ -99,7 +99,7 @@ def main():
         # Reshape spatial dimension back to 2D
         # Shape:[head_num, latent_h, latent_w, dict_num]
         probs = probs.view(probs.size(0), latent_h, latent_w, probs.size(-1))
-        print(probs)
+        print(probs.shape)
 
         ax_img = axes[row_idx][0]
         ax_img.imshow(orig_np)
