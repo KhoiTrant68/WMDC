@@ -32,12 +32,17 @@ def main():
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     # Format: (Entry Index, Head Index)
-    target_maps =[
-        (99, 1), 
-        (90, 1), 
-        (16, 0), 
-        (86, 0)
+        target_maps =[
+        (0, 0), 
+        (10, 0), 
+        (50, 0), 
+        (99, 0),
+        (0, 1), 
+        (10, 1), 
+        (50, 1), 
+        (99, 1)
     ]
+
 
     print(f"Loading WMDC model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
