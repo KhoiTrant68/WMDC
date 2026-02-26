@@ -53,7 +53,7 @@ def main():
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    print(f"Loading model from {args.checkpoint}...")
+    print(f"Loading model from {args.checkpoint}... to {device}")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
