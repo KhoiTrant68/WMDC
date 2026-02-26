@@ -37,10 +37,12 @@ def main():
         (10, 0), 
         (50, 0), 
         (99, 0),
-        (0, 1), 
-        (10, 1), 
-        (50, 1), 
-        (99, 1)
+        (120, 0)
+        (0, 19), 
+        (10, 19), 
+        (50, 19), 
+        (99, 19),
+        (120, 19)
     ]
 
 
@@ -99,7 +101,7 @@ def main():
         # Reshape spatial dimension back to 2D
         # Shape:[head_num, latent_h, latent_w, dict_num]
         probs = probs.view(probs.size(0), latent_h, latent_w, probs.size(-1))
-        print(probs.shape)
+        print(probs)
 
         ax_img = axes[row_idx][0]
         ax_img.imshow(orig_np)
