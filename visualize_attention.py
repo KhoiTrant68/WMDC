@@ -32,7 +32,7 @@ def main():
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     # Format: (Entry Index, Head Index)
-        target_maps =[
+    target_maps =[
         (0, 0), 
         (10, 0), 
         (50, 0), 
