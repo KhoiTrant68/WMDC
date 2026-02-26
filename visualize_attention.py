@@ -123,7 +123,7 @@ def main():
             ax_map = axes[row_idx][col_idx + 1]
             
             # Use 'hot' colormap, matching Figure 8 exactly
-            im = ax_map.imshow(attn_map, cmap='autumn', aspect='auto', interpolation='nearest')
+            im = ax_map.imshow(attn_map, cmap='gist_heat', aspect='auto', interpolation='nearest')
             
             # Format axes
             ax_map.tick_params(axis='both', which='major', labelsize=6)
