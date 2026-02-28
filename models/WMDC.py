@@ -7,7 +7,7 @@ from compressai.layers import AttentionBlock
 from compressai.models import CompressionModel
 from torch import nn
 
-from modules.dictationary_blocks import MultiScaleDictionaryCrossAttentionGLU
+from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
 from modules.utils import CheckboardMaskedConv2d, conv, conv1x1, deconv, ste_round
 from modules.VSS_module import SwinBlock, VSSBlock
 from modules.wavelet_blocks import (
