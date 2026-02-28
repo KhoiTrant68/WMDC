@@ -78,8 +78,7 @@ def pad_image(x, p=128):
     x_padded = F.pad(
         x,
         (padding_left, padding_right, padding_top, padding_bottom),
-        mode="constant",
-        value=0,
+        mode="reflect",
     )
     return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
 

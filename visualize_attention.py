@@ -16,7 +16,7 @@ def pad_image(x, p=128):
     pad_w = (p - w % p) % p
     if pad_w == 0 and pad_h == 0:
         return x
-    return F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0)
+    return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize WMDC Dictionary Attention Maps")

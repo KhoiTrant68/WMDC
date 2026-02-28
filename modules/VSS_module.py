@@ -1281,7 +1281,7 @@ class SwinBlock(nn.Module):
         resize = False
         # Pad if necessary
         if pad_b > 0 or pad_r > 0:
-            x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
+            x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b), mode="reflect")
             resize = True
 
         # Convert CHW to HWC

@@ -50,7 +50,7 @@ class SWAtten(AttentionBlock):
 
         # Pad tensor if H or W is not a multiple of window_size
         if pad_r > 0 or pad_b > 0:
-            x_padded = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
+            x_padded = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b), mode="reflect")
         else:
             x_padded = x
 

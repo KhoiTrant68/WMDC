@@ -23,7 +23,7 @@ def pad_image(x, p=128):
     padding_bottom = new_h - h - padding_top
     if padding_left == 0 and padding_right == 0 and padding_top == 0 and padding_bottom == 0:
         return x, (0,0,0,0)
-    x_padded = F.pad(x, (padding_left, padding_right, padding_top, padding_bottom), mode="constant", value=0)
+    x_padded = F.pad(x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect")
     return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
 
 def crop_image(x, padding):
