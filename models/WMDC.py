@@ -107,6 +107,36 @@ class FRFTMerger(nn.Module):
         
         return x_out
 
+class SoftQuantizer(nn.Module):
+    """
+    Annealed Quantizer: Switches from Additive Uniform Noise to STE Rounding.
+    Phase 1 (Noise): Creates a smooth optimization landscape.
+    Phase 2 (STE): Matches the discrete nature of inference.
+    """
+    def __init__(self):
+        super().__init__()
+        # 0 = Noise (Phase 1), 1 = STE (Phase 2)
+        self.register_buffer("quant_mode", torch.tensor(0, dtype=torch.int))
+
+    def set_mode(self, mode="noise"):
+        self.quant_mode.fill_(0 if mode == "noise" else 1)
+
+    def forward(self, x, means=None):
+        if self.training and self.quant_mode == 0:
+            # Phase 1: Additive Uniform Noise
+            # y_hat = y + U(-0.5, 0.5)
+            noise = torch.rand_like(x) - 0.5
+            return x + noise
+        else:
+            # Phase 2 & Inference: STE Rounding
+            # y_hat = round(y - mean) + mean
+            if means is not None:
+                x_centered = x - means
+                x_quant = torch.round(x_centered)
+                return x_quant.detach() - x_centered.detach() + x_centered + means
+            else:
+                x_quant = torch.round(x)
+                return x_quant.detach() - x.detach() + x
 
 class SWAtten(AttentionBlock):
     def __init__(
@@ -167,9 +197,13 @@ class WMDC(CompressionModel):
         self.M = M
         self.num_slices = num_slices
         self.window_size = 8
+        self.num_mixtures = 3  # K=3 for GMM
 
         self.slice_ch_lf = M // num_slices  # 320 // 5 = 64
         self.slice_ch_hf = (3 * M) // num_slices  # 960 // 5 = 192
+
+        # QUANTIZER
+        self.quantizer = SoftQuantizer()
 
         # ----------------------------------------------------------------------
         # A. MAIN ENCODER (FRFT-Integrated)
@@ -348,6 +382,9 @@ class WMDC(CompressionModel):
             for i in range(self.num_slices)
         )
 
+        # Output dimensions increased for GMM: 3 params (mu, sigma, weight) * K mixtures
+        gmm_out_dim = self.num_mixtures * 3 * self.slice_ch_hf
+
         self.cc_transforms_hf = nn.ModuleList(
             nn.Sequential(
                 conv(
@@ -360,7 +397,7 @@ class WMDC(CompressionModel):
                 conv(512, 256, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(
-                    256, 2 * self.slice_ch_hf, stride=1, kernel_size=3
+                    256, gmm_out_dim, stride=1, kernel_size=3
                 ),  # Outputs: mu + scale
             )
             for i in range(self.num_slices)
@@ -393,6 +430,82 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
+    def set_quantization_stage(self, mode="noise"):
+        self.quantizer.set_mode(mode)
+
+    # ==========================================================================
+    # GMM HELPERS
+    # ==========================================================================
+    def _parse_gmm_params(self, params, channels):
+        """
+        Splits the raw tensor into means, scales, and weights for K mixtures.
+        params: [B, K*3*C, H, W]
+        Returns:
+            mu: [B, K, C, H, W]
+            scale: [B, K, C, H, W]
+            weight: [B, K, C, H, W] (Logits)
+        """
+        B, _, H, W = params.shape
+        K = self.num_mixtures
+        # Reshape to [B, 3, K, C, H, W]
+        params = params.view(B, 3, K, channels, H, W)
+        
+        mu = params[:, 0, ...]
+        scale = nn.functional.softplus(params[:, 1, ...]) + 1e-6 # Ensure positive scale
+        weight_logits = params[:, 2, ...]
+        
+        return mu, scale, weight_logits
+
+    def _gmm_likelihood(self, y, mu, scale, weight_logits):
+        """
+        Computes GMM likelihood for training.
+        y: [B, C, H, W]
+        mu, scale, weight: [B, K, C, H, W]
+        """
+        # Expand y for K dimension: [B, 1, C, H, W]
+        y = y.unsqueeze(1)
+        
+        # Softmax weights over K dimension
+        weights = nn.functional.softmax(weight_logits, dim=1)
+        
+        # Calculate Gaussian likelihood for each mixture
+        # Using standard Gaussian PDF formula or CompressAI CDF logic
+        # CompressAI's approach: cdf(x + 0.5) - cdf(x - 0.5)
+        # We approximate with PDF * bin_width (1.0) for optimization stability in GMM
+        
+        dist = torch.distributions.Normal(mu, scale)
+        
+        # Probability of y in each component
+        # We use the "noise" formulation: P(y) approx N(y|mu, sigma)
+        # For training stability with soft quantization (noise), PDF is appropriate.
+        probs = dist.log_prob(y).exp() # [B, K, C, H, W]
+        
+        # Weighted sum
+        mixed_probs = torch.sum(weights * probs, dim=1) # [B, C, H, W]
+        
+        # Clamp for stability
+        mixed_probs = torch.clamp(mixed_probs, min=1e-9)
+        
+        return mixed_probs
+
+    def _gmm_moment_matching(self, mu, scale, weight_logits):
+        """
+        Projects GMM parameters to a single Gaussian for coding compatibility.
+        """
+        weights = nn.functional.softmax(weight_logits, dim=1)
+        
+        # Effective Mean
+        eff_mu = torch.sum(weights * mu, dim=1) # [B, C, H, W]
+        
+        # Effective Variance = E[x^2] - (E[x])^2
+        # E[x^2] = sum( w * (sigma^2 + mu^2) )
+        eff_var = torch.sum(weights * (scale.pow(2) + mu.pow(2)), dim=1) - eff_mu.pow(2)
+        eff_scale = torch.sqrt(torch.clamp(eff_var, min=1e-9))
+        
+        return eff_mu, eff_scale
+
+    
+
     # ==========================================================================
     # FORWARD
     # ==========================================================================
@@ -416,7 +529,7 @@ class WMDC(CompressionModel):
         z = self.h_a(y_wave)
         _, z_likelihoods = self.entropy_bottleneck(z)
         z_offset = self.entropy_bottleneck._get_medians()
-        z_hat = ste_round(z - z_offset) + z_offset
+        z_hat = self.quantizer(z - z_offset) + z_offset
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -494,7 +607,7 @@ class WMDC(CompressionModel):
             means_hat_split[:, :, 0::2, 0::2] = means_anchor[:, :, 0::2, 0::2]
             means_hat_split[:, :, 1::2, 1::2] = means_anchor[:, :, 1::2, 1::2]
 
-            y_anchor_quantized = ste_round(y_anchor - means_anchor) + means_anchor
+            y_anchor_quantized = self.quantizer(y_anchor, means=means_hat_split)
             y_anchor_quantized[:, :, 0::2, 1::2] = 0
             y_anchor_quantized[:, :, 1::2, 0::2] = 0
 
@@ -516,9 +629,7 @@ class WMDC(CompressionModel):
             )
 
             y_non_anchor = non_anchor_split[i]
-            y_non_anchor_quantized = (
-                ste_round(y_non_anchor - means_non_anchor) + means_non_anchor
-            )
+            y_non_anchor_quantized = self.quantizer(y_non_anchor, means=means_non_anchor)
             y_non_anchor_quantized[:, :, 0::2, 0::2] = 0
             y_non_anchor_quantized[:, :, 1::2, 1::2] = 0
 
@@ -548,13 +659,15 @@ class WMDC(CompressionModel):
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
-            mu_scale = self.cc_transforms_hf[i](support)
-            mu, scale = mu_scale.chunk(2, 1)
+            gmm_params = self.cc_transforms_hf[i](support)
+            mu, scale, weight_logits = self._parse_gmm_params(gmm_params, self.slice_ch_hf)
 
-            _, y_slice_likelihood = self.gaussian_conditional_hf(
-                y_slice, scale, means=mu
-            )
-            y_hat_slice = ste_round(y_slice - mu) + mu
+            y_slice_probs = self._gmm_likelihood(y_slice, mu, scale, weight_logits)
+            y_slice_likelihood.append(y_slice_probs)
+
+            # Quantization: Use Moment Matching to find effective mean for SoftQuantizer center
+            eff_mu, _ = self._gmm_moment_matching(mu, scale, weight_logits)
+            y_hat_slice = self.quantizer(y_slice, means=eff_mu)
 
             # LRP
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
@@ -562,7 +675,7 @@ class WMDC(CompressionModel):
             y_hat_slice += lrp
 
             y_hf_hat_slices.append(y_hat_slice)
-            y_hf_likelihood.append(y_slice_likelihood)
+            
 
         y_hf_hat = torch.cat(y_hf_hat_slices, dim=1)
         y_hf_likelihoods = torch.cat(y_hf_likelihood, dim=1)
@@ -705,9 +818,7 @@ class WMDC(CompressionModel):
             indexes_list_lf.extend(indexes_anchor.reshape(-1).tolist())
 
             # Local reconstruction for non-anchor masking context
-            anchor_quantized = (
-                ste_round(y_anchor_encode - means_anchor_encode) + means_anchor_encode
-            )
+            anchor_quantized = self.gaussian_conditional_lf.dequantize(y_non_anchor_symbols, means_non_anchor_encode)
             y_anchor_decode = torch.zeros(B_anchor, C_anchor, H_anchor, W_anchor).to(
                 x.device
             )
@@ -753,10 +864,7 @@ class WMDC(CompressionModel):
             symbols_list_lf.extend(y_non_anchor_symbols.reshape(-1).tolist())
             indexes_list_lf.extend(indexes_non_anchor.reshape(-1).tolist())
 
-            non_anchor_quantized = (
-                ste_round(y_non_anchor_encode - means_non_anchor_encode)
-                + means_non_anchor_encode
-            )
+            non_anchor_quantized = self.gaussian_conditional_lf.dequantize(y_non_anchor_symbols, means_non_anchor_encode)
 
             y_non_anchor_quantized = torch.zeros_like(y_anchor)
             y_non_anchor_quantized[:, :, 0::2, 1::2] = non_anchor_quantized[
@@ -805,16 +913,17 @@ class WMDC(CompressionModel):
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
-            mu_scale = self.cc_transforms_hf[i](support)
-            mu, scale = mu_scale.chunk(2, 1)
+            gmm_params = self.cc_transforms_hf[i](support)
+            mu, scale, weight_logits = self._parse_gmm_params(gmm_params, self.slice_ch_hf)
+            eff_mu, eff_scale = self._gmm_moment_matching(mu, scale, weight_logits)
 
-            indexes = self.gaussian_conditional_hf.build_indexes(scale)
-            y_hf_symbols = self.gaussian_conditional_hf.quantize(y_slice, "symbols", mu)
+            indexes = self.gaussian_conditional_hf.build_indexes(eff_scale)
+            y_hf_symbols = self.gaussian_conditional_hf.quantize(y_slice, "symbols", eff_mu)
 
             symbols_list_hf.extend(y_hf_symbols.reshape(-1).tolist())
             indexes_list_hf.extend(indexes.reshape(-1).tolist())
 
-            y_hat_slice = ste_round(y_slice - mu) + mu
+            y_hat_slice = self.gaussian_conditional_hf.dequantize(y_hf_symbols, eff_mu)
 
             # LRP
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
@@ -1019,17 +1128,19 @@ class WMDC(CompressionModel):
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
-            mu_scale = self.cc_transforms_hf[i](support)
-            mu, scale = mu_scale.chunk(2, 1)
+            gmm_params = self.cc_transforms_hf[i](support)
+            mu, scale, weight_logits = self._parse_gmm_params(gmm_params, self.slice_ch_hf)
+            eff_mu, eff_scale = self._gmm_moment_matching(mu, scale, weight_logits)
 
-            indexes = self.gaussian_conditional_hf.build_indexes(scale)
+
+            indexes = self.gaussian_conditional_hf.build_indexes(eff_scale)
 
             rv_hf = decoder_hf.decode_stream(
                 indexes.reshape(-1).tolist(), cdf_hf, cdf_lengths_hf, offsets_hf
             )
             rv_hf = torch.Tensor(rv_hf).to(z_hat.device).reshape(indexes.size())
 
-            y_hat_slice = rv_hf + mu
+            y_hat_slice = rv_hf + eff_mu
 
             # LRP
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
