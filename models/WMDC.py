@@ -663,7 +663,7 @@ class WMDC(CompressionModel):
             mu, scale, weight_logits = self._parse_gmm_params(gmm_params, self.slice_ch_hf)
 
             y_slice_probs = self._gmm_likelihood(y_slice, mu, scale, weight_logits)
-            y_slice_likelihood.append(y_slice_probs)
+            y_hf_likelihood.append(y_slice_probs)
 
             # Quantization: Use Moment Matching to find effective mean for SoftQuantizer center
             eff_mu, _ = self._gmm_moment_matching(mu, scale, weight_logits)
