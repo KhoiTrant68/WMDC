@@ -76,9 +76,7 @@ def pad_image(x, p=128):
     ):
         return x, (0, 0, 0, 0)
     x_padded = F.pad(
-        x,
-        (padding_left, padding_right, padding_top, padding_bottom),
-        mode="reflect",
+        x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect"
     )
     return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
 
@@ -116,10 +114,8 @@ class RateDistortionLoss(nn.Module):
         out = {}
         num_pixels = N * H * W
 
-        # 1. Rate (Bpp)
         out["bpp_loss"] = compute_bpp(output, num_pixels)
 
-        # 2. Distortion
         if self.metric == "mse":
             out["mse_loss"] = self.mse(output["x_hat"], target)
             distortion = 255**2 * out["mse_loss"]
@@ -129,9 +125,7 @@ class RateDistortionLoss(nn.Module):
         else:
             raise ValueError(f"Unknown metric: {self.metric}")
 
-        # 3. Total Loss
         out["loss"] = self.lmbda * distortion + out["bpp_loss"]
-
         return out
 
 
@@ -141,11 +135,6 @@ class RateDistortionLoss(nn.Module):
 
 
 def configure_optimizers(net, args):
-    """
-    Separates parameters into:
-    1. Main parameters (weights, biases) -> optimizer
-    2. Aux parameters (entropy bottleneck quantiles) -> aux_optimizer
-    """
     parameters = {
         n: p
         for n, p in net.named_parameters()
@@ -159,7 +148,6 @@ def configure_optimizers(net, args):
 
     optimizer = optim.Adam(parameters.values(), lr=args.learning_rate)
     aux_optimizer = optim.Adam(aux_parameters.values(), lr=args.aux_learning_rate)
-
     return optimizer, aux_optimizer
 
 
@@ -181,7 +169,6 @@ def train_one_epoch(
     accelerator,
 ):
     model.train()
-
     loss_meter = AverageMeter()
     bpp_meter = AverageMeter()
 
@@ -197,7 +184,6 @@ def train_one_epoch(
         out_net = model(d)
 
         out_criterion = criterion(out_net, d)
-
         accelerator.backward(out_criterion["loss"])
 
         if clip_max_norm > 0:
@@ -286,7 +272,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
     if accelerator.is_main_process:
         total_saw = count_images * accelerator.num_processes
         logger.info(
-            f"[Sanity Check] Processed approximately {total_saw} images across {accelerator.num_processes} GPUs."
+            f"[Sanity Check] Processed approx {total_saw} images across {accelerator.num_processes} GPUs."
         )
         logger.info(
             f"Test Epoch {epoch}: Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
@@ -332,7 +318,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # find_unused_parameters=True is CRITICAL for Mamba/VSS models in DDP
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
@@ -379,7 +364,6 @@ def main():
         logger.info("Initializing Model...")
 
     model = WMDC(N=args.N, M=args.M, num_slices=5)
-
     optimizer, aux_optimizer = configure_optimizers(model, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[80, 90], gamma=0.1
@@ -413,6 +397,14 @@ def main():
         logger.info("Starting Training Loop...")
 
     for epoch in range(start_epoch, args.epochs):
+        # [CRITICAL UPDATE]: Switch SoftQuantizer phase to STE fine-tuning
+        if epoch == 80:
+            accelerator.unwrap_model(model).set_quantization_stage("ste")
+            if accelerator.is_main_process:
+                logger.info(
+                    "Epoch 80 reached: Switched quantizer to Phase 2 (STE mode)."
+                )
+
         train_loss = train_one_epoch(
             model,
             criterion,
@@ -443,7 +435,6 @@ def main():
             }
 
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
-
             if test_loss < best_loss:
                 best_loss = test_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
