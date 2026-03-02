@@ -1,21 +1,111 @@
 import math
-
 import torch
+from torch import nn
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.layers import AttentionBlock
 from compressai.models import CompressionModel
-from torch import nn
 
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
 from modules.utils import CheckboardMaskedConv2d, conv, conv1x1, deconv, ste_round
 from modules.VSS_module import SwinBlock, VSSBlock
 from modules.wavelet_blocks import (
-    DWT_2D,
-    IDWT_2D,
     ResidualBlockUpsample_wave,
     ResidualBlockWithStride_wave,
 )
+
+from torch_frft.frft_module import frft
+
+
+class LearnableFRFT_Split(nn.Module):
+    """
+    Helper module to apply learnable FRFT on 2D feature maps.
+    """
+    def __init__(self, init_a=0.5):
+        super().__init__()
+        self.raw_a_h = nn.Parameter(torch.tensor(init_a))
+        self.raw_a_w = nn.Parameter(torch.tensor(init_a))
+
+    def forward(self, x):
+        # x: [B, C, H, W] (Complex or Real)
+        # Apply FRFT on Height (dim=2) and Width (dim=3)
+        x = frft(x, self.raw_a_h, dim=2)
+        x = frft(x, self.raw_a_w, dim=3)
+        return x
+
+    def inverse(self, x):
+        # Inverse Apply (-a)
+        x = frft(x, -self.raw_a_w, dim=3)
+        x = frft(x, -self.raw_a_h, dim=2)
+        return x
+
+
+class FRFTSplitter(nn.Module):
+    """
+    Replaces DWT_2D.
+    Splits latent y [B, M, H, W] into Frequency Components [B, 4M, H/2, W/2].
+    
+    Pipeline:
+    1. Pixel Unshuffle (Space-to-Depth): [B, M, H, W] -> [B, 4M, H/2, W/2]
+    2. Learnable FRFT: Rotates into optimal fractional frequency domain.
+    3. Complex Projection: Learns to map Complex FRFT coefficients to Real-valued latents.
+    """
+    def __init__(self, channel_m):
+        super().__init__()
+        self.frft = LearnableFRFT_Split(init_a=0.5)
+        # Projection: Real+Imag (8M) -> Real (4M)
+        self.c2r_conv = nn.Conv2d(channel_m * 8, channel_m * 4, kernel_size=1)
+
+    def forward(self, x):
+        # 1. Space to Depth
+        x = nn.functional.pixel_unshuffle(x, 2) # [B, 4M, H/2, W/2]
+        
+        # 2. FRFT (Returns Complex)
+        x_freq = self.frft(x) 
+        
+        # 3. Projection to Real (for Entropy Coding compatibility)
+        # Cat Real and Imag components along channel dimension
+        x_cat = torch.cat([x_freq.real, x_freq.imag], dim=1) # [B, 8M, H/2, W/2]
+        
+        # Mix them back to 4M channels
+        x_real = self.c2r_conv(x_cat)
+        
+        return x_real
+
+
+class FRFTMerger(nn.Module):
+    """
+    Replaces IDWT_2D.
+    Merges Frequency Components [B, 4M, H/2, W/2] back to [B, M, H, W].
+    """
+    def __init__(self, channel_m):
+        super().__init__()
+        self.frft = LearnableFRFT_Split(init_a=0.5)
+        # Projection: Real (4M) -> Real+Imag (8M)
+        self.r2c_conv = nn.Conv2d(channel_m * 4, channel_m * 8, kernel_size=1)
+
+    def forward(self, x):
+        # x: [B, 4M, H/2, W/2] (Real, from entropy decoder)
+        
+        # 1. Project back to Complex Space components
+        x_cat = self.r2c_conv(x) # [B, 8M, H/2, W/2]
+        
+        # Split back into Real and Imag parts
+        chunks = torch.chunk(x_cat, 2, dim=1) # Tuple of [B, 4M, ...]
+        x_complex = torch.complex(chunks[0], chunks[1])
+        
+        # 2. Inverse FRFT
+        x_spatial = self.frft.inverse(x_complex)
+        
+        # 3. Take Real part (Energy compaction usually preserves info in Real)
+        # Note: Ideally, we take magnitude, but keeping Real allows signed values 
+        # which acts better with PixelShuffle reconstruction.
+        x_spatial = x_spatial.real 
+        
+        # 4. Depth to Space
+        x_out = torch.nn.functional.pixel_shuffle(x_spatial, 2) # [B, M, H, W]
+        
+        return x_out
 
 
 class SWAtten(AttentionBlock):
@@ -35,7 +125,7 @@ class SWAtten(AttentionBlock):
                 input_dim, input_dim, head_dim, window_size, drop_path
             )
 
-        self.window_size = window_size  # Save window size for dynamic padding
+        self.window_size = window_size
 
     def forward(self, x):
         if hasattr(self, "in_conv"):
@@ -43,21 +133,18 @@ class SWAtten(AttentionBlock):
 
         identity = x
 
-        # --- DYNAMIC PADDING FOR SWIN BLOCK ---
+        # --- DYNAMIC REFLECTION PADDING  ---
         B, C, H, W = x.shape
         pad_r = (self.window_size - x.size(-1) % self.window_size) % self.window_size
         pad_b = (self.window_size - x.size(-2) % self.window_size) % self.window_size
 
-        # Pad tensor if H or W is not a multiple of window_size
         if pad_r > 0 or pad_b > 0:
             x_padded = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b), mode="reflect")
         else:
             x_padded = x
 
-        # Process through SwinBlock
         z = self.non_local_block(x_padded)
 
-        # Crop back to original exact dimensions
         if pad_r > 0 or pad_b > 0:
             z = z[:, :, :H, :W]
         # --------------------------------------
@@ -85,7 +172,7 @@ class WMDC(CompressionModel):
         self.slice_ch_hf = (3 * M) // num_slices  # 960 // 5 = 192
 
         # ----------------------------------------------------------------------
-        # A. MAIN ENCODER (Wavelet-Integrated)
+        # A. MAIN ENCODER (FRFT-Integrated)
         # ----------------------------------------------------------------------
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
@@ -95,10 +182,10 @@ class WMDC(CompressionModel):
         )
 
         # ----------------------------------------------------------------------
-        # B. SPECTRAL SPLIT
+        # B. SPECTRAL SPLIT (Learned FRFT Splitter)
         # ----------------------------------------------------------------------
-        self.dwt = DWT_2D(wave="haar")
-        self.idwt = IDWT_2D(wave="haar")
+        self.dwt = FRFTSplitter(M)
+        self.idwt = FRFTMerger(M)
 
         # ----------------------------------------------------------------------
         # C. HYPER-PRIOR AUTOENCODER (Mamba-Enhanced)
@@ -242,7 +329,7 @@ class WMDC(CompressionModel):
         self.gaussian_conditional_lf = GaussianConditional(None)
 
         # ----------------------------------------------------------------------
-        # E. PATH B: HIGH FREQUENCY ENTROPY MODEL (DCAE Dictionary Attention)
+        # E. PATH B: HIGH FREQUENCY ENTROPY MODEL (Dictionary Attention)
         # ----------------------------------------------------------------------
         self.dict_dim = 32 * dict_head_num
         self.dt = nn.Parameter(
@@ -307,7 +394,7 @@ class WMDC(CompressionModel):
         )
 
     # ==========================================================================
-    # FORWARD PASS (TRAINING)
+    # FORWARD
     # ==========================================================================
     def forward(self, x):
         B, C, H, W = x.size()
@@ -316,7 +403,12 @@ class WMDC(CompressionModel):
         y = self.g_a(x)
         y_shape = y.shape[2:]
 
-        y_wave = self.dwt(y)  # Shape: [B, 4M, H_d, W_d]
+        # Output is [B, 4M, H/2, W/2]
+        y_wave = self.dwt(y)
+        
+        # Split into Low and High fractional frequency components
+        # y_lf: [B, M, H/2, W/2]
+        # y_hf: [B, 3M, H/2, W/2]
         y_lf = y_wave[:, : self.M, :, :]
         y_hf = y_wave[:, self.M :, :, :]
 
