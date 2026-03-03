@@ -1,10 +1,12 @@
 import math
+
 import torch
-from torch import nn
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.layers import AttentionBlock
 from compressai.models import CompressionModel
+from torch import nn
+from torch_frft.frft_module import frft
 
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
 from modules.utils import CheckboardMaskedConv2d, conv, conv1x1, deconv
@@ -13,7 +15,6 @@ from modules.wavelet_blocks import (
     ResidualBlockUpsample_wave,
     ResidualBlockWithStride_wave,
 )
-from torch_frft.frft_module import frft
 
 
 class LearnableFRFT_Split(nn.Module):

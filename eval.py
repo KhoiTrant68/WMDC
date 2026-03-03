@@ -1,16 +1,18 @@
 import argparse
-import os
-import time
 import json
 import math
+import os
+import time
+
 import torch
 import torch.nn.functional as F
-from torchvision import transforms
-from torchvision.utils import save_image
 from PIL import Image
 from pytorch_msssim import ms_ssim
+from torchvision import transforms
+from torchvision.utils import save_image
 
 from models.WMDC import WMDC
+
 
 def pad_image(x, p=128):
     """Pads image to be divisible by p"""
@@ -21,10 +23,18 @@ def pad_image(x, p=128):
     padding_right = new_w - w - padding_left
     padding_top = (new_h - h) // 2
     padding_bottom = new_h - h - padding_top
-    if padding_left == 0 and padding_right == 0 and padding_top == 0 and padding_bottom == 0:
-        return x, (0,0,0,0)
-    x_padded = F.pad(x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect")
+    if (
+        padding_left == 0
+        and padding_right == 0
+        and padding_top == 0
+        and padding_bottom == 0
+    ):
+        return x, (0, 0, 0, 0)
+    x_padded = F.pad(
+        x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect"
+    )
     return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
+
 
 def crop_image(x, padding):
     """Crops back to original size"""
@@ -32,21 +42,35 @@ def crop_image(x, padding):
         return x
     return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
 
+
 def compute_actual_bpp(strings, num_pixels):
     """Recursively computes the size of the bitstream in bytes, converts to BPP"""
     size = 0
     for s in strings:
         if isinstance(s, (list, tuple)):
-            size += compute_actual_bpp(s, 1) / 8  
+            size += compute_actual_bpp(s, 1) / 8
         elif isinstance(s, bytes):
             size += len(s)
     return (size * 8) / num_pixels
 
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate WMDC performance")
-    parser.add_argument("--dataset", type=str, required=True, help="Path to evaluation dataset (e.g., Kodak)")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model .pth.tar")
-    parser.add_argument("--output", type=str, default="output", help="Directory to save images and RD_report.json")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="Path to evaluation dataset (e.g., Kodak)",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Path to trained model .pth.tar"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="output",
+        help="Directory to save images and RD_report.json",
+    )
     parser.add_argument("--N", type=int, default=192)
     parser.add_argument("--M", type=int, default=320)
     parser.add_argument("--cuda", action="store_true", help="Use GPU")
@@ -61,7 +85,7 @@ def main():
 
     print(f"Loading model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
-    
+
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
@@ -69,38 +93,40 @@ def main():
     print("Updating Entropy Coder CDFs...")
     model.update(force=True)
 
-    image_paths =[os.path.join(args.dataset, f) for f in os.listdir(args.dataset) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    image_paths = [
+        os.path.join(args.dataset, f)
+        for f in os.listdir(args.dataset)
+        if f.endswith((".png", ".jpg", ".jpeg"))
+    ]
     image_paths.sort()
 
-    results = {
-        "bpp": [],
-        "psnr":[],
-        "ms_ssim": [],
-        "enc_time": [],
-        "dec_time":[]
-    }
+    results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
 
     print(f"Evaluating on {len(image_paths)} images from {args.dataset}")
     print(f"Outputs will be saved to: {args.output}/")
-    
+
     with torch.no_grad():
         for img_path in image_paths:
-            img = Image.open(img_path).convert('RGB')
+            img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
             num_pixels = x.size(2) * x.size(3)
 
             x_padded, padding = pad_image(x, p=128)
 
-            if args.cuda: torch.cuda.synchronize()
+            if args.cuda:
+                torch.cuda.synchronize()
             t0 = time.time()
             out_enc = model.compress(x_padded)
-            if args.cuda: torch.cuda.synchronize()
+            if args.cuda:
+                torch.cuda.synchronize()
             enc_time = time.time() - t0
 
-            if args.cuda: torch.cuda.synchronize()
+            if args.cuda:
+                torch.cuda.synchronize()
             t1 = time.time()
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
-            if args.cuda: torch.cuda.synchronize()
+            if args.cuda:
+                torch.cuda.synchronize()
             dec_time = time.time() - t1
 
             x_hat = crop_image(out_dec["x_hat"], padding).clamp_(0, 1)
@@ -121,23 +147,26 @@ def main():
             results["enc_time"].append(enc_time)
             results["dec_time"].append(dec_time)
 
-            print(f"Image: {img_filename} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | MS-SSIM: {msssim:.4f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s")
+            print(
+                f"Image: {img_filename} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | MS-SSIM: {msssim:.4f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
+            )
 
-    avg_results = {k: sum(v)/len(v) for k, v in results.items()}
-    print("\n" + "="*50)
+    avg_results = {k: sum(v) / len(v) for k, v in results.items()}
+    print("\n" + "=" * 50)
     print(f"AVERAGE RESULTS (Dataset: {args.dataset})")
     print(f"BPP:      {avg_results['bpp']: .4f}")
     print(f"PSNR:     {avg_results['psnr']: .2f} dB")
     print(f"MS-SSIM:  {avg_results['ms_ssim']: .4f}")
     print(f"Enc Time: {avg_results['enc_time']: .3f} s")
     print(f"Dec Time: {avg_results['dec_time']: .3f} s")
-    print("="*50)
+    print("=" * 50)
 
     # --- DUMP JSON TO RD_report.json ---
     json_path = os.path.join(args.output, "RD_report.json")
     with open(json_path, "w") as f:
         json.dump(avg_results, f, indent=4)
     print(f"Saved metrics to {json_path}")
+
 
 if __name__ == "__main__":
     main()
