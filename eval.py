@@ -105,6 +105,14 @@ def main():
     print(f"Evaluating on {len(image_paths)} images from {args.dataset}")
     print(f"Outputs will be saved to: {args.output}/")
 
+    print("Warming up CUDA context for precise timing...")
+    with torch.no_grad():
+        dummy_x = torch.zeros(1, 3, 256, 256).to(device)
+        _ = model.compress(dummy_x)
+        if args.cuda:
+            torch.cuda.synchronize()
+    print("Warmup complete. Starting benchmark...")
+
     with torch.no_grad():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")

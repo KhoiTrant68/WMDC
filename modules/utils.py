@@ -43,5 +43,10 @@ class CheckboardMaskedConv2d(nn.Conv2d):
         self.mask[:, :, 1::2, 0::2] = 1
 
     def forward(self, x):
-        self.weight.data *= self.mask
-        return super().forward(x)
+        # self.weight.data *= self.mask
+        # return super().forward(x)
+        masked_weight = self.weight * self.mask
+        return torch.nn.functional.conv2d(
+            x, masked_weight, self.bias, self.stride, 
+            self.padding, self.dilation, self.groups
+        )

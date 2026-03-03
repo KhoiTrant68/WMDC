@@ -44,7 +44,7 @@ class LearnableFRFT_Split(nn.Module):
 class FRFTSplitter(nn.Module):
     """
     Splits latent y[B, M, H, W] into Frequency Components [B, 4M, H/2, W/2].
-    Accepts a shared FRFT module to ensure perfect invertibility.
+    Accepts a shared FRFT module to ensure invertibility.
     """
 
     def __init__(self, channel_m, frft_module):
@@ -55,8 +55,9 @@ class FRFTSplitter(nn.Module):
 
     def forward(self, x):
         x = nn.functional.pixel_unshuffle(x, 2)  # [B, 4M, H/2, W/2]
-        x_freq = self.frft(x)
-        x_cat = torch.cat([x_freq.real, x_freq.imag], dim=1)  # [B, 8M, H/2, W/2]
+        with torch.amp.autocast(device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32):
+            x_freq = self.frft(x.float())
+            x_cat = torch.cat([x_freq.real, x_freq.imag], dim=1)  # [B, 8M, H/2, W/2]
         x_real = self.c2r_conv(x_cat)
         return x_real
 
@@ -64,7 +65,7 @@ class FRFTSplitter(nn.Module):
 class FRFTMerger(nn.Module):
     """
     Merges Frequency Components [B, 4M, H/2, W/2] back to [B, M, H, W].
-    Accepts a shared FRFT module to ensure perfect invertibility.
+    Accepts a shared FRFT module to ensure invertibility.
     """
 
     def __init__(self, channel_m, frft_module):
@@ -76,9 +77,10 @@ class FRFTMerger(nn.Module):
     def forward(self, x):
         x_cat = self.r2c_conv(x)  # [B, 8M, H/2, W/2]
         chunks = torch.chunk(x_cat, 2, dim=1)  # Tuple of [B, 4M, ...]
-        x_complex = torch.complex(chunks[0], chunks[1])
-        x_spatial = self.frft.inverse(x_complex)
-        x_spatial = x_spatial.real
+        with torch.amp.autocast(device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32):
+            x_complex = torch.complex(chunks[0].float(), chunks[1].float())
+            x_spatial = self.frft.inverse(x_complex)
+            x_spatial = x_spatial.real
         x_out = torch.nn.functional.pixel_shuffle(x_spatial, 2)  # [B, M, H, W]
         return x_out
 
@@ -467,7 +469,7 @@ class WMDC(CompressionModel):
                 torch.cat([ctx_params_anchor_split[i], support], dim=1)
             ).chunk(2, 1)
             means_anchor = self.anchor_atten_mean_lf[i](means_anchor)
-            scales_anchor = self.anchor_atten_scale_lf[i](scales_anchor)
+            scales_anchor = torch.nn.functional.softplus(self.anchor_atten_scale_lf[i](scales_anchor)) + 1e-6
 
             scales_hat_split = torch.zeros_like(y_anchor)
             means_hat_split = torch.zeros_like(y_anchor)
@@ -485,7 +487,7 @@ class WMDC(CompressionModel):
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
             means_non_anchor = self.anchor_atten_mean_lf[i](means_non_anchor)
-            scales_non_anchor = self.anchor_atten_scale_lf[i](scales_non_anchor)
+            scales_non_anchor = torch.nn.functional.softplus(self.anchor_atten_scale_lf[i](scales_non_anchor)) + 1e-6
 
             scales_hat_split[:, :, 0::2, 1::2] = scales_non_anchor[:, :, 0::2, 1::2]
             scales_hat_split[:, :, 1::2, 0::2] = scales_non_anchor[:, :, 1::2, 0::2]
@@ -516,7 +518,7 @@ class WMDC(CompressionModel):
         y_lf_likelihoods = torch.cat(y_lf_likelihood, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY (DICTIONARY)
+        # PATH B: HIGH FREQUENCY (Static Spectral Cross-Attention)
         # ----------------------------------------------------------------------
         y_hf_slices = y_hf.chunk(self.num_slices, 1)
         y_hf_hat_slices = []
@@ -680,7 +682,10 @@ class WMDC(CompressionModel):
                 y_anchor_encode, "symbols", means_anchor_encode
             )
 
-            symbols_list_lf.extend(y_anchor_symbols.reshape(-1).tolist())
+            offset_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_anchor]
+            y_anchor_symbols_shifted = (y_anchor_symbols - offset_anchor).int()
+            
+            symbols_list_lf.extend(y_anchor_symbols_shifted.reshape(-1).tolist())
             indexes_list_lf.extend(indexes_anchor.reshape(-1).tolist())
 
             anchor_quantized = self.gaussian_conditional_lf.dequantize(
@@ -727,7 +732,10 @@ class WMDC(CompressionModel):
                 y_non_anchor_encode, "symbols", means_non_anchor_encode
             )
 
-            symbols_list_lf.extend(y_non_anchor_symbols.reshape(-1).tolist())
+            offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_non_anchor]
+            y_non_anchor_symbols_shifted = (y_non_anchor_symbols - offset_non_anchor).int()
+            
+            symbols_list_lf.extend(y_non_anchor_symbols_shifted.reshape(-1).tolist())
             indexes_list_lf.extend(indexes_non_anchor.reshape(-1).tolist())
 
             non_anchor_quantized = self.gaussian_conditional_lf.dequantize(
@@ -785,7 +793,9 @@ class WMDC(CompressionModel):
             indexes = self.gaussian_conditional_hf.build_indexes(scale)
             y_hf_symbols = self.gaussian_conditional_hf.quantize(y_slice, "symbols", mu)
 
-            symbols_list_hf.extend(y_hf_symbols.reshape(-1).tolist())
+            offset_hf = self.gaussian_conditional_hf.offset.view(-1)[indexes]
+            y_hf_symbols_shifted = (y_hf_symbols - offset_hf).int()
+            symbols_list_hf.extend(y_hf_symbols_shifted.reshape(-1).tolist())
             indexes_list_hf.extend(indexes.reshape(-1).tolist())
 
             y_hat_slice = self.gaussian_conditional_hf.dequantize(y_hf_symbols, mu)
@@ -897,6 +907,8 @@ class WMDC(CompressionModel):
                 torch.Tensor(rv_anchor).to(z_hat.device).reshape(indexes_anchor.size())
             )
 
+            offset_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_anchor]
+            rv_anchor = rv_anchor + offset_anchor
             anchor_quantized = rv_anchor + means_anchor_encode
 
             y_anchor_decode = torch.zeros(B_anchor, C_anchor, H_anchor, W_anchor).to(
@@ -943,7 +955,8 @@ class WMDC(CompressionModel):
                 .to(z_hat.device)
                 .reshape(indexes_non_anchor.size())
             )
-
+            offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_non_anchor]
+            rv_non_anchor = rv_non_anchor + offset_non_anchor
             non_anchor_quantized = rv_non_anchor + means_non_anchor_encode
 
             y_non_anchor_quantized = torch.zeros_like(means_anchor)
@@ -995,7 +1008,8 @@ class WMDC(CompressionModel):
             )
             rv_hf = torch.Tensor(rv_hf).to(z_hat.device).reshape(indexes.size())
 
-            y_hat_slice = rv_hf + mu
+            offset_hf = self.gaussian_conditional_hf.offset.view(-1)[indexes]
+            y_hat_slice = rv_hf + offset_hf + mu
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             lrp = 0.5 * torch.tanh(self.lrp_transforms_hf[i](lrp_support))

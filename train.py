@@ -318,7 +318,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
 
