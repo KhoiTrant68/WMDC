@@ -180,6 +180,13 @@ def train_one_epoch(
     )
 
     for i, d in pbar:
+        # Detach quantiles from Main Graph
+        # We temporarily disable gradients for quantiles during the main pass
+        # so DDP doesn't try to synchronize them (avoiding 'marked ready twice' error).
+        for n, p in model.named_parameters():
+            if n.endswith(".quantiles"):
+                p.requires_grad = False
+
         optimizer.zero_grad()
         out_net = model(d)
 
@@ -190,6 +197,11 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
 
         optimizer.step()
+
+        # Re-enable quantiles for Aux Graph
+        for n, p in model.named_parameters():
+            if n.endswith(".quantiles"):
+                p.requires_grad = True
 
         unwrapped_model = accelerator.unwrap_model(model)
         aux_loss = unwrapped_model.aux_loss()
@@ -318,7 +330,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
 

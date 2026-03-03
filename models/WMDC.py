@@ -55,7 +55,9 @@ class FRFTSplitter(nn.Module):
 
     def forward(self, x):
         x = nn.functional.pixel_unshuffle(x, 2)  # [B, 4M, H/2, W/2]
-        with torch.amp.autocast(device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32):
+        with torch.amp.autocast(
+            device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32
+        ):
             x_freq = self.frft(x.float())
             x_cat = torch.cat([x_freq.real, x_freq.imag], dim=1)  # [B, 8M, H/2, W/2]
         x_real = self.c2r_conv(x_cat)
@@ -77,7 +79,9 @@ class FRFTMerger(nn.Module):
     def forward(self, x):
         x_cat = self.r2c_conv(x)  # [B, 8M, H/2, W/2]
         chunks = torch.chunk(x_cat, 2, dim=1)  # Tuple of [B, 4M, ...]
-        with torch.amp.autocast(device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32):
+        with torch.amp.autocast(
+            device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32
+        ):
             x_complex = torch.complex(chunks[0].float(), chunks[1].float())
             x_spatial = self.frft.inverse(x_complex)
             x_spatial = x_spatial.real
@@ -469,7 +473,12 @@ class WMDC(CompressionModel):
                 torch.cat([ctx_params_anchor_split[i], support], dim=1)
             ).chunk(2, 1)
             means_anchor = self.anchor_atten_mean_lf[i](means_anchor)
-            scales_anchor = torch.nn.functional.softplus(self.anchor_atten_scale_lf[i](scales_anchor)) + 1e-6
+            scales_anchor = (
+                torch.nn.functional.softplus(
+                    self.anchor_atten_scale_lf[i](scales_anchor)
+                )
+                + 1e-6
+            )
 
             scales_hat_split = torch.zeros_like(y_anchor)
             means_hat_split = torch.zeros_like(y_anchor)
@@ -487,7 +496,12 @@ class WMDC(CompressionModel):
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
             means_non_anchor = self.anchor_atten_mean_lf[i](means_non_anchor)
-            scales_non_anchor = torch.nn.functional.softplus(self.anchor_atten_scale_lf[i](scales_non_anchor)) + 1e-6
+            scales_non_anchor = (
+                torch.nn.functional.softplus(
+                    self.anchor_atten_scale_lf[i](scales_non_anchor)
+                )
+                + 1e-6
+            )
 
             scales_hat_split[:, :, 0::2, 1::2] = scales_non_anchor[:, :, 0::2, 1::2]
             scales_hat_split[:, :, 1::2, 0::2] = scales_non_anchor[:, :, 1::2, 0::2]
@@ -684,7 +698,7 @@ class WMDC(CompressionModel):
 
             offset_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_anchor]
             y_anchor_symbols_shifted = (y_anchor_symbols - offset_anchor).int()
-            
+
             symbols_list_lf.extend(y_anchor_symbols_shifted.reshape(-1).tolist())
             indexes_list_lf.extend(indexes_anchor.reshape(-1).tolist())
 
@@ -732,9 +746,13 @@ class WMDC(CompressionModel):
                 y_non_anchor_encode, "symbols", means_non_anchor_encode
             )
 
-            offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_non_anchor]
-            y_non_anchor_symbols_shifted = (y_non_anchor_symbols - offset_non_anchor).int()
-            
+            offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[
+                indexes_non_anchor
+            ]
+            y_non_anchor_symbols_shifted = (
+                y_non_anchor_symbols - offset_non_anchor
+            ).int()
+
             symbols_list_lf.extend(y_non_anchor_symbols_shifted.reshape(-1).tolist())
             indexes_list_lf.extend(indexes_non_anchor.reshape(-1).tolist())
 
@@ -955,7 +973,9 @@ class WMDC(CompressionModel):
                 .to(z_hat.device)
                 .reshape(indexes_non_anchor.size())
             )
-            offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_non_anchor]
+            offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[
+                indexes_non_anchor
+            ]
             rv_non_anchor = rv_non_anchor + offset_non_anchor
             non_anchor_quantized = rv_non_anchor + means_non_anchor_encode
 
