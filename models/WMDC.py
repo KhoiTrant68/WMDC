@@ -1,129 +1,65 @@
 import math
 import torch
+from torch import nn
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
-from torch import nn
-from torch_frft.frft_module import frft
 
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
-from modules.utils import CheckboardMaskedConv2d, conv, conv1x1, deconv
+from modules.utils import CheckboardMaskedConv2d, conv, deconv
 from modules.VSS_module import VSSBlock
+
 from modules.wavelet_blocks import (
+    DWT_2D,
+    IDWT_2D,
     ResidualBlockUpsample_wave,
     ResidualBlockWithStride_wave,
 )
 
 
-class LearnableFRFT_Split(nn.Module):
-    """
-    Helper module to apply learnable Fractional Fourier Transform (FRFT) on 2D feature maps.
-    """
-
-    def __init__(self, init_a=0.5):
-        super().__init__()
-        self.raw_a_h = nn.Parameter(torch.tensor(init_a))
-        self.raw_a_w = nn.Parameter(torch.tensor(init_a))
-
-    def forward(self, x):
-        # Apply FRFT on Height (dim=2) and Width (dim=3)
-        x = frft(x, self.raw_a_h, dim=2)
-        x = frft(x, self.raw_a_w, dim=3)
-        return x
-
-    def inverse(self, x):
-        # Inverse Apply (-a)
-        x = frft(x, -self.raw_a_w, dim=3)
-        x = frft(x, -self.raw_a_h, dim=2)
-        return x
-
-
-class LearnableFrftForward(nn.Module):
-    """
-    Generalized Frequency Decoupling using Fractional Fourier Transform (FRFT).
-    Replaces the traditional Discrete Wavelet Transform (DWT). The pixel_unshuffle
-    operation merely rearranges spatial features into the channel dimension before
-    applying the continuous fractional domain transformation.
-    """
-
-    def __init__(self, channel_m, frft_module):
-        super().__init__()
-        self.frft = frft_module
-        # Projection: Real+Imag (8M) -> Real (4M)
-        self.c2r_conv = nn.Conv2d(channel_m * 8, channel_m * 4, kernel_size=1)
-
-    def forward(self, x):
-        x = nn.functional.pixel_unshuffle(x, 2)  # Spatial-to-channel rearrangement
-        with torch.amp.autocast(
-            device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32
-        ):
-            x_freq = self.frft(x.float())
-            x_cat = torch.cat([x_freq.real, x_freq.imag], dim=1)  # [B, 8M, H/2, W/2]
-        x_real = self.c2r_conv(x_cat)
-        return x_real
-
-
-class LearnableFrftInverse(nn.Module):
-    """
-    Inverse FRFT processing. Merges Frequency Components back to the spatial domain.
-    Ensures invertibility by using the shared learnable parameters.
-    """
-
-    def __init__(self, channel_m, frft_module):
-        super().__init__()
-        self.frft = frft_module
-        # Projection: Real (4M) -> Real+Imag (8M)
-        self.r2c_conv = nn.Conv2d(channel_m * 4, channel_m * 8, kernel_size=1)
-
-    def forward(self, x):
-        x_cat = self.r2c_conv(x)  # [B, 8M, H/2, W/2]
-        chunks = torch.chunk(x_cat, 2, dim=1)  # Tuple of[B, 4M, ...]
-        with torch.amp.autocast(
-            device_type="cuda" if x.is_cuda else "cpu", dtype=torch.float32
-        ):
-            x_complex = torch.complex(chunks[0].float(), chunks[1].float())
-            x_spatial = self.frft.inverse(x_complex)
-            x_spatial = x_spatial.real
-        x_out = torch.nn.functional.pixel_shuffle(x_spatial, 2)  # [B, M, H, W]
-        return x_out
-
-
 class SoftQuantizer(nn.Module):
     """
-    Annealed Quantizer: Switches from Additive Uniform Noise to STE Rounding.
+    Soft-to-Hard Quantization Annealing.
+    Transitions smoothly from uniform noise (tau=0) to STE (tau=1) over training,
+    stabilizing gradients for Mamba and Cross-Attention modules.
     """
 
     def __init__(self):
         super().__init__()
-        self.register_buffer("quant_mode", torch.tensor(0, dtype=torch.int))
+        self.register_buffer("tau", torch.tensor(0.0, dtype=torch.float32))
 
-    def set_mode(self, mode="noise"):
-        self.quant_mode.fill_(0 if mode == "noise" else 1)
+    def update_tau(self, tau_value):
+        """Updates the temperature parameter (called from train.py)"""
+        self.tau.fill_(tau_value)
 
     def forward(self, x, means=None):
-        if self.training and self.quant_mode == 0:
+        if self.training:
+            # 1. Hard rounding (STE path)
+            x_centered = x - means if means is not None else x
+            x_quant = torch.round(x_centered)
+            ste_path = x_quant.detach() - x_centered.detach() + x_centered
+            ste_out = ste_path + means if means is not None else ste_path
+
+            # 2. Additive Uniform Noise path
             noise = torch.rand_like(x) - 0.5
-            return x + noise
+            noise_out = x + noise
+
+            # Interpolate based on current epoch temperature (tau)
+            return self.tau * ste_out + (1.0 - self.tau) * noise_out
         else:
+            # Inference always uses hard rounding
             if means is not None:
-                x_centered = x - means
-                x_quant = torch.round(x_centered)
-                return x_quant.detach() - x_centered.detach() + x_centered + means
-            else:
-                x_quant = torch.round(x)
-                return x_quant.detach() - x.detach() + x
+                return torch.round(x - means) + means
+            return torch.round(x)
 
 
 class MambaContextLayer(nn.Module):
     """
-    Replaces redundant Swin-Attention with a pure Visual State Space (Mamba) block.
-    This ensures the model relies exclusively on SSMs for spatial context extraction,
-    sharpening the architectural narrative and reducing computational overhead.
+    Core Visual State Space (Mamba) block for capturing global receptive fields.
     """
 
     def __init__(self, dim):
         super().__init__()
-        # Utilizing the core VSSBlock to establish global receptive fields efficiently
         self.vss = VSSBlock(hidden_dim=dim, drop_path=0.0, ssm_d_state=16)
 
     def forward(self, x):
@@ -143,7 +79,7 @@ class WMDC(CompressionModel):
 
         self.quantizer = SoftQuantizer()
 
-        # A. MAIN ENCODER
+        # A. MAIN ENCODER (Spatial)
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
             ResidualBlockWithStride_wave(N, N, stride=2, wavelet="haar"),
@@ -151,10 +87,9 @@ class WMDC(CompressionModel):
             conv(N, M, kernel_size=5, stride=2),
         )
 
-        # B. SPECTRAL SPLIT (Learnable FRFT Domain Transformation)
-        self.shared_frft = LearnableFRFT_Split(init_a=0.5)
-        self.frft_forward = LearnableFrftForward(M, self.shared_frft)
-        self.frft_inverse = LearnableFrftInverse(M, self.shared_frft)
+        # B. SPECTRAL SPLIT (Wavelet Transform)
+        self.dwt = DWT_2D(wave="haar")
+        self.idwt = IDWT_2D(wave="haar")
 
         # C. HYPER-PRIOR AUTOENCODER (State Space Prior)
         self.h_a = nn.Sequential(
@@ -268,15 +203,10 @@ class WMDC(CompressionModel):
             torch.randn([dict_num, self.dict_dim]), requires_grad=True
         )
 
-        # BOTTLENECK: Compress massive channel dimensions down to 512 to prevent FLOPs explosion
-        # Base input = M (y_low_hat) + 6*M (params_hf) = 7*M. Plus decoded slices = slice_ch_hf * i
-        self.hf_bottlenecks = nn.ModuleList(
-            conv1x1(7 * M + self.slice_ch_hf * i, 512) for i in range(self.num_slices)
-        )
-
+        # Query dimension: y_low_hat (M) + params_hf (2M) + decoded slices (i * slice_ch_hf) = 3M + i * slice_ch_hf
         self.dt_cross_attention_hf = nn.ModuleList(
             MultiScaleDictionaryCrossAttentionGLU(
-                input_dim=512,  # Uses the bottleneck output
+                input_dim=3 * M + (self.slice_ch_hf * i),
                 output_dim=3 * M,
                 head_num=dict_head_num,
                 mlp_rate=4,
@@ -288,9 +218,8 @@ class WMDC(CompressionModel):
 
         self.cc_transforms_hf = nn.ModuleList(
             nn.Sequential(
-                conv(
-                    512 + 3 * M, 512, stride=1, kernel_size=3
-                ),  # Query (512) + Dict Output (3M)
+                # support_dim = query_dim (3M + i*slice_ch_hf) + dict_output (3M) = 6M + i*slice_ch_hf
+                conv((6 * M) + (self.slice_ch_hf * i), 512, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(512, 256, stride=1, kernel_size=3),
                 nn.GELU(),
@@ -301,7 +230,10 @@ class WMDC(CompressionModel):
 
         self.lrp_transforms_hf = nn.ModuleList(
             nn.Sequential(
-                conv(512 + 3 * M + self.slice_ch_hf, 512, stride=1, kernel_size=3),
+                # lrp_support_dim = support_dim (6M + i*slice_ch_hf) + y_hat_slice (slice_ch_hf) = 6M + (i+1)*slice_ch_hf
+                conv(
+                    (6 * M) + (self.slice_ch_hf * (i + 1)), 512, stride=1, kernel_size=3
+                ),
                 nn.GELU(),
                 conv(512, 256, stride=1, kernel_size=3),
                 nn.GELU(),
@@ -319,9 +251,6 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
-    def set_quantization_stage(self, mode="noise"):
-        self.quantizer.set_mode(mode)
-
     # ==========================================================================
     # FORWARD
     # ==========================================================================
@@ -331,10 +260,11 @@ class WMDC(CompressionModel):
         y = self.g_a(x)
         y_shape = y.shape[2:]
 
-        # Fractional Domain Decoupling
-        y_freq = self.frft_forward(y)
-        y_low = y_freq[:, : self.M, :, :]
-        y_high = y_freq[:, self.M :, :, :]
+        # Wavelet Domain Decoupling
+        y_freq = self.dwt(y)  # [B, 4M, H/2, W/2]
+
+        y_low = y_freq[:, : self.M, :, :]  # LL band (M)
+        y_high = y_freq[:, self.M :, :, :]  # LH, HL, HH bands (3M)
 
         z = self.h_a(y_freq)
         _, z_likelihoods = self.entropy_bottleneck(z)
@@ -352,7 +282,9 @@ class WMDC(CompressionModel):
             latent_means[:, : self.M],
             latent_means[:, self.M :],
         )
-        params_hf = torch.cat([latent_scales_hf, latent_means_hf], dim=1)
+        params_hf = torch.cat(
+            [latent_scales_hf, latent_means_hf], dim=1
+        )  # [B, 2M, ...]
 
         # ----------------------------------------------------------------------
         # PATH A: LOW FREQUENCY (Mamba Checkerboard Context)
@@ -465,7 +397,7 @@ class WMDC(CompressionModel):
         y_low_likelihoods = torch.cat(y_low_likelihood, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY (Bottleneck + Dictionary Cross-Attention)
+        # PATH B: HIGH FREQUENCY (Un-bottlenecked Dictionary Cross-Attention)
         # ----------------------------------------------------------------------
         y_high_slices = y_high.chunk(self.num_slices, 1)
         y_high_hat_slices = []
@@ -473,18 +405,13 @@ class WMDC(CompressionModel):
         dt_batch = self.dt.repeat([B, 1, 1])
 
         for i, y_slice in enumerate(y_high_slices):
-            query_raw = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
-
-            # Bottleneck to resolve channel explosion
-            query = self.hf_bottlenecks[i](query_raw)
-
+            query = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
             gaussian_params = self.cc_transforms_hf[i](support)
             mu, scale = gaussian_params.chunk(2, 1)
 
-            # Ensure strictly positive scales
             scale = nn.functional.softplus(scale) + 1e-6
 
             _, y_slice_likelihood = self.gaussian_conditional_hf(
@@ -508,7 +435,7 @@ class WMDC(CompressionModel):
         # MERGE & DECODE
         # ----------------------------------------------------------------------
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
-        y_tilde = self.frft_inverse(y_freq_hat)
+        y_tilde = self.idwt(y_freq_hat)
         x_hat = self.g_s(y_tilde)
 
         return {
@@ -538,7 +465,7 @@ class WMDC(CompressionModel):
     def compress(self, x):
         B, C, H, W = x.size()
         y = self.g_a(x)
-        y_freq = self.frft_forward(y)
+        y_freq = self.dwt(y)
         H_wave, W_wave = y_freq.shape[2:]
         y_low = y_freq[:, : self.M, :, :]
         y_high = y_freq[:, self.M :, :, :]
@@ -737,8 +664,7 @@ class WMDC(CompressionModel):
         indexes_list_hf = []
 
         for i, y_slice in enumerate(y_high_slices):
-            query_raw = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
-            query = self.hf_bottlenecks[i](query_raw)
+            query = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
@@ -911,6 +837,7 @@ class WMDC(CompressionModel):
                 .to(z_hat.device)
                 .reshape(indexes_non_anchor.size())
             )
+
             offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[
                 indexes_non_anchor
             ]
@@ -951,8 +878,7 @@ class WMDC(CompressionModel):
         decoder_hf.set_stream(y_high_string)
 
         for i in range(self.num_slices):
-            query_raw = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
-            query = self.hf_bottlenecks[i](query_raw)
+            query = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
@@ -982,7 +908,7 @@ class WMDC(CompressionModel):
         # MERGE & DECODE
         # ----------------------------------------------------------------------
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
-        y_tilde = self.frft_inverse(y_freq_hat)
+        y_tilde = self.idwt(y_freq_hat)
         x_hat = self.g_s(y_tilde).clamp_(0, 1)
 
         return {"x_hat": x_hat}

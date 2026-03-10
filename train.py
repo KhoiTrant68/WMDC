@@ -410,12 +410,20 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         # [CRITICAL UPDATE]: Switch SoftQuantizer phase to STE fine-tuning
-        if epoch == 5:
-            accelerator.unwrap_model(model).set_quantization_stage("ste")
-            if accelerator.is_main_process:
-                logger.info(
-                    "Epoch 5 reached: Switched quantizer to Phase 2 (STE mode)."
-                )
+
+        anneal_start = 3
+        anneal_end = args.epochs - 3
+        if epoch <= anneal_start:
+            tau = 0.0
+        elif epoch >= anneal_end:
+            tau = 1.0
+        else:
+            tau = (epoch - anneal_start) / (anneal_end - anneal_start)
+
+        accelerator.unwrap_model(model).quantizer.update_tau(tau)
+
+        if accelerator.is_main_process:
+            logger.info("Epoch 5 reached: Switched quantizer to Phase 2 (STE mode).")
 
         train_loss = train_one_epoch(
             model,
