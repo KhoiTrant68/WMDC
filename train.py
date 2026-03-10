@@ -410,11 +410,11 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         # [CRITICAL UPDATE]: Switch SoftQuantizer phase to STE fine-tuning
-        if epoch == 80:
+        if epoch == 5:
             accelerator.unwrap_model(model).set_quantization_stage("ste")
             if accelerator.is_main_process:
                 logger.info(
-                    "Epoch 80 reached: Switched quantizer to Phase 2 (STE mode)."
+                    "Epoch 5 reached: Switched quantizer to Phase 2 (STE mode)."
                 )
 
         train_loss = train_one_epoch(
