@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 # =========================================================
 # Format: "Method Name": ([bpp_points], [psnr_points], "marker", "color")
 
+
 methods_data = {
     # Anchor Method (Usually VVC or a standard baseline)
     "VVC (VTM)": (
