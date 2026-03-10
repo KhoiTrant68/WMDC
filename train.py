@@ -418,7 +418,8 @@ def main():
         elif epoch >= anneal_end:
             tau = 1.0
         else:
-            tau = (epoch - anneal_start) / (anneal_end - anneal_start)
+            progress = (epoch - anneal_start) / (anneal_end - anneal_start)
+            tau = 0.5 * (1.0 - math.cos(math.pi * progress))
 
         accelerator.unwrap_model(model).quantizer.update_tau(tau)
 

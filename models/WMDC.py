@@ -199,7 +199,7 @@ class WMDC(CompressionModel):
         self.dt = nn.Parameter(
             torch.randn([dict_num, self.dict_dim]), requires_grad=True
         )
-
+        nn.init.orthogonal_(self.dt)
         for dir_name in ["lh", "hl", "hh"]:
             # Query Dim: y_low_hat(M) + scale_dir(M) + mean_dir(M) + past_slices(i * slice_ch_dir)
             query_dim = lambda i: 3 * M + (self.slice_ch_dir * i)
@@ -392,9 +392,9 @@ class WMDC(CompressionModel):
                 means_non_anchor[:, :, 1::2, 0::2],
             )
 
-            _, y_slice_likelihood = self.gaussian_conditional_lf(
-                y_slice, scales_hat_split, means=means_hat_split
-            )
+            # _, y_slice_likelihood = self.gaussian_conditional_lf(
+            #     y_slice, scales_hat_split, means=means_hat_split
+            # )
 
             y_non_anchor = non_anchor_split[i]
             y_non_anchor_quantized = self.quantizer(
@@ -404,6 +404,10 @@ class WMDC(CompressionModel):
             y_non_anchor_quantized[:, :, 1::2, 1::2] = 0
 
             y_hat_slice = y_anchor_quantized + y_non_anchor_quantized
+
+            y_slice_likelihood = self.gaussian_conditional_lf._likelihood(
+                y_hat_slice, scales_hat_split, means=means_hat_split
+            )
             lrp = 0.5 * torch.tanh(
                 self.lrp_transforms_lf[i](torch.cat([mean_support, y_hat_slice], dim=1))
             )
@@ -427,7 +431,7 @@ class WMDC(CompressionModel):
         dt_batch = self.dt.repeat([B, 1, 1])
 
         for i, y_slice in enumerate(y_high_slices):
-            y_lh_slice, y_hl_slice, y_hh_slice = y_slice.chunk(3, dim=1)
+            # y_lh_slice, y_hl_slice, y_hh_slice = y_slice.chunk(3, dim=1)
 
             # 1. Parallel Directional Queries
             q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
@@ -453,10 +457,13 @@ class WMDC(CompressionModel):
             scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
             scale = nn.functional.softplus(scale) + 1e-6
 
-            _, y_slice_like = self.gaussian_conditional_hf(y_slice, scale, means=mu)
+            # _, y_slice_like = self.gaussian_conditional_hf(y_slice, scale, means=mu)
+            y_hat_slice = self.quantizer(y_slice, means=mu)
+            y_slice_like = self.gaussian_conditional_hf._likelihood(
+                y_hat_slice, scale, means=mu
+            )
             y_high_likelihood.append(y_slice_like)
 
-            y_hat_slice = self.quantizer(y_slice, means=mu)
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
 
             # 4. Parallel LRP
