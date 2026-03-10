@@ -1,12 +1,12 @@
 import math
 import torch
-from torch import nn
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
+from torch import nn
 
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
-from modules.utils import CheckboardMaskedConv2d, conv, deconv
+from modules.utils import CheckboardMaskedConv2d, conv, conv1x1, deconv
 from modules.VSS_module import VSSBlock
 
 from modules.wavelet_blocks import (
@@ -18,46 +18,31 @@ from modules.wavelet_blocks import (
 
 
 class SoftQuantizer(nn.Module):
-    """
-    Soft-to-Hard Quantization Annealing.
-    Transitions smoothly from uniform noise (tau=0) to STE (tau=1) over training,
-    stabilizing gradients for Mamba and Cross-Attention modules.
-    """
-
     def __init__(self):
         super().__init__()
         self.register_buffer("tau", torch.tensor(0.0, dtype=torch.float32))
 
     def update_tau(self, tau_value):
-        """Updates the temperature parameter (called from train.py)"""
         self.tau.fill_(tau_value)
 
     def forward(self, x, means=None):
         if self.training:
-            # 1. Hard rounding (STE path)
             x_centered = x - means if means is not None else x
             x_quant = torch.round(x_centered)
             ste_path = x_quant.detach() - x_centered.detach() + x_centered
             ste_out = ste_path + means if means is not None else ste_path
 
-            # 2. Additive Uniform Noise path
             noise = torch.rand_like(x) - 0.5
             noise_out = x + noise
 
-            # Interpolate based on current epoch temperature (tau)
             return self.tau * ste_out + (1.0 - self.tau) * noise_out
         else:
-            # Inference always uses hard rounding
             if means is not None:
                 return torch.round(x - means) + means
             return torch.round(x)
 
 
 class MambaContextLayer(nn.Module):
-    """
-    Core Visual State Space (Mamba) block for capturing global receptive fields.
-    """
-
     def __init__(self, dim):
         super().__init__()
         self.vss = VSSBlock(hidden_dim=dim, drop_path=0.0, ssm_d_state=16)
@@ -79,7 +64,7 @@ class WMDC(CompressionModel):
 
         self.quantizer = SoftQuantizer()
 
-        # A. MAIN ENCODER (Spatial)
+        # A. MAIN ENCODER
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
             ResidualBlockWithStride_wave(N, N, stride=2, wavelet="haar"),
@@ -91,7 +76,7 @@ class WMDC(CompressionModel):
         self.dwt = DWT_2D(wave="haar")
         self.idwt = IDWT_2D(wave="haar")
 
-        # C. HYPER-PRIOR AUTOENCODER (State Space Prior)
+        # C. HYPER-PRIOR AUTOENCODER
         self.h_a = nn.Sequential(
             conv(4 * M, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
@@ -110,7 +95,7 @@ class WMDC(CompressionModel):
             deconv(N, 4 * M, kernel_size=5, stride=2),
         )
 
-        # D. PATH A: LOW FREQUENCY ENTROPY MODEL (Pure Mamba Context)
+        # D. PATH A: LOW FREQUENCY ENTROPY MODEL
         self.atten_mean_lf = nn.ModuleList(
             MambaContextLayer(M + self.slice_ch_lf * min(i, 5))
             for i in range(self.num_slices)
@@ -197,16 +182,21 @@ class WMDC(CompressionModel):
         )
         self.gaussian_conditional_lf = GaussianConditional(None)
 
-        # E. PATH B: HIGH FREQUENCY ENTROPY MODEL (Dictionary & Cross-Attention)
+        # E. PATH B: HIGH FREQUENCY ENTROPY MODEL
         self.dict_dim = 32 * dict_head_num
         self.dt = nn.Parameter(
             torch.randn([dict_num, self.dict_dim]), requires_grad=True
         )
 
-        # Query dimension: y_low_hat (M) + params_hf (2M) + decoded slices (i * slice_ch_hf) = 3M + i * slice_ch_hf
+        # RESTORED BOTTLENECK: The Wavelet High-Frequency params (LH, HL, HH) result in 7*M channels.
+        # We must project this massive 2240 channel tensor to 512 to prevent shape mismatch and OOM.
+        self.hf_bottlenecks = nn.ModuleList(
+            conv1x1(7 * M + self.slice_ch_hf * i, 512) for i in range(self.num_slices)
+        )
+
         self.dt_cross_attention_hf = nn.ModuleList(
             MultiScaleDictionaryCrossAttentionGLU(
-                input_dim=3 * M + (self.slice_ch_hf * i),
+                input_dim=512,  # Uses the bottleneck output
                 output_dim=3 * M,
                 head_num=dict_head_num,
                 mlp_rate=4,
@@ -218,8 +208,7 @@ class WMDC(CompressionModel):
 
         self.cc_transforms_hf = nn.ModuleList(
             nn.Sequential(
-                # support_dim = query_dim (3M + i*slice_ch_hf) + dict_output (3M) = 6M + i*slice_ch_hf
-                conv((6 * M) + (self.slice_ch_hf * i), 512, stride=1, kernel_size=3),
+                conv(512 + 3 * M, 512, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(512, 256, stride=1, kernel_size=3),
                 nn.GELU(),
@@ -230,10 +219,7 @@ class WMDC(CompressionModel):
 
         self.lrp_transforms_hf = nn.ModuleList(
             nn.Sequential(
-                # lrp_support_dim = support_dim (6M + i*slice_ch_hf) + y_hat_slice (slice_ch_hf) = 6M + (i+1)*slice_ch_hf
-                conv(
-                    (6 * M) + (self.slice_ch_hf * (i + 1)), 512, stride=1, kernel_size=3
-                ),
+                conv(512 + 3 * M + self.slice_ch_hf, 512, stride=1, kernel_size=3),
                 nn.GELU(),
                 conv(512, 256, stride=1, kernel_size=3),
                 nn.GELU(),
@@ -251,20 +237,15 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
-    # ==========================================================================
-    # FORWARD
-    # ==========================================================================
     def forward(self, x):
         B, C, H, W = x.size()
 
         y = self.g_a(x)
         y_shape = y.shape[2:]
 
-        # Wavelet Domain Decoupling
-        y_freq = self.dwt(y)  # [B, 4M, H/2, W/2]
-
-        y_low = y_freq[:, : self.M, :, :]  # LL band (M)
-        y_high = y_freq[:, self.M :, :, :]  # LH, HL, HH bands (3M)
+        y_freq = self.dwt(y)
+        y_low = y_freq[:, : self.M, :, :]
+        y_high = y_freq[:, self.M :, :, :]
 
         z = self.h_a(y_freq)
         _, z_likelihoods = self.entropy_bottleneck(z)
@@ -282,12 +263,10 @@ class WMDC(CompressionModel):
             latent_means[:, : self.M],
             latent_means[:, self.M :],
         )
-        params_hf = torch.cat(
-            [latent_scales_hf, latent_means_hf], dim=1
-        )  # [B, 2M, ...]
+        params_hf = torch.cat([latent_scales_hf, latent_means_hf], dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH A: LOW FREQUENCY (Mamba Checkerboard Context)
+        # PATH A: LOW FREQUENCY
         # ----------------------------------------------------------------------
         anchor = torch.zeros_like(y_low).to(x.device)
         non_anchor = torch.zeros_like(y_low).to(x.device)
@@ -311,8 +290,7 @@ class WMDC(CompressionModel):
             1,
         )
 
-        y_low_hat_slices = []
-        y_low_likelihood = []
+        y_low_hat_slices, y_low_likelihood = [], []
 
         for i, y_slice in enumerate(y_low_slices):
             mean_support = torch.cat([latent_means_lf] + y_low_hat_slices, dim=1)
@@ -347,10 +325,14 @@ class WMDC(CompressionModel):
 
             scales_hat_split = torch.zeros_like(y_anchor)
             means_hat_split = torch.zeros_like(y_anchor)
-            scales_hat_split[:, :, 0::2, 0::2] = scales_anchor[:, :, 0::2, 0::2]
-            scales_hat_split[:, :, 1::2, 1::2] = scales_anchor[:, :, 1::2, 1::2]
-            means_hat_split[:, :, 0::2, 0::2] = means_anchor[:, :, 0::2, 0::2]
-            means_hat_split[:, :, 1::2, 1::2] = means_anchor[:, :, 1::2, 1::2]
+            scales_hat_split[:, :, 0::2, 0::2], scales_hat_split[:, :, 1::2, 1::2] = (
+                scales_anchor[:, :, 0::2, 0::2],
+                scales_anchor[:, :, 1::2, 1::2],
+            )
+            means_hat_split[:, :, 0::2, 0::2], means_hat_split[:, :, 1::2, 1::2] = (
+                means_anchor[:, :, 0::2, 0::2],
+                means_anchor[:, :, 1::2, 1::2],
+            )
 
             y_anchor_quantized = self.quantizer(y_anchor, means=means_hat_split)
             y_anchor_quantized[:, :, 0::2, 1::2] = 0
@@ -368,10 +350,14 @@ class WMDC(CompressionModel):
                 + 1e-6
             )
 
-            scales_hat_split[:, :, 0::2, 1::2] = scales_non_anchor[:, :, 0::2, 1::2]
-            scales_hat_split[:, :, 1::2, 0::2] = scales_non_anchor[:, :, 1::2, 0::2]
-            means_hat_split[:, :, 0::2, 1::2] = means_non_anchor[:, :, 0::2, 1::2]
-            means_hat_split[:, :, 1::2, 0::2] = means_non_anchor[:, :, 1::2, 0::2]
+            scales_hat_split[:, :, 0::2, 1::2], scales_hat_split[:, :, 1::2, 0::2] = (
+                scales_non_anchor[:, :, 0::2, 1::2],
+                scales_non_anchor[:, :, 1::2, 0::2],
+            )
+            means_hat_split[:, :, 0::2, 1::2], means_hat_split[:, :, 1::2, 0::2] = (
+                means_non_anchor[:, :, 0::2, 1::2],
+                means_non_anchor[:, :, 1::2, 0::2],
+            )
 
             _, y_slice_likelihood = self.gaussian_conditional_lf(
                 y_slice, scales_hat_split, means=means_hat_split
@@ -397,21 +383,23 @@ class WMDC(CompressionModel):
         y_low_likelihoods = torch.cat(y_low_likelihood, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY (Un-bottlenecked Dictionary Cross-Attention)
+        # PATH B: HIGH FREQUENCY
         # ----------------------------------------------------------------------
         y_high_slices = y_high.chunk(self.num_slices, 1)
-        y_high_hat_slices = []
-        y_high_likelihood = []
+        y_high_hat_slices, y_high_likelihood = [], []
         dt_batch = self.dt.repeat([B, 1, 1])
 
         for i, y_slice in enumerate(y_high_slices):
-            query = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
+            query_raw = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
+
+            # Apply bottleneck to 2240 channel tensor -> 512 channels
+            query = self.hf_bottlenecks[i](query_raw)
+
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
             gaussian_params = self.cc_transforms_hf[i](support)
             mu, scale = gaussian_params.chunk(2, 1)
-
             scale = nn.functional.softplus(scale) + 1e-6
 
             _, y_slice_likelihood = self.gaussian_conditional_hf(
@@ -421,7 +409,6 @@ class WMDC(CompressionModel):
 
             y_hat_slice = self.quantizer(y_slice, means=mu)
 
-            # LRP
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             lrp = 0.5 * torch.tanh(self.lrp_transforms_hf[i](lrp_support))
             y_hat_slice += lrp
@@ -431,9 +418,6 @@ class WMDC(CompressionModel):
         y_high_hat = torch.cat(y_high_hat_slices, dim=1)
         y_high_likelihoods = torch.cat(y_high_likelihood, dim=1)
 
-        # ----------------------------------------------------------------------
-        # MERGE & DECODE
-        # ----------------------------------------------------------------------
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
         y_tilde = self.idwt(y_freq_hat)
         x_hat = self.g_s(y_tilde)
@@ -447,9 +431,6 @@ class WMDC(CompressionModel):
             },
         }
 
-    # ==========================================================================
-    # UPDATE CDFs
-    # ==========================================================================
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = torch.exp(torch.linspace(math.log(0.11), math.log(256), 64))
@@ -508,8 +489,7 @@ class WMDC(CompressionModel):
         offsets_lf = self.gaussian_conditional_lf.offset.reshape(-1).int().tolist()
 
         encoder_lf = BufferedRansEncoder()
-        symbols_list_lf = []
-        indexes_list_lf = []
+        symbols_list_lf, indexes_list_lf = [], []
 
         for i, y_slice in enumerate(y_low_slices):
             mean_support = torch.cat([latent_means_lf] + y_low_hat_slices, dim=1)
@@ -660,11 +640,11 @@ class WMDC(CompressionModel):
         offsets_hf = self.gaussian_conditional_hf.offset.reshape(-1).int().tolist()
 
         encoder_hf = BufferedRansEncoder()
-        symbols_list_hf = []
-        indexes_list_hf = []
+        symbols_list_hf, indexes_list_hf = [], []
 
         for i, y_slice in enumerate(y_high_slices):
-            query = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
+            query_raw = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
+            query = self.hf_bottlenecks[i](query_raw)
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
@@ -878,7 +858,8 @@ class WMDC(CompressionModel):
         decoder_hf.set_stream(y_high_string)
 
         for i in range(self.num_slices):
-            query = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
+            query_raw = torch.cat([y_low_hat, params_hf] + y_high_hat_slices, dim=1)
+            query = self.hf_bottlenecks[i](query_raw)
             dict_info = self.dt_cross_attention_hf[i](query, dt_batch)
 
             support = torch.cat([query, dict_info], dim=1)
