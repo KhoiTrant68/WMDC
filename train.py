@@ -423,7 +423,7 @@ def main():
         accelerator.unwrap_model(model).quantizer.update_tau(tau)
 
         if accelerator.is_main_process:
-            logger.info("Epoch 5 reached: Switched quantizer to Phase 2 (STE mode).")
+            logger.info("Epoch 3 reached: Switched quantizer to Phase 2 (STE mode).")
 
         train_loss = train_one_epoch(
             model,
