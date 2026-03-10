@@ -93,13 +93,13 @@ def main():
     print("Updating Entropy Coder CDFs...")
     model.update(force=True)
 
-    image_paths = [
-        os.path.join(args.dataset, f)
-        for f in os.listdir(args.dataset)
-        if f.endswith((".png", ".jpg", ".jpeg"))
-    ]
-    image_paths.sort()
-
+    image_paths = sorted(
+        [
+            os.path.join(args.dataset, f)
+            for f in os.listdir(args.dataset)
+            if f.endswith((".png", ".jpg", ".jpeg"))
+        ]
+    )
     results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
 
     print(f"Evaluating on {len(image_paths)} images from {args.dataset}")
@@ -117,9 +117,9 @@ def main():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-            num_pixels = x.size(2) * x.size(3)
 
             x_padded, padding = pad_image(x, p=128)
+            num_pixels_padded = x_padded.size(2) * x_padded.size(3)
 
             if args.cuda:
                 torch.cuda.synchronize()
@@ -139,12 +139,10 @@ def main():
 
             x_hat = crop_image(out_dec["x_hat"], padding).clamp_(0, 1)
 
-            # --- DUMP OUTPUT IMAGE ---
             img_filename = os.path.basename(img_path)
-            out_img_path = os.path.join(img_dir, img_filename)
-            save_image(x_hat, out_img_path)
+            save_image(x_hat, os.path.join(img_dir, img_filename))
 
-            bpp = compute_actual_bpp(out_enc["strings"], num_pixels)
+            bpp = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
             mse = F.mse_loss(x, x_hat)
             psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()
@@ -154,26 +152,13 @@ def main():
             results["ms_ssim"].append(msssim)
             results["enc_time"].append(enc_time)
             results["dec_time"].append(dec_time)
-
             print(
                 f"Image: {img_filename} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | MS-SSIM: {msssim:.4f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
             )
 
     avg_results = {k: sum(v) / len(v) for k, v in results.items()}
-    print("\n" + "=" * 50)
-    print(f"AVERAGE RESULTS (Dataset: {args.dataset})")
-    print(f"BPP:      {avg_results['bpp']: .4f}")
-    print(f"PSNR:     {avg_results['psnr']: .2f} dB")
-    print(f"MS-SSIM:  {avg_results['ms_ssim']: .4f}")
-    print(f"Enc Time: {avg_results['enc_time']: .3f} s")
-    print(f"Dec Time: {avg_results['dec_time']: .3f} s")
-    print("=" * 50)
-
-    # --- DUMP JSON TO RD_report.json ---
-    json_path = os.path.join(args.output, "RD_report.json")
-    with open(json_path, "w") as f:
+    with open(os.path.join(args.output, "RD_report.json"), "w") as f:
         json.dump(avg_results, f, indent=4)
-    print(f"Saved metrics to {json_path}")
 
 
 if __name__ == "__main__":

@@ -181,26 +181,23 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         shortcut = x
         x = self.lnx(x)
         x = self.q_trans(x)
-        x = rearrange(x, "b h w c -> b c h w")
 
-        q = rearrange(x, "b (e c) h w -> b e (h w) c", e=self.head_num)
+        q = rearrange(x, "b h w (e c) -> b e (h w) c", e=self.head_num)
+
         dt = self.dict_ln(dt)
         k = self.k(dt)
-        k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
-        dt = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
-        sim = torch.einsum("benc,bedc->bend", q, k)
-        sim = sim * self.scale
+        k = rearrange(k, "n (e c) -> e n c", e=self.head_num)
+        dt_val = rearrange(dt, "n (e c) -> e n c", e=self.head_num)
+
+        sim = torch.einsum("belc,enc->beln", q, k) * self.scale
         probs = self.softmax(sim)
-        output = torch.einsum("bend,bedc->benc", probs, dt)
-        output = rearrange(output, "b e (h w) c -> b h w (e c) ", h=H, w=W)
+
+        output = torch.einsum("beln,enc->belc", probs, dt_val)
+        output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
 
         output = self.linear(output) + self.res_scale_2(shortcut)
-
         output = self.mlp(self.ln_mlp(output)) + self.res_scale_3(output)
 
         output = self.output_trans(output)
-        output = rearrange(
-            output,
-            "b h w c -> b c h w",
-        )
+        output = rearrange(output, "b h w c -> b c h w")
         return output

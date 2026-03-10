@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-matplotlib.use("Agg")  # Headless mode
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torchvision import transforms
 
@@ -74,7 +74,6 @@ def main():
         (120, 1),
     ]
 
-    print(f"Loading WMDC model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if "state_dict" in ckpt:
@@ -88,16 +87,16 @@ def main():
     def get_attention_probs(module, input, output):
         extracted_probs.append(output.detach().cpu())
 
-    # Attach hook to the Softmax layer of the selected high-frequency slice
-    target_module = model.dt_cross_attention_hf[args.slice].softmax
+    target_module = model.dt_attn_lh[args.slice].softmax
     hook_handle = target_module.register_forward_hook(get_attention_probs)
 
-    valid_exts = (".png", ".jpg", ".jpeg")
     img_files = sorted(
-        [f for f in os.listdir(args.img_dir) if f.lower().endswith(valid_exts)]
-    )
-
-    img_files = img_files[:5]
+        [
+            f
+            for f in os.listdir(args.img_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+    )[:5]
     num_images = len(img_files)
     num_cols = len(target_maps) + 1
 
@@ -155,7 +154,7 @@ def main():
 
             ax_map = axes[row_idx][col_idx + 1]
 
-            # Use 'hot' colormap, matching Figure 8 exactly
+            # Use 'hot' colormap
             im = ax_map.imshow(
                 attn_map, cmap="gist_heat", aspect="auto", interpolation="nearest"
             )
@@ -166,24 +165,19 @@ def main():
                 spine.set_edgecolor("black")
                 spine.set_linewidth(0.5)
 
-            # Apply bottom labels ONLY on the last row
             if row_idx == num_images - 1:
-                label = f"Dictionary\nEntry {entry_idx}, Head {head_idx}"
-                ax_map.set_xlabel(label, fontsize=14, labelpad=10)
+                ax_map.set_xlabel(
+                    f"Dictionary\nEntry {entry_idx}, Head {head_idx}",
+                    fontsize=14,
+                    labelpad=10,
+                )
 
-    # Clean up hook
     hook_handle.remove()
-
-    # Save Output
-    output_pdf = args.output
-    output_jpg = args.output.replace(".pdf", ".jpg")
-
-    plt.savefig(output_pdf, format="pdf", bbox_inches="tight", dpi=300)
-    plt.savefig(output_jpg, format="jpg", bbox_inches="tight", dpi=300)
-    plt.close()
-    print(
-        f"Done! Successfully generated Figure 8-style plot:\n-> {output_pdf}\n-> {output_jpg}"
+    plt.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)
+    plt.savefig(
+        args.output.replace(".pdf", ".jpg"), format="jpg", bbox_inches="tight", dpi=300
     )
+    plt.close()
 
 
 if __name__ == "__main__":

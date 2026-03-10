@@ -1,14 +1,14 @@
 import math
+
 import torch
-from torch import nn
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
+from torch import nn
 
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
-from modules.utils import CheckboardMaskedConv2d, conv, deconv
+from modules.utils import CheckboardMaskedConv2d, conv, deconv, ste_round
 from modules.VSS_module import VSSBlock
-
 from modules.wavelet_blocks import (
     DWT_2D,
     IDWT_2D,
@@ -30,22 +30,18 @@ class SoftQuantizer(nn.Module):
     def update_tau(self, tau_value):
         self.tau.fill_(tau_value)
 
-    def forward(self, x, means=None):
+    def forward(self, x, means=None, noise=None):
         if self.training:
-            # 1. Hard rounding (STE path)
             x_centered = x - means if means is not None else x
-            x_quant = torch.round(x_centered)
-            ste_path = x_quant.detach() - x_centered.detach() + x_centered
-            ste_out = ste_path + means if means is not None else ste_path
+            ste_out = ste_round(x_centered)
+            ste_out = ste_out + means if means is not None else ste_out
 
-            # 2. Additive Uniform Noise path
-            noise = torch.rand_like(x) - 0.5
+            if noise is None:
+                noise = torch.rand_like(x) - 0.5
             noise_out = x + noise
 
-            # Interpolate based on current epoch temperature (tau)
             return self.tau * ste_out + (1.0 - self.tau) * noise_out
         else:
-            # Inference always uses hard rounding
             if means is not None:
                 return torch.round(x - means) + means
             return torch.round(x)
@@ -146,24 +142,17 @@ class WMDC(CompressionModel):
 
         self.context_vss_lf = nn.ModuleList(
             nn.Sequential(
-                VSSBlock(
-                    hidden_dim=(
-                        2 * M + 2 * self.slice_ch_lf
-                        if i == 0
-                        else 2 * M + 4 * self.slice_ch_lf
-                    ),
-                    ssm_d_state=16,
-                ),
-                conv(
+                nn.Conv2d(
                     (
                         2 * M + 2 * self.slice_ch_lf
                         if i == 0
                         else 2 * M + 4 * self.slice_ch_lf
                     ),
-                    2 * self.slice_ch_lf,
-                    kernel_size=3,
-                    stride=1,
+                    128,
+                    kernel_size=1,
                 ),
+                nn.GELU(),
+                nn.Conv2d(128, 2 * self.slice_ch_lf, kernel_size=3, padding=1),
             )
             for i in range(self.num_slices)
         )
@@ -266,9 +255,6 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
-    # ==========================================================================
-    # FORWARD
-    # ==========================================================================
     def forward(self, x):
         B, C, H, W = x.size()
 
@@ -282,9 +268,16 @@ class WMDC(CompressionModel):
         y_high = y_freq[:, self.M :, :, :]  # LH, HL, HH bands (3M)
 
         z = self.h_a(y_freq)
-        _, z_likelihoods = self.entropy_bottleneck(z)
-        z_offset = self.entropy_bottleneck._get_medians()
-        z_hat = self.quantizer(z - z_offset) + z_offset
+
+        z_hat_noise, z_likelihoods = self.entropy_bottleneck(z)
+        z_offset = self.entropy_bottleneck._get_medians().detach()
+        if self.training:
+            z_ste = ste_round(z - z_offset) + z_offset
+            z_hat = (
+                self.quantizer.tau * z_ste + (1.0 - self.quantizer.tau) * z_hat_noise
+            )
+        else:
+            z_hat = z_hat_noise
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -392,10 +385,6 @@ class WMDC(CompressionModel):
                 means_non_anchor[:, :, 1::2, 0::2],
             )
 
-            # _, y_slice_likelihood = self.gaussian_conditional_lf(
-            #     y_slice, scales_hat_split, means=means_hat_split
-            # )
-
             y_non_anchor = non_anchor_split[i]
             y_non_anchor_quantized = self.quantizer(
                 y_non_anchor, means=means_non_anchor
@@ -408,7 +397,9 @@ class WMDC(CompressionModel):
             y_slice_likelihood = self.gaussian_conditional_lf._likelihood(
                 y_hat_slice, scales_hat_split, means=means_hat_split
             )
-            y_slice_likelihood = self.gaussian_conditional_lf.likelihood_lower_bound(y_slice_likelihood)
+            y_slice_likelihood = self.gaussian_conditional_lf.likelihood_lower_bound(
+                y_slice_likelihood
+            )
             lrp = 0.5 * torch.tanh(
                 self.lrp_transforms_lf[i](torch.cat([mean_support, y_hat_slice], dim=1))
             )
@@ -429,22 +420,17 @@ class WMDC(CompressionModel):
         y_high_slices = y_high.chunk(self.num_slices, 1)
         y_high_hat_slices, y_high_likelihood = [], []
         lh_hats, hl_hats, hh_hats = [], [], []
-        dt_batch = self.dt.repeat([B, 1, 1])
 
         for i, y_slice in enumerate(y_high_slices):
-            # y_lh_slice, y_hl_slice, y_hh_slice = y_slice.chunk(3, dim=1)
-
             # 1. Parallel Directional Queries
             q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
             q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
             q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
 
-            # 2. Parallel Dictionary Retrieval
-            dict_lh = self.dt_attn_lh[i](q_lh, dt_batch)
-            dict_hl = self.dt_attn_hl[i](q_hl, dt_batch)
-            dict_hh = self.dt_attn_hh[i](q_hh, dt_batch)
+            dict_lh = self.dt_attn_lh[i](q_lh, self.dt)
+            dict_hl = self.dt_attn_hl[i](q_hl, self.dt)
+            dict_hh = self.dt_attn_hh[i](q_hh, self.dt)
 
-            # 3. Parallel Support & Context Transforms
             sup_lh = torch.cat([q_lh, dict_lh], dim=1)
             sup_hl = torch.cat([q_hl, dict_hl], dim=1)
             sup_hh = torch.cat([q_hh, dict_hh], dim=1)
@@ -458,17 +444,19 @@ class WMDC(CompressionModel):
             scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
             scale = nn.functional.softplus(scale) + 1e-6
 
-            # _, y_slice_like = self.gaussian_conditional_hf(y_slice, scale, means=mu)
+            # 2. Parallel Dictionary Retrieval
             y_hat_slice = self.quantizer(y_slice, means=mu)
             y_slice_like = self.gaussian_conditional_hf._likelihood(
                 y_hat_slice, scale, means=mu
             )
-            y_slice_like = self.gaussian_conditional_hf.likelihood_lower_bound(y_slice_like)
+            y_slice_like = self.gaussian_conditional_hf.likelihood_lower_bound(
+                y_slice_like
+            )
             y_high_likelihood.append(y_slice_like)
 
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
 
-            # 4. Parallel LRP
+            # 3. Parallel LRP
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
                 self.lrp_transforms_lh[i](torch.cat([sup_lh, y_hat_lh], dim=1))
             )
@@ -562,7 +550,8 @@ class WMDC(CompressionModel):
         offsets_lf = self.gaussian_conditional_lf.offset.reshape(-1).int().tolist()
 
         encoder_lf = BufferedRansEncoder()
-        symbols_list_lf, indexes_list_lf = [], []
+
+        symbols_tensors_lf, indexes_tensors_lf = [], []
 
         for i, y_slice in enumerate(y_low_slices):
             mean_support = torch.cat([latent_means_lf] + y_low_hat_slices, dim=1)
@@ -616,8 +605,8 @@ class WMDC(CompressionModel):
             offset_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_anchor]
             y_anchor_symbols_shifted = (y_anchor_symbols - offset_anchor).int()
 
-            symbols_list_lf.extend(y_anchor_symbols_shifted.reshape(-1).tolist())
-            indexes_list_lf.extend(indexes_anchor.reshape(-1).tolist())
+            symbols_tensors_lf.append(y_anchor_symbols_shifted.view(-1))
+            indexes_tensors_lf.append(indexes_anchor.view(-1))
 
             anchor_quantized = self.gaussian_conditional_lf.dequantize(
                 y_anchor_symbols, means_anchor_encode
@@ -670,13 +659,12 @@ class WMDC(CompressionModel):
                 y_non_anchor_symbols - offset_non_anchor
             ).int()
 
-            symbols_list_lf.extend(y_non_anchor_symbols_shifted.reshape(-1).tolist())
-            indexes_list_lf.extend(indexes_non_anchor.reshape(-1).tolist())
+            symbols_tensors_lf.append(y_non_anchor_symbols_shifted.view(-1))
+            indexes_tensors_lf.append(indexes_non_anchor.view(-1))
 
             non_anchor_quantized = self.gaussian_conditional_lf.dequantize(
                 y_non_anchor_symbols, means_non_anchor_encode
             )
-
             y_non_anchor_quantized = torch.zeros_like(y_anchor)
             y_non_anchor_quantized[:, :, 0::2, 1::2] = non_anchor_quantized[
                 :, :, 0::2, :
@@ -690,6 +678,14 @@ class WMDC(CompressionModel):
                 self.lrp_transforms_lf[i](torch.cat([mean_support, y_hat_slice], dim=1))
             )
             y_low_hat_slices.append(y_hat_slice)
+
+        # Batch transfer optimization
+        symbols_list_lf = (
+            torch.cat(symbols_tensors_lf).cpu().tolist() if symbols_tensors_lf else []
+        )
+        indexes_list_lf = (
+            torch.cat(indexes_tensors_lf).cpu().tolist() if indexes_tensors_lf else []
+        )
 
         encoder_lf.encode_with_indexes(
             symbols_list_lf, indexes_list_lf, cdf_lf, cdf_lengths_lf, offsets_lf
@@ -706,7 +702,6 @@ class WMDC(CompressionModel):
         y_high_slices = y_high.chunk(self.num_slices, 1)
         y_high_hat_slices = []
         lh_hats, hl_hats, hh_hats = [], [], []
-        dt_batch = self.dt.repeat([B, 1, 1])
 
         cdf_hf = self.gaussian_conditional_hf.quantized_cdf.tolist()
         cdf_lengths_hf = (
@@ -715,16 +710,16 @@ class WMDC(CompressionModel):
         offsets_hf = self.gaussian_conditional_hf.offset.reshape(-1).int().tolist()
 
         encoder_hf = BufferedRansEncoder()
-        symbols_list_hf, indexes_list_hf = [], []
+        symbols_tensors_hf, indexes_tensors_hf = [], []
 
         for i, y_slice in enumerate(y_high_slices):
             q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
             q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
             q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
 
-            dict_lh = self.dt_attn_lh[i](q_lh, dt_batch)
-            dict_hl = self.dt_attn_hl[i](q_hl, dt_batch)
-            dict_hh = self.dt_attn_hh[i](q_hh, dt_batch)
+            dict_lh = self.dt_attn_lh[i](q_lh, self.dt)
+            dict_hl = self.dt_attn_hl[i](q_hl, self.dt)
+            dict_hh = self.dt_attn_hh[i](q_hh, self.dt)
 
             sup_lh = torch.cat([q_lh, dict_lh], dim=1)
             sup_hl = torch.cat([q_hl, dict_hl], dim=1)
@@ -738,14 +733,13 @@ class WMDC(CompressionModel):
             scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
             scale = nn.functional.softplus(scale) + 1e-6
 
-            # Quantize the full concatenated slice
             indexes = self.gaussian_conditional_hf.build_indexes(scale)
             y_hf_symbols = self.gaussian_conditional_hf.quantize(y_slice, "symbols", mu)
-
             offset_hf = self.gaussian_conditional_hf.offset.view(-1)[indexes]
             y_hf_symbols_shifted = (y_hf_symbols - offset_hf).int()
-            symbols_list_hf.extend(y_hf_symbols_shifted.reshape(-1).tolist())
-            indexes_list_hf.extend(indexes.reshape(-1).tolist())
+
+            symbols_tensors_hf.append(y_hf_symbols_shifted.view(-1))
+            indexes_tensors_hf.append(indexes.view(-1))
 
             y_hat_slice = self.gaussian_conditional_hf.dequantize(y_hf_symbols, mu)
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
@@ -762,11 +756,18 @@ class WMDC(CompressionModel):
             )
 
             y_hat_slice = torch.cat([y_hat_lh, y_hat_hl, y_hat_hh], dim=1)
-
             lh_hats.append(y_hat_lh)
             hl_hats.append(y_hat_hl)
             hh_hats.append(y_hat_hh)
             y_high_hat_slices.append(y_hat_slice)
+
+        # Batch transfer optimization
+        symbols_list_hf = (
+            torch.cat(symbols_tensors_hf).cpu().tolist() if symbols_tensors_hf else []
+        )
+        indexes_list_hf = (
+            torch.cat(indexes_tensors_hf).cpu().tolist() if indexes_tensors_hf else []
+        )
 
         encoder_hf.encode_with_indexes(
             symbols_list_hf, indexes_list_hf, cdf_hf, cdf_lengths_hf, offsets_hf
@@ -947,7 +948,6 @@ class WMDC(CompressionModel):
 
         y_high_hat_slices = []
         lh_hats, hl_hats, hh_hats = [], [], []
-        dt_batch = self.dt.repeat([B, 1, 1])
 
         cdf_hf = self.gaussian_conditional_hf.quantized_cdf.tolist()
         cdf_lengths_hf = (
@@ -963,9 +963,9 @@ class WMDC(CompressionModel):
             q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
             q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
 
-            dict_lh = self.dt_attn_lh[i](q_lh, dt_batch)
-            dict_hl = self.dt_attn_hl[i](q_hl, dt_batch)
-            dict_hh = self.dt_attn_hh[i](q_hh, dt_batch)
+            dict_lh = self.dt_attn_lh[i](q_lh, self.dt)
+            dict_hl = self.dt_attn_hl[i](q_hl, self.dt)
+            dict_hh = self.dt_attn_hh[i](q_hh, self.dt)
 
             sup_lh = torch.cat([q_lh, dict_lh], dim=1)
             sup_hl = torch.cat([q_hl, dict_hl], dim=1)

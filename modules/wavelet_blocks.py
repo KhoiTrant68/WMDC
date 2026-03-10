@@ -99,14 +99,10 @@ class DWT_2D(nn.Module):
         w_hl = dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1)
         w_hh = dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)
 
-        # self.register_buffer("w_ll", w_ll.unsqueeze(0).unsqueeze(0))
-        # self.register_buffer("w_lh", w_lh.unsqueeze(0).unsqueeze(0))
-        # self.register_buffer("w_hl", w_hl.unsqueeze(0).unsqueeze(0))
-        # self.register_buffer("w_hh", w_hh.unsqueeze(0).unsqueeze(0))
-        self.w_ll = nn.Parameter(w_ll.unsqueeze(0).unsqueeze(0), requires_grad=True)
-        self.w_lh = nn.Parameter(w_lh.unsqueeze(0).unsqueeze(0), requires_grad=True)
-        self.w_hl = nn.Parameter(w_hl.unsqueeze(0).unsqueeze(0), requires_grad=True)
-        self.w_hh = nn.Parameter(w_hh.unsqueeze(0).unsqueeze(0), requires_grad=True)
+        self.register_buffer("w_ll", w_ll.unsqueeze(0).unsqueeze(0))
+        self.register_buffer("w_lh", w_lh.unsqueeze(0).unsqueeze(0))
+        self.register_buffer("w_hl", w_hl.unsqueeze(0).unsqueeze(0))
+        self.register_buffer("w_hh", w_hh.unsqueeze(0).unsqueeze(0))
 
     def forward(self, x):
         return DWT_Function.apply(
@@ -139,8 +135,7 @@ class IDWT_2D(nn.Module):
             ],
             dim=0,
         )
-        # self.register_buffer("filters", filters)
-        self.filters = nn.Parameter(filters, requires_grad=True)
+        self.register_buffer("filters", filters)
 
     def forward(self, x):
         return IDWT_Function.apply(x, self.filters.to(x.dtype))
