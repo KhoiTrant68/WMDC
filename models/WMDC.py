@@ -408,6 +408,7 @@ class WMDC(CompressionModel):
             y_slice_likelihood = self.gaussian_conditional_lf._likelihood(
                 y_hat_slice, scales_hat_split, means=means_hat_split
             )
+            y_slice_likelihood = self.gaussian_conditional_lf.likelihood_lower_bound(y_slice_likelihood)
             lrp = 0.5 * torch.tanh(
                 self.lrp_transforms_lf[i](torch.cat([mean_support, y_hat_slice], dim=1))
             )
@@ -462,6 +463,7 @@ class WMDC(CompressionModel):
             y_slice_like = self.gaussian_conditional_hf._likelihood(
                 y_hat_slice, scale, means=mu
             )
+            y_slice_like = self.gaussian_conditional_hf.likelihood_lower_bound(y_slice_like)
             y_high_likelihood.append(y_slice_like)
 
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
