@@ -469,7 +469,7 @@ class WMDC(CompressionModel):
             y_high_hat_slices.append(y_hat_slice)
 
         # y_high_hat = torch.cat(y_high_hat_slices, dim=1)
-         y_high_hat = torch.cat([
+        y_high_hat = torch.cat([
             torch.cat(lh_hats, dim=1),
             torch.cat(hl_hats, dim=1),
             torch.cat(hh_hats, dim=1)
