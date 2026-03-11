@@ -12,7 +12,6 @@ from einops.layers.torch import Rearrange
 from timm.models.layers import DropPath, trunc_normal_
 from torch import Tensor
 
-# Use your existing modules
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
 from modules.utils import (
     CheckboardMaskedConv2d,
