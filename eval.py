@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=128):
+def pad_image(x, p=32):
     """Pads image to be divisible by p"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
@@ -56,41 +56,24 @@ def compute_actual_bpp(strings, num_pixels):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate WMDC performance")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        required=True,
-        help="Path to evaluation dataset (e.g., Kodak)",
-    )
-    parser.add_argument(
-        "--checkpoint", type=str, required=True, help="Path to trained model .pth.tar"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="output",
-        help="Directory to save images and RD_report.json",
-    )
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--output", type=str, default="output")
     parser.add_argument("--N", type=int, default=192)
     parser.add_argument("--M", type=int, default=320)
-    parser.add_argument("--cuda", action="store_true", help="Use GPU")
+    parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    # --- SETUP OUTPUT DIRECTORIES ---
     os.makedirs(args.output, exist_ok=True)
     img_dir = os.path.join(args.output, "images")
     os.makedirs(img_dir, exist_ok=True)
 
-    print(f"Loading model from {args.checkpoint}...")
     model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
-
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
-
-    print("Updating Entropy Coder CDFs...")
     model.update(force=True)
 
     image_paths = sorted(
@@ -102,24 +85,19 @@ def main():
     )
     results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
 
-    print(f"Evaluating on {len(image_paths)} images from {args.dataset}")
-    print(f"Outputs will be saved to: {args.output}/")
-
-    print("Warming up CUDA context for precise timing...")
     with torch.no_grad():
         dummy_x = torch.zeros(1, 3, 256, 256).to(device)
         _ = model.compress(dummy_x)
         if args.cuda:
             torch.cuda.synchronize()
-    print("Warmup complete. Starting benchmark...")
 
     with torch.no_grad():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-            x_padded, padding = pad_image(x, p=128)
-            num_pixels_padded = x_padded.size(2) * x_padded.size(3)
+            x_padded, padding = pad_image(x, p=32)
+            num_pixels_original = x.size(2) * x.size(3)
 
             if args.cuda:
                 torch.cuda.synchronize()
@@ -142,7 +120,7 @@ def main():
             img_filename = os.path.basename(img_path)
             save_image(x_hat, os.path.join(img_dir, img_filename))
 
-            bpp = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
+            bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)
             mse = F.mse_loss(x, x_hat)
             psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()

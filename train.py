@@ -2,9 +2,11 @@ import argparse
 import logging
 import math
 import os
+import random
 import sys
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,36 +23,26 @@ from tqdm import tqdm
 
 from models.WMDC import WMDC
 
-# =========================================================
-#  CONFIGURATION & UTILS
-# =========================================================
-
 
 def setup_logger(log_dir):
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(
         log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
-
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s[%(levelname)s] %(message)s",
         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
     )
     return logging.getLogger(__name__)
 
 
 class AverageMeter:
-    """Computes and stores the average and current value"""
-
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+        self.val = self.avg = self.sum = self.count = 0
 
     def update(self, val, n=1):
         self.val = val
@@ -59,8 +51,8 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def pad_image(x, p=128):
-    """Pads image to be divisible by p (required for Window Attention/Mamba)"""
+def pad_image(x, p=32):
+    """Padded specifically for model spatial downsampling (32x)"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
     new_w = (w + p - 1) // p * p
@@ -89,17 +81,12 @@ def crop_image(x, padding):
 
 
 def compute_bpp(out_net, num_pixels):
-    """Calculates Bits Per Pixel based on likelihoods"""
+    """Safely calculates Bits Per Pixel using fp32 precision to avoid log(0) underflow"""
     bpp_loss = sum(
-        torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+        torch.log(likelihoods.float()).sum() / (-math.log(2) * num_pixels)
         for likelihoods in out_net["likelihoods"].values()
     )
     return bpp_loss
-
-
-# =========================================================
-#  LOSS FUNCTION
-# =========================================================
 
 
 class RateDistortionLoss(nn.Module):
@@ -180,34 +167,22 @@ def train_one_epoch(
     )
 
     for i, d in pbar:
-        # Detach quantiles from Main Graph
-        # We temporarily disable gradients for quantiles during the main pass
-        # so DDP doesn't try to synchronize them (avoiding 'marked ready twice' error).
-        for n, p in model.named_parameters():
-            if n.endswith(".quantiles"):
-                p.requires_grad = False
-
         optimizer.zero_grad()
-        out_net = model(d)
+        aux_optimizer.zero_grad()
 
+        out_net = model(d)
         out_criterion = criterion(out_net, d)
-        accelerator.backward(out_criterion["loss"])
+
+        loss = out_criterion["loss"] + out_net["aux_loss"]
+        accelerator.backward(loss)
 
         if clip_max_norm > 0:
-            accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
+            main_params = [
+                p for n, p in model.named_parameters() if not n.endswith(".quantiles")
+            ]
+            accelerator.clip_grad_norm_(main_params, clip_max_norm)
 
         optimizer.step()
-
-        # Re-enable quantiles for Aux Graph
-        for n, p in model.named_parameters():
-            if n.endswith(".quantiles"):
-                p.requires_grad = True
-
-        unwrapped_model = accelerator.unwrap_model(model)
-        aux_loss = unwrapped_model.aux_loss()
-
-        aux_optimizer.zero_grad()
-        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         loss_val = out_criterion["loss"].item()
@@ -220,19 +195,32 @@ def train_one_epoch(
 
         if accelerator.is_main_process:
             step = epoch * len(train_dataloader) + i
-            if i % 100 == 0 and writer is not None:
-                writer.add_scalar("Train/Total_Loss", loss_val, step)
-                writer.add_scalar("Train/Bpp", bpp_val, step)
+
+            # 1. Periodically log to TensorBoard and the Text File
+            if i % 100 == 0:
+                if writer is not None:
+                    writer.add_scalar("Train/Total_Loss", loss_val, step)
+                    writer.add_scalar("Train/Bpp", bpp_val, step)
+
+                if logger is not None:
+                    logger.info(
+                        f"Train Epoch: {epoch} [{i}/{len(train_dataloader)}] "
+                        f"Loss: {loss_val:.4f} | Bpp: {bpp_val:.4f}"
+                    )
+
+    # 2. Log the final epoch summary
+    if accelerator.is_main_process and logger is not None:
+        logger.info(
+            f"====> Epoch: {epoch} Average Train Loss: {loss_meter.avg:.4f} | "
+            f"Average Train Bpp: {bpp_meter.avg:.4f}"
+        )
 
     return loss_meter.avg
 
 
 def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
     model.eval()
-
-    psnr_meter = AverageMeter()
-    bpp_meter = AverageMeter()
-    loss_meter = AverageMeter()
+    psnr_meter, bpp_meter, loss_meter = AverageMeter(), AverageMeter(), AverageMeter()
 
     pbar = tqdm(
         enumerate(test_dataloader),
@@ -247,7 +235,6 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
 
             out_net = model(d_padded)
             out_net["x_hat"].clamp_(0, 1)
-
             x_hat = crop_image(out_net["x_hat"], padding)
 
             num_pixels = d.size(0) * d.size(2) * d.size(3)
@@ -303,28 +290,28 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="WMDC Training (Accelerate)")
-    parser.add_argument(
-        "-d", "--dataset", type=str, required=True, help="Path to dataset root"
-    )
-    parser.add_argument(
-        "--save_path", type=str, default="checkpoints", help="Directory to save models"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-d", "--dataset", type=str, required=True)
+    parser.add_argument("--save_path", type=str, default="checkpoints")
     parser.add_argument("-e", "--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     parser.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
     parser.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
-    parser.add_argument(
-        "--patch-size", type=int, default=256, help="Crop size for training"
-    )
+    parser.add_argument("--patch-size", type=int, default=256)
     parser.add_argument("--clip_max_norm", type=float, default=1.0)
-    parser.add_argument("--checkpoint", type=str, help="Path to resume checkpoint")
+    parser.add_argument("--checkpoint", type=str)
     parser.add_argument("--metric", type=str, default="mse", choices=["mse", "ms-ssim"])
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--N", type=int, default=192)
     parser.add_argument("--M", type=int, default=320)
     return parser.parse_args()
+
+
+def seed_worker():
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def main():
@@ -335,13 +322,15 @@ def main():
     set_seed(args.seed)
 
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
-    logger = None
-    writer = None
+    logger = setup_logger(save_dir) if accelerator.is_main_process else None
+    writer = (
+        SummaryWriter(os.path.join(save_dir, "tensorboard"))
+        if accelerator.is_main_process
+        else None
+    )
 
     if accelerator.is_main_process:
-        logger = setup_logger(save_dir)
-        writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
-        logger.info(f"Training started with Accelerate. Config: {args}")
+        logger.info(f"Training Config: {args}")
 
     train_transforms = transforms.Compose(
         [
@@ -357,12 +346,17 @@ def main():
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -370,10 +364,9 @@ def main():
         shuffle=False,
         num_workers=4,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
-
-    if accelerator.is_main_process:
-        logger.info("Initializing Model...")
 
     model = WMDC(N=args.N, M=args.M, num_slices=5)
     optimizer, aux_optimizer = configure_optimizers(model, args)
@@ -388,29 +381,19 @@ def main():
     )
 
     criterion = RateDistortionLoss(lmbda=args.lmbda, metric=args.metric)
-
     start_epoch = 0
     best_loss = float("inf")
 
     if args.checkpoint:
-        if accelerator.is_main_process:
-            logger.info(f"Loading checkpoint: {args.checkpoint}")
-        unwrapped_model = accelerator.unwrap_model(model)
         ckpt = torch.load(args.checkpoint, map_location="cpu")
-
-        unwrapped_model.load_state_dict(ckpt["state_dict"])
+        accelerator.unwrap_model(model).load_state_dict(ckpt["state_dict"])
         optimizer.load_state_dict(ckpt["optimizer"])
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("loss", float("inf"))
 
-    if accelerator.is_main_process:
-        logger.info("Starting Training Loop...")
-
     for epoch in range(start_epoch, args.epochs):
-        # [CRITICAL UPDATE]: Switch SoftQuantizer phase to STE fine-tuning
-
         anneal_start = 3
         anneal_end = args.epochs - 3
         if epoch <= anneal_start:
@@ -422,9 +405,6 @@ def main():
             tau = 0.5 * (1.0 - math.cos(math.pi * progress))
 
         accelerator.unwrap_model(model).quantizer.update_tau(tau)
-
-        if accelerator.is_main_process:
-            logger.info("Epoch 3 reached: Switched quantizer to Phase 2 (STE mode).")
 
         train_loss = train_one_epoch(
             model,
@@ -438,7 +418,6 @@ def main():
             writer,
             accelerator,
         )
-
         test_loss = test_epoch(
             epoch, test_loader, model, criterion, logger, writer, accelerator
         )
@@ -454,17 +433,13 @@ def main():
                 "loss": test_loss,
                 "args": args,
             }
-
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
             if test_loss < best_loss:
                 best_loss = test_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
-                logger.info("New best model saved!")
 
-    if writer is not None:
+    if writer:
         writer.close()
-    if accelerator.is_main_process:
-        logger.info("Training complete.")
 
 
 if __name__ == "__main__":

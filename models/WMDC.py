@@ -65,9 +65,7 @@ class WMDC(CompressionModel):
 
         self.slice_ch_lf = M // num_slices
         self.slice_ch_hf = (3 * M) // num_slices
-        self.slice_ch_dir = (
-            self.slice_ch_hf // 3
-        )  # Channels per directional sub-band per slice
+        self.slice_ch_dir = self.slice_ch_hf // 3  # Channels per sub-band per slice
 
         self.quantizer = SoftQuantizer()
 
@@ -102,7 +100,7 @@ class WMDC(CompressionModel):
             deconv(N, 4 * M, kernel_size=5, stride=2),
         )
 
-        # D. PATH A: LOW FREQUENCY ENTROPY MODEL (Pure Mamba Checkerboard Context)
+        # D. PATH A: LOW FREQUENCY ENTROPY MODEL (Mamba Checkerboard Context)
         self.atten_mean_lf = nn.ModuleList(
             MambaContextLayer(M + self.slice_ch_lf * min(i, 5))
             for i in range(self.num_slices)
@@ -183,17 +181,15 @@ class WMDC(CompressionModel):
         self.gaussian_conditional_lf = GaussianConditional(None)
 
         # E. PATH B: DIRECTION-DECOUPLED HIGH FREQUENCY ENTROPY MODEL
-        # we split them by wavelet direction (Horizontal, Vertical, Diagonal) and use 3 parallel streams.
         self.dict_dim = 32 * dict_head_num
         self.dt = nn.Parameter(
             torch.randn([dict_num, self.dict_dim]), requires_grad=True
         )
         nn.init.orthogonal_(self.dt)
+
         for dir_name in ["lh", "hl", "hh"]:
-            # Query Dim: y_low_hat(M) + scale_dir(M) + mean_dir(M) + past_slices(i * slice_ch_dir)
             query_dim = lambda i: 3 * M + (self.slice_ch_dir * i)
 
-            # 1. Independent Directional Dictionary Attentions
             setattr(
                 self,
                 f"dt_attn_{dir_name}",
@@ -208,7 +204,6 @@ class WMDC(CompressionModel):
                 ),
             )
 
-            # 2. Independent Conditional Context Transforms
             setattr(
                 self,
                 f"cc_transforms_{dir_name}",
@@ -224,7 +219,6 @@ class WMDC(CompressionModel):
                 ),
             )
 
-            # 3. Independent Latent Residual Prediction (LRP) Transforms
             setattr(
                 self,
                 f"lrp_transforms_{dir_name}",
@@ -261,14 +255,11 @@ class WMDC(CompressionModel):
         y = self.g_a(x)
         y_shape = y.shape[2:]
 
-        # Wavelet Domain Decoupling
-        y_freq = self.dwt(y)  # [B, 4M, H/2, W/2]
-
-        y_low = y_freq[:, : self.M, :, :]  # LL band (M)
-        y_high = y_freq[:, self.M :, :, :]  # LH, HL, HH bands (3M)
+        y_freq = self.dwt(y)
+        y_low = y_freq[:, : self.M, :, :]
+        y_high = y_freq[:, self.M :, :, :]
 
         z = self.h_a(y_freq)
-
         z_hat_noise, z_likelihoods = self.entropy_bottleneck(z)
         z_offset = self.entropy_bottleneck._get_medians().detach()
         if self.training:
@@ -412,17 +403,23 @@ class WMDC(CompressionModel):
         y_low_likelihoods = torch.cat(y_low_likelihood, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY (Direction-Decoupled Attention)
+        # PATH B: HIGH FREQUENCY (Proper Directional Splitting)
         # ----------------------------------------------------------------------
         scales_lh, scales_hl, scales_hh = latent_scales_hf.chunk(3, dim=1)
         means_lh, means_hl, means_hh = latent_means_hf.chunk(3, dim=1)
 
-        y_high_slices = y_high.chunk(self.num_slices, 1)
+        y_lh, y_hl, y_hh = y_high.chunk(3, dim=1)
+        y_lh_slices = y_lh.chunk(self.num_slices, dim=1)
+        y_hl_slices = y_hl.chunk(self.num_slices, dim=1)
+        y_hh_slices = y_hh.chunk(self.num_slices, dim=1)
+
         y_high_hat_slices, y_high_likelihood = [], []
         lh_hats, hl_hats, hh_hats = [], [], []
 
-        for i, y_slice in enumerate(y_high_slices):
-            # 1. Parallel Directional Queries
+        for i in range(self.num_slices):
+            # Form accurate directional slice subset
+            y_slice = torch.cat([y_lh_slices[i], y_hl_slices[i], y_hh_slices[i]], dim=1)
+
             q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
             q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
             q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
@@ -439,12 +436,10 @@ class WMDC(CompressionModel):
             mu_hl, sc_hl = self.cc_transforms_hl[i](sup_hl).chunk(2, 1)
             mu_hh, sc_hh = self.cc_transforms_hh[i](sup_hh).chunk(2, 1)
 
-            # Re-combine directions to quantify the entire HF slice efficiently
             mu = torch.cat([mu_lh, mu_hl, mu_hh], dim=1)
             scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
             scale = nn.functional.softplus(scale) + 1e-6
 
-            # 2. Parallel Dictionary Retrieval
             y_hat_slice = self.quantizer(y_slice, means=mu)
             y_slice_like = self.gaussian_conditional_hf._likelihood(
                 y_hat_slice, scale, means=mu
@@ -456,7 +451,6 @@ class WMDC(CompressionModel):
 
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
 
-            # 3. Parallel LRP
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
                 self.lrp_transforms_lh[i](torch.cat([sup_lh, y_hat_lh], dim=1))
             )
@@ -477,13 +471,11 @@ class WMDC(CompressionModel):
         y_high_hat = torch.cat(y_high_hat_slices, dim=1)
         y_high_likelihoods = torch.cat(y_high_likelihood, dim=1)
 
-        # ----------------------------------------------------------------------
-        # MERGE & DECODE
-        # ----------------------------------------------------------------------
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
         y_tilde = self.idwt(y_freq_hat)
         x_hat = self.g_s(y_tilde)
 
+        # Return dict natively includes aux_loss for DDP stability
         return {
             "x_hat": x_hat,
             "likelihoods": {
@@ -491,6 +483,7 @@ class WMDC(CompressionModel):
                 "y_high": y_high_likelihoods,
                 "z": z_likelihoods,
             },
+            "aux_loss": self.aux_loss(),  # Triggers self.entropy_bottleneck.loss() correctly
         }
 
     def update(self, scale_table=None, force=False):
@@ -506,6 +499,7 @@ class WMDC(CompressionModel):
         return updated
 
     def compress(self, x):
+        # [Truncated logic identical to previous compress, ensure y_high is split correctly]
         B, C, H, W = x.size()
         y = self.g_a(x)
         y_freq = self.dwt(y)
@@ -550,7 +544,6 @@ class WMDC(CompressionModel):
         offsets_lf = self.gaussian_conditional_lf.offset.reshape(-1).int().tolist()
 
         encoder_lf = BufferedRansEncoder()
-
         symbols_tensors_lf, indexes_tensors_lf = [], []
 
         for i, y_slice in enumerate(y_low_slices):
@@ -679,7 +672,6 @@ class WMDC(CompressionModel):
             )
             y_low_hat_slices.append(y_hat_slice)
 
-        # Batch transfer optimization
         symbols_list_lf = (
             torch.cat(symbols_tensors_lf).cpu().tolist() if symbols_tensors_lf else []
         )
@@ -694,12 +686,16 @@ class WMDC(CompressionModel):
         y_low_hat = torch.cat(y_low_hat_slices, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY (Direction-Decoupled Attention Compress)
+        # PATH B: HIGH FREQUENCY (Proper Directional Splitting)
         # ----------------------------------------------------------------------
         scales_lh, scales_hl, scales_hh = latent_scales_hf.chunk(3, dim=1)
         means_lh, means_hl, means_hh = latent_means_hf.chunk(3, dim=1)
 
-        y_high_slices = y_high.chunk(self.num_slices, 1)
+        y_lh, y_hl, y_hh = y_high.chunk(3, dim=1)
+        y_lh_slices = y_lh.chunk(self.num_slices, dim=1)
+        y_hl_slices = y_hl.chunk(self.num_slices, dim=1)
+        y_hh_slices = y_hh.chunk(self.num_slices, dim=1)
+
         y_high_hat_slices = []
         lh_hats, hl_hats, hh_hats = [], [], []
 
@@ -712,7 +708,10 @@ class WMDC(CompressionModel):
         encoder_hf = BufferedRansEncoder()
         symbols_tensors_hf, indexes_tensors_hf = [], []
 
-        for i, y_slice in enumerate(y_high_slices):
+        for i in range(self.num_slices):
+            # Form accurate directional slice subset
+            y_slice = torch.cat([y_lh_slices[i], y_hl_slices[i], y_hh_slices[i]], dim=1)
+
             q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
             q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
             q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
@@ -744,7 +743,6 @@ class WMDC(CompressionModel):
             y_hat_slice = self.gaussian_conditional_hf.dequantize(y_hf_symbols, mu)
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
 
-            # LRP Re-alignment
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
                 self.lrp_transforms_lh[i](torch.cat([sup_lh, y_hat_lh], dim=1))
             )
@@ -804,7 +802,6 @@ class WMDC(CompressionModel):
         # PATH A: LOW FREQUENCY (Identical to compress pass)
         # ----------------------------------------------------------------------
         y_low_hat_slices = []
-
         ctx_params_anchor_split = torch.split(
             torch.zeros(B, self.slice_ch_lf * 2 * self.num_slices, H_wave, W_wave).to(
                 z_hat.device
@@ -823,6 +820,7 @@ class WMDC(CompressionModel):
         decoder_lf.set_stream(y_low_string)
 
         for i in range(self.num_slices):
+            # [Identical decompression block exactly as in the original code for PATH A...]
             mean_support = torch.cat([latent_means_lf] + y_low_hat_slices, dim=1)
             mean_support = self.atten_mean_lf[i](mean_support)
             mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
@@ -941,7 +939,7 @@ class WMDC(CompressionModel):
         y_low_hat = torch.cat(y_low_hat_slices, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY (Direction-Decoupled Attention Decompress)
+        # PATH B: HIGH FREQUENCY (Proper Directional Splitting matching compress layout)
         # ----------------------------------------------------------------------
         scales_lh, scales_hl, scales_hh = latent_scales_hf.chunk(3, dim=1)
         means_lh, means_hl, means_hh = latent_means_hf.chunk(3, dim=1)
@@ -1010,9 +1008,6 @@ class WMDC(CompressionModel):
 
         y_high_hat = torch.cat(y_high_hat_slices, dim=1)
 
-        # ----------------------------------------------------------------------
-        # MERGE & DECODE
-        # ----------------------------------------------------------------------
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
         y_tilde = self.idwt(y_freq_hat)
         x_hat = self.g_s(y_tilde).clamp_(0, 1)
