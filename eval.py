@@ -44,14 +44,16 @@ def crop_image(x, padding):
 
 
 def compute_actual_bpp(strings, num_pixels):
-    """Recursively computes the size of the bitstream in bytes, converts to BPP"""
-    size = 0
-    for s in strings:
-        if isinstance(s, (list, tuple)):
-            size += compute_actual_bpp(s, 1) / 8
-        elif isinstance(s, bytes):
-            size += len(s)
-    return (size * 8) / num_pixels
+    """Safely recursively calculates the size of the bitstream in bytes, converts to BPP"""
+    def get_size(obj):
+        if isinstance(obj, bytes):
+            return len(obj)
+        elif isinstance(obj, (list, tuple)):
+            return sum(get_size(s) for s in obj)
+        return 0
+    
+    total_bytes = get_size(strings)
+    return (total_bytes * 8) / num_pixels
 
 
 def main():
