@@ -610,7 +610,7 @@ class WMDC(CompressionModel):
             )
 
             offset_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_anchor]
-            y_anchor_symbols_shifted = (y_anchor_symbols - offset_anchor).int()
+            y_anchor_symbols_shifted = (y_anchor_symbols + offset_anchor).int()
 
             symbols_tensors_lf.append(y_anchor_symbols_shifted.view(-1))
             indexes_tensors_lf.append(indexes_anchor.view(-1))
@@ -668,7 +668,7 @@ class WMDC(CompressionModel):
                 indexes_non_anchor
             ]
             y_non_anchor_symbols_shifted = (
-                y_non_anchor_symbols - offset_non_anchor
+                y_non_anchor_symbols + offset_non_anchor
             ).int()
 
             symbols_tensors_lf.append(y_non_anchor_symbols_shifted.view(-1))
@@ -754,7 +754,7 @@ class WMDC(CompressionModel):
             indexes = self.gaussian_conditional_hf.build_indexes(scale)
             y_hf_symbols = self.gaussian_conditional_hf.quantize(y_slice, "symbols", mu)
             offset_hf = self.gaussian_conditional_hf.offset.view(-1)[indexes]
-            y_hf_symbols_shifted = (y_hf_symbols - offset_hf).int()
+            y_hf_symbols_shifted = (y_hf_symbols + offset_hf).int()
 
             symbols_tensors_hf.append(y_hf_symbols_shifted.view(-1))
             indexes_tensors_hf.append(indexes.view(-1))
@@ -892,7 +892,7 @@ class WMDC(CompressionModel):
             )
 
             offset_anchor = self.gaussian_conditional_lf.offset.view(-1)[indexes_anchor]
-            rv_anchor = rv_anchor + offset_anchor
+            rv_anchor = rv_anchor - offset_anchor
             anchor_quantized = rv_anchor + means_anchor_encode
 
             y_anchor_decode = torch.zeros(B_anchor, C_anchor, H_anchor, W_anchor).to(
@@ -948,7 +948,7 @@ class WMDC(CompressionModel):
             offset_non_anchor = self.gaussian_conditional_lf.offset.view(-1)[
                 indexes_non_anchor
             ]
-            rv_non_anchor = rv_non_anchor + offset_non_anchor
+            rv_non_anchor = rv_non_anchor - offset_non_anchor
             non_anchor_quantized = rv_non_anchor + means_non_anchor_encode
 
             y_non_anchor_quantized = torch.zeros_like(means_anchor)
@@ -1015,7 +1015,7 @@ class WMDC(CompressionModel):
 
             offset_hf = self.gaussian_conditional_hf.offset.view(-1)[indexes]
 
-            y_hat_slice = rv_hf + offset_hf + mu
+            y_hat_slice = rv_hf - offset_hf + mu
             y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
 
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
