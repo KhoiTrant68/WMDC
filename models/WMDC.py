@@ -468,7 +468,13 @@ class WMDC(CompressionModel):
             hh_hats.append(y_hat_hh)
             y_high_hat_slices.append(y_hat_slice)
 
-        y_high_hat = torch.cat(y_high_hat_slices, dim=1)
+        # y_high_hat = torch.cat(y_high_hat_slices, dim=1)
+         y_high_hat = torch.cat([
+            torch.cat(lh_hats, dim=1),
+            torch.cat(hl_hats, dim=1),
+            torch.cat(hh_hats, dim=1)
+        ], dim=1)
+
         y_high_likelihoods = torch.cat(y_high_likelihood, dim=1)
 
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
@@ -1006,7 +1012,12 @@ class WMDC(CompressionModel):
             hh_hats.append(y_hat_hh)
             y_high_hat_slices.append(y_hat_slice)
 
-        y_high_hat = torch.cat(y_high_hat_slices, dim=1)
+        # y_high_hat = torch.cat(y_high_hat_slices, dim=1)
+        y_high_hat = torch.cat([
+            torch.cat(lh_hats, dim=1),
+            torch.cat(hl_hats, dim=1),
+            torch.cat(hh_hats, dim=1)
+        ], dim=1)
 
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
         y_tilde = self.idwt(y_freq_hat)
