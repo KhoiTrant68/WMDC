@@ -1,20 +1,27 @@
 import math
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from torch import Tensor
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-from timm.models.layers import trunc_normal_, DropPath
-
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+from timm.models.layers import DropPath, trunc_normal_
+from torch import Tensor
 
 # Use your existing modules
 from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
-from modules.utils import CheckboardMaskedConv2d, conv, deconv, ste_round, conv1x1, conv3x3
+from modules.utils import (
+    CheckboardMaskedConv2d,
+    conv,
+    conv1x1,
+    conv3x3,
+    deconv,
+    ste_round,
+)
 from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import (
     DWT_2D,
@@ -23,10 +30,10 @@ from modules.wavelet_blocks import (
     ResidualBlockWithStride_wave,
 )
 
-
 # ==============================================================================
 # SWIN ATTENTION MODULES (Robust channel context)
 # ==============================================================================
+
 
 class WMSA(nn.Module):
     def __init__(self, input_dim, output_dim, head_dim, window_size, type):
@@ -52,6 +59,19 @@ class WMSA(nn.Module):
             .transpose(1, 2)
             .transpose(0, 1)
         )
+
+        # Precompute relative position index and register as buffer to prevent CPU-GPU sync bottleneck
+        cord = torch.tensor(
+            np.array(
+                [
+                    [i, j]
+                    for i in range(self.window_size)
+                    for j in range(self.window_size)
+                ]
+            )
+        )
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
+        self.register_buffer("relative_position_index", relation)
 
     def generate_mask(self, h, w, p, shift):
         attn_mask = torch.zeros(
@@ -130,18 +150,10 @@ class WMSA(nn.Module):
         return output
 
     def relative_embedding(self):
-        cord = torch.tensor(
-            np.array(
-                [
-                    [i, j]
-                    for i in range(self.window_size)
-                    for j in range(self.window_size)
-                ]
-            )
-        )
-        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
         return self.relative_position_params[
-            :, relation[:, :, 0].long(), relation[:, :, 1].long()
+            :,
+            self.relative_position_index[:, :, 0].long(),
+            self.relative_position_index[:, :, 1].long(),
         ]
 
 
@@ -181,20 +193,23 @@ class SwinBlock(nn.Module):
         self.window_size = window_size
 
     def forward(self, x):
+        B, C, H, W = x.shape
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+
         resize = False
-        if (x.size(-1) <= self.window_size) or (x.size(-2) <= self.window_size):
-            padding_row = (self.window_size - x.size(-2)) // 2
-            padding_col = (self.window_size - x.size(-1)) // 2
-            x = F.pad(x, (padding_col, padding_col + 1, padding_row, padding_row + 1))
+        if pad_b > 0 or pad_r > 0:
+            x = F.pad(x, (0, pad_r, 0, pad_b), mode="reflect")
             resize = True
+
         trans_x = Rearrange("b c h w -> b h w c")(x)
         trans_x = self.block_1(trans_x)
         trans_x = self.block_2(trans_x)
         trans_x = Rearrange("b h w c -> b c h w")(trans_x)
+
         if resize:
-            x = F.pad(
-                x, (-padding_col, -padding_col - 1, -padding_row, -padding_row - 1)
-            )
+            trans_x = trans_x[:, :, :H, :W]
+
         return trans_x
 
 
@@ -225,9 +240,6 @@ class SWAtten(nn.Module):
         out += identity
         out = self.out_conv(out)
         return out
-
-
-
 
 
 # ==============================================================================

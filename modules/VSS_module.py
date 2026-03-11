@@ -1,4 +1,5 @@
 import math
+import warnings
 from functools import partial
 from typing import Any, Callable
 
@@ -15,21 +16,17 @@ from modules.csm_triton import CrossMergeTriton, CrossScanTriton, CrossScanTrito
 try:
     import selective_scan_cuda_core
 except Exception as e:
-    ...
-    # print(f"WARNING: can not import selective_scan_cuda_core.", flush=True)
-    # print(e, flush=True)
+    warnings.warn(
+        f"Failed to import selective_scan_cuda_core. Check CUDA headers. Error: {e}"
+    )
 try:
     import selective_scan_cuda_oflex
 except Exception as e:
-    ...
-    # print(f"WARNING: can not import selective_scan_cuda_core.", flush=True)
-    # print(e, flush=True)
+    warnings.warn(f"Failed to import selective_scan_cuda_oflex. Error: {e}")
 try:
     import selective_scan_cuda
 except Exception as e:
-    ...
-    # print(f"WARNING: can not import selective_scan_cuda.", flush=True)
-    # print(e, flush=True)
+    warnings.warn(f"Failed to import selective_scan_cuda. Error: {e}")
 
 import numpy as np
 
@@ -1124,6 +1121,19 @@ class WMSA(nn.Module):
             .transpose(0, 1)
         )
 
+        # Precompute relative position index and register as buffer to prevent CPU-GPU sync bottleneck
+        cord = torch.tensor(
+            np.array(
+                [
+                    [i, j]
+                    for i in range(self.window_size)
+                    for j in range(self.window_size)
+                ]
+            )
+        )
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
+        self.register_buffer("relative_position_index", relation)
+
     def generate_mask(self, h, w, p, shift):
         """generating the mask of SW-MSA
         Args:
@@ -1214,18 +1224,10 @@ class WMSA(nn.Module):
         return output
 
     def relative_embedding(self):
-        cord = torch.tensor(
-            np.array(
-                [
-                    [i, j]
-                    for i in range(self.window_size)
-                    for j in range(self.window_size)
-                ]
-            )
-        )
-        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
         return self.relative_position_params[
-            :, relation[:, :, 0].long(), relation[:, :, 1].long()
+            :,
+            self.relative_position_index[:, :, 0].long(),
+            self.relative_position_index[:, :, 1].long(),
         ]
 
 

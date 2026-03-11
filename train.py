@@ -394,17 +394,6 @@ def main():
         best_loss = ckpt.get("loss", float("inf"))
 
     for epoch in range(start_epoch, args.epochs):
-        # anneal_start = 3
-        # anneal_end = args.epochs - 3
-        # if epoch <= anneal_start:
-        #     tau = 0.0
-        # elif epoch >= anneal_end:
-        #     tau = 1.0
-        # else:
-        #     progress = (epoch - anneal_start) / (anneal_end - anneal_start)
-        #     tau = 0.5 * (1.0 - math.cos(math.pi * progress))
-
-        accelerator.unwrap_model(model).quantizer.update_tau(tau)
 
         train_loss = train_one_epoch(
             model,
