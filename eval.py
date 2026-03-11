@@ -99,7 +99,7 @@ def main():
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-            x_padded, padding = pad_image(x, p=32)
+            x_padded, padding = pad_image(x, p=128)
             num_pixels_original = x.size(2) * x.size(3)
 
             if args.cuda:
