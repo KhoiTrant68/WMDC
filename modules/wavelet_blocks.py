@@ -1,6 +1,7 @@
 import pywt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from compressai.layers import GDN, conv3x3, subpel_conv3x3
 from torch import Tensor
 from torch.autograd import Function
@@ -142,18 +143,57 @@ class IDWT_2D(nn.Module):
 
 
 # ==============================================================================
-# 2. WAVELET RESIDUAL BLOCKS
+# 2. SHIFT-INVARIANT ANTI-ALIASED WAVELETS (NOVELTY)
+# ==============================================================================
+class AntiAliasedDWT(nn.Module):
+    """
+    Applies a Binomial Blur filter prior to Decimation to ensure
+    Shift-Invariant Latent Spaces (Massively reduces entropy variance).
+    """
+
+    def __init__(self, wave="haar"):
+        super().__init__()
+        self.dwt = DWT_2D(wave=wave)
+        a = torch.tensor([1.0, 2.0, 1.0]) / 4.0
+        filt = a[:, None] * a[None, :]
+        self.register_buffer("blur_filter", filt[None, None, :, :])
+
+    def forward(self, x):
+        C = x.size(1)
+        filt = self.blur_filter.repeat(C, 1, 1, 1)
+        x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        x_blurred = F.conv2d(x_pad, filt, groups=C)
+        return self.dwt(x_blurred)
+
+
+class AntiAliasedIDWT(nn.Module):
+    def __init__(self, wave="haar"):
+        super().__init__()
+        self.idwt = IDWT_2D(wave=wave)
+        a = torch.tensor([1.0, 2.0, 1.0]) / 4.0
+        filt = a[:, None] * a[None, :]
+        self.register_buffer("blur_filter", filt[None, None, :, :])
+
+    def forward(self, x):
+        y = self.idwt(x)
+        C = y.size(1)
+        filt = self.blur_filter.repeat(C, 1, 1, 1)
+        y_pad = F.pad(y, (1, 1, 1, 1), mode="reflect")
+        y_blurred = F.conv2d(y_pad, filt, groups=C)
+        return y_blurred
+
+
+# ==============================================================================
+# 3. WAVELET RESIDUAL BLOCKS
 # ==============================================================================
 class ResidualBlockWithStride_wave(nn.Module):
-    """Residual block with a stride on the first convolution, refined with DWT features."""
-
     def __init__(self, in_ch: int, out_ch: int, stride: int = 2, wavelet="haar"):
         super().__init__()
         self.conv1 = conv3x3(in_ch, out_ch, stride=stride)
         self.leaky_relu = nn.LeakyReLU(inplace=True)
 
-        self.dwt = DWT_2D(wave=wavelet)
-        self.idwt = IDWT_2D(wave=wavelet)
+        self.dwt = AntiAliasedDWT(wave=wavelet)
+        self.idwt = AntiAliasedIDWT(wave=wavelet)
 
         self.low_freq_conv = conv3x3(out_ch, out_ch)
         self.gdn_low = GDN(out_ch)
@@ -187,15 +227,13 @@ class ResidualBlockWithStride_wave(nn.Module):
 
 
 class ResidualBlockUpsample_wave(nn.Module):
-    """Residual block with sub-pixel upsampling, refined with DWT features."""
-
     def __init__(self, in_ch: int, out_ch: int, upsample: int = 2, wavelet="haar"):
         super().__init__()
         self.subpel_conv = subpel_conv3x3(in_ch, out_ch, upsample)
         self.leaky_relu = nn.LeakyReLU(inplace=True)
 
-        self.dwt = DWT_2D(wave=wavelet)
-        self.idwt = IDWT_2D(wave=wavelet)
+        self.dwt = AntiAliasedDWT(wave=wavelet)
+        self.idwt = AntiAliasedIDWT(wave=wavelet)
 
         self.low_freq_conv = conv3x3(out_ch, out_ch)
         self.igdn_low = GDN(out_ch, inverse=True)

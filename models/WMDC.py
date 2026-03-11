@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 from einops import rearrange, repeat
@@ -12,7 +11,6 @@ from einops.layers.torch import Rearrange
 from timm.models.layers import DropPath, trunc_normal_
 from torch import Tensor
 
-from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
 from modules.utils import (
     CheckboardMaskedConv2d,
     conv,
@@ -23,14 +21,14 @@ from modules.utils import (
 )
 from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import (
-    DWT_2D,
-    IDWT_2D,
+    AntiAliasedDWT,
+    AntiAliasedIDWT,
     ResidualBlockUpsample_wave,
     ResidualBlockWithStride_wave,
 )
 
 # ==============================================================================
-# SWIN ATTENTION MODULES (Robust channel context)
+# SWIN ATTENTION MODULES
 # ==============================================================================
 
 
@@ -59,7 +57,6 @@ class WMSA(nn.Module):
             .transpose(0, 1)
         )
 
-        # Precompute relative position index and register as buffer to prevent CPU-GPU sync bottleneck
         cord = torch.tensor(
             np.array(
                 [
@@ -242,12 +239,12 @@ class SWAtten(nn.Module):
 
 
 # ==============================================================================
-# MAIN MODEL
+# MAIN MODEL: Frequency-Autoregressive State Space Compression
 # ==============================================================================
 
 
 class WMDC(CompressionModel):
-    def __init__(self, N=192, M=320, num_slices=5, dict_num=128, dict_head_num=20):
+    def __init__(self, N=192, M=320, num_slices=5):
         super().__init__(entropy_bottleneck_channels=N)
         self.N = N
         self.M = M
@@ -266,8 +263,9 @@ class WMDC(CompressionModel):
             conv(N, M, kernel_size=5, stride=2),
         )
 
-        self.dwt = DWT_2D(wave="haar")
-        self.idwt = IDWT_2D(wave="haar")
+        # Apply Anti-Aliasing filters to ensure latent space smoothness
+        self.dwt = AntiAliasedDWT(wave="haar")
+        self.idwt = AntiAliasedIDWT(wave="haar")
 
         # C. HYPER-PRIOR AUTOENCODER
         self.h_a = nn.Sequential(
@@ -288,7 +286,7 @@ class WMDC(CompressionModel):
             deconv(N, 4 * M, kernel_size=5, stride=2),
         )
 
-        # D. PATH A: LOW FREQUENCY ENTROPY MODEL
+        # D. PATH A: LOW FREQUENCY ENTROPY MODEL (Checkerboard)
         self.atten_mean_lf = nn.ModuleList(
             nn.Sequential(
                 SWAtten(
@@ -414,61 +412,75 @@ class WMDC(CompressionModel):
         )
         self.gaussian_conditional_lf = GaussianConditional(None)
 
-        # E. PATH B: HIGH FREQUENCY ENTROPY MODEL
-        self.dict_dim = 32 * dict_head_num
-        self.dt = nn.Parameter(
-            torch.randn([dict_num, self.dict_dim]), requires_grad=True
-        )
-        nn.init.orthogonal_(self.dt)
+        # E. PATH B: HIGH FREQUENCY INTER-BAND AUTOREGRESSIVE MODEL
+        self.fusion_lh = nn.ModuleList()
+        self.fusion_hl = nn.ModuleList()
+        self.fusion_hh = nn.ModuleList()
+        self.lrp_transforms_lh = nn.ModuleList()
+        self.lrp_transforms_hl = nn.ModuleList()
+        self.lrp_transforms_hh = nn.ModuleList()
 
-        for dir_name in ["lh", "hl", "hh"]:
-            query_dim = lambda i: 3 * M + (self.slice_ch_dir * i)
-            setattr(
-                self,
-                f"dt_attn_{dir_name}",
-                nn.ModuleList(
-                    MultiScaleDictionaryCrossAttentionGLU(
-                        input_dim=query_dim(i),
-                        output_dim=M,
-                        head_num=dict_head_num,
-                        mlp_rate=4,
-                    )
-                    for i in range(self.num_slices)
-                ),
+        for i in range(self.num_slices):
+            # LH conditioned on LL
+            dim_sup_lh = 3 * M + self.slice_ch_dir * i
+            self.fusion_lh.append(
+                nn.Sequential(
+                    conv(dim_sup_lh, 512, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    VSSBlock(hidden_dim=512, drop_path=0.1, ssm_d_state=16),
+                    conv(512, 2 * self.slice_ch_dir, stride=1, kernel_size=3),
+                )
             )
-            setattr(
-                self,
-                f"cc_transforms_{dir_name}",
-                nn.ModuleList(
-                    nn.Sequential(
-                        conv(query_dim(i) + M, 512, stride=1, kernel_size=3),
-                        nn.GELU(),
-                        conv(512, 256, stride=1, kernel_size=3),
-                        nn.GELU(),
-                        conv(256, 2 * self.slice_ch_dir, stride=1, kernel_size=3),
-                    )
-                    for i in range(self.num_slices)
-                ),
+            self.lrp_transforms_lh.append(
+                nn.Sequential(
+                    conv(dim_sup_lh + self.slice_ch_dir, 512, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(512, 256, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(256, self.slice_ch_dir, stride=1, kernel_size=3),
+                )
             )
-            setattr(
-                self,
-                f"lrp_transforms_{dir_name}",
-                nn.ModuleList(
-                    nn.Sequential(
-                        conv(
-                            (query_dim(i) + M) + self.slice_ch_dir,
-                            512,
-                            stride=1,
-                            kernel_size=3,
-                        ),
-                        nn.GELU(),
-                        conv(512, 256, stride=1, kernel_size=3),
-                        nn.GELU(),
-                        conv(256, self.slice_ch_dir, stride=1, kernel_size=3),
-                    )
-                    for i in range(self.num_slices)
-                ),
+
+            # HL conditioned on LL + LH
+            dim_sup_hl = 3 * M + self.slice_ch_dir * (2 * i + 1)
+            self.fusion_hl.append(
+                nn.Sequential(
+                    conv(dim_sup_hl, 512, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    VSSBlock(hidden_dim=512, drop_path=0.1, ssm_d_state=16),
+                    conv(512, 2 * self.slice_ch_dir, stride=1, kernel_size=3),
+                )
             )
+            self.lrp_transforms_hl.append(
+                nn.Sequential(
+                    conv(dim_sup_hl + self.slice_ch_dir, 512, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(512, 256, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(256, self.slice_ch_dir, stride=1, kernel_size=3),
+                )
+            )
+
+            # HH conditioned on LL + LH + HL
+            dim_sup_hh = 3 * M + self.slice_ch_dir * (3 * i + 2)
+            self.fusion_hh.append(
+                nn.Sequential(
+                    conv(dim_sup_hh, 512, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    VSSBlock(hidden_dim=512, drop_path=0.1, ssm_d_state=16),
+                    conv(512, 2 * self.slice_ch_dir, stride=1, kernel_size=3),
+                )
+            )
+            self.lrp_transforms_hh.append(
+                nn.Sequential(
+                    conv(dim_sup_hh + self.slice_ch_dir, 512, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(512, 256, stride=1, kernel_size=3),
+                    nn.GELU(),
+                    conv(256, self.slice_ch_dir, stride=1, kernel_size=3),
+                )
+            )
+
         self.gaussian_conditional_hf = GaussianConditional(None)
 
         # F. MAIN DECODER
@@ -617,65 +629,62 @@ class WMDC(CompressionModel):
         y_low_likelihoods = torch.cat(y_low_likelihood, dim=1)
 
         # ----------------------------------------------------------------------
-        # PATH B: HIGH FREQUENCY
+        # PATH B: HIGH FREQUENCY (Inter-Band Autoregressive)
         # ----------------------------------------------------------------------
         scales_lh, scales_hl, scales_hh = latent_scales_hf.chunk(3, dim=1)
         means_lh, means_hl, means_hh = latent_means_hf.chunk(3, dim=1)
 
         y_lh, y_hl, y_hh = y_high.chunk(3, dim=1)
-        y_lh_slices, y_hl_slices, y_hh_slices = (
-            y_lh.chunk(self.num_slices, dim=1),
-            y_hl.chunk(self.num_slices, dim=1),
-            y_hh.chunk(self.num_slices, dim=1),
-        )
+        y_lh_slices = y_lh.chunk(self.num_slices, dim=1)
+        y_hl_slices = y_hl.chunk(self.num_slices, dim=1)
+        y_hh_slices = y_hh.chunk(self.num_slices, dim=1)
 
         y_high_hat_slices, y_high_likelihood = [], []
         lh_hats, hl_hats, hh_hats = [], [], []
 
         for i in range(self.num_slices):
-            y_slice = torch.cat([y_lh_slices[i], y_hl_slices[i], y_hh_slices[i]], dim=1)
-
-            q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
-            q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
-            q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
-
-            dict_lh = self.dt_attn_lh[i](q_lh, self.dt)
-            dict_hl = self.dt_attn_hl[i](q_hl, self.dt)
-            dict_hh = self.dt_attn_hh[i](q_hh, self.dt)
-
-            sup_lh = torch.cat([q_lh, dict_lh], dim=1)
-            sup_hl = torch.cat([q_hl, dict_hl], dim=1)
-            sup_hh = torch.cat([q_hh, dict_hh], dim=1)
-
-            mu_lh, sc_lh = self.cc_transforms_lh[i](sup_lh).chunk(2, 1)
-            mu_hl, sc_hl = self.cc_transforms_hl[i](sup_hl).chunk(2, 1)
-            mu_hh, sc_hh = self.cc_transforms_hh[i](sup_hh).chunk(2, 1)
-
-            mu = torch.cat([mu_lh, mu_hl, mu_hh], dim=1)
-            scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
-
-            _, y_slice_like = self.gaussian_conditional_hf(y_slice, scale, means=mu)
-            y_high_likelihood.append(y_slice_like)
-
-            # Apply clean STE
-            y_hat_slice = ste_round(y_slice - mu) + mu
-
-            y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
-
+            # 1. LH
+            sup_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
+            mu_lh, sc_lh = self.fusion_lh[i](sup_lh).chunk(2, 1)
+            _, like_lh = self.gaussian_conditional_hf(
+                y_lh_slices[i], sc_lh, means=mu_lh
+            )
+            y_hat_lh = ste_round(y_lh_slices[i] - mu_lh) + mu_lh
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
                 self.lrp_transforms_lh[i](torch.cat([sup_lh, y_hat_lh], dim=1))
             )
+            lh_hats.append(y_hat_lh)
+
+            # 2. HL
+            sup_hl = torch.cat(
+                [y_low_hat, scales_hl, means_hl] + hl_hats + lh_hats, dim=1
+            )
+            mu_hl, sc_hl = self.fusion_hl[i](sup_hl).chunk(2, 1)
+            _, like_hl = self.gaussian_conditional_hf(
+                y_hl_slices[i], sc_hl, means=mu_hl
+            )
+            y_hat_hl = ste_round(y_hl_slices[i] - mu_hl) + mu_hl
             y_hat_hl = y_hat_hl + 0.5 * torch.tanh(
                 self.lrp_transforms_hl[i](torch.cat([sup_hl, y_hat_hl], dim=1))
             )
+            hl_hats.append(y_hat_hl)
+
+            # 3. HH
+            sup_hh = torch.cat(
+                [y_low_hat, scales_hh, means_hh] + hh_hats + lh_hats + hl_hats, dim=1
+            )
+            mu_hh, sc_hh = self.fusion_hh[i](sup_hh).chunk(2, 1)
+            _, like_hh = self.gaussian_conditional_hf(
+                y_hh_slices[i], sc_hh, means=mu_hh
+            )
+            y_hat_hh = ste_round(y_hh_slices[i] - mu_hh) + mu_hh
             y_hat_hh = y_hat_hh + 0.5 * torch.tanh(
                 self.lrp_transforms_hh[i](torch.cat([sup_hh, y_hat_hh], dim=1))
             )
+            hh_hats.append(y_hat_hh)
 
             y_hat_slice = torch.cat([y_hat_lh, y_hat_hl, y_hat_hh], dim=1)
-            lh_hats.append(y_hat_lh)
-            hl_hats.append(y_hat_hl)
-            hh_hats.append(y_hat_hh)
+            y_high_likelihood.append(torch.cat([like_lh, like_hl, like_hh], dim=1))
             y_high_hat_slices.append(y_hat_slice)
 
         y_high_hat = torch.cat(
@@ -870,64 +879,64 @@ class WMDC(CompressionModel):
         means_lh, means_hl, means_hh = latent_means_hf.chunk(3, dim=1)
 
         y_lh, y_hl, y_hh = y_high.chunk(3, dim=1)
-        y_lh_slices, y_hl_slices, y_hh_slices = (
-            y_lh.chunk(self.num_slices, dim=1),
-            y_hl.chunk(self.num_slices, dim=1),
-            y_hh.chunk(self.num_slices, dim=1),
-        )
+        y_lh_slices = y_lh.chunk(self.num_slices, dim=1)
+        y_hl_slices = y_hl.chunk(self.num_slices, dim=1)
+        y_hh_slices = y_hh.chunk(self.num_slices, dim=1)
 
         lh_hats, hl_hats, hh_hats = [], [], []
         y_high_strings = []
 
         for i in range(self.num_slices):
-            y_slice = torch.cat([y_lh_slices[i], y_hl_slices[i], y_hh_slices[i]], dim=1)
-
-            q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
-            q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
-            q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
-
-            dict_lh, dict_hl, dict_hh = (
-                self.dt_attn_lh[i](q_lh, self.dt),
-                self.dt_attn_hl[i](q_hl, self.dt),
-                self.dt_attn_hh[i](q_hh, self.dt),
+            # 1. LH
+            sup_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
+            mu_lh, sc_lh = self.fusion_lh[i](sup_lh).chunk(2, 1)
+            idx_lh = self.gaussian_conditional_hf.build_indexes(sc_lh)
+            strings_lh = self.gaussian_conditional_hf.compress(
+                y_lh_slices[i], idx_lh, means=mu_lh
             )
-            sup_lh, sup_hl, sup_hh = (
-                torch.cat([q_lh, dict_lh], dim=1),
-                torch.cat([q_hl, dict_hl], dim=1),
-                torch.cat([q_hh, dict_hh], dim=1),
+            y_hat_lh = self.gaussian_conditional_hf.decompress(
+                strings_lh, idx_lh, means=mu_lh
             )
-
-            mu_lh, sc_lh = self.cc_transforms_lh[i](sup_lh).chunk(2, 1)
-            mu_hl, sc_hl = self.cc_transforms_hl[i](sup_hl).chunk(2, 1)
-            mu_hh, sc_hh = self.cc_transforms_hh[i](sup_hh).chunk(2, 1)
-
-            mu = torch.cat([mu_lh, mu_hl, mu_hh], dim=1)
-            scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
-
-            indexes = self.gaussian_conditional_hf.build_indexes(scale)
-            y_hf_strings = self.gaussian_conditional_hf.compress(
-                y_slice, indexes, means=mu
-            )
-            y_hat_slice = self.gaussian_conditional_hf.decompress(
-                y_hf_strings, indexes, means=mu
-            )
-
-            y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
-
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
                 self.lrp_transforms_lh[i](torch.cat([sup_lh, y_hat_lh], dim=1))
+            )
+            lh_hats.append(y_hat_lh)
+
+            # 2. HL
+            sup_hl = torch.cat(
+                [y_low_hat, scales_hl, means_hl] + hl_hats + lh_hats, dim=1
+            )
+            mu_hl, sc_hl = self.fusion_hl[i](sup_hl).chunk(2, 1)
+            idx_hl = self.gaussian_conditional_hf.build_indexes(sc_hl)
+            strings_hl = self.gaussian_conditional_hf.compress(
+                y_hl_slices[i], idx_hl, means=mu_hl
+            )
+            y_hat_hl = self.gaussian_conditional_hf.decompress(
+                strings_hl, idx_hl, means=mu_hl
             )
             y_hat_hl = y_hat_hl + 0.5 * torch.tanh(
                 self.lrp_transforms_hl[i](torch.cat([sup_hl, y_hat_hl], dim=1))
             )
+            hl_hats.append(y_hat_hl)
+
+            # 3. HH
+            sup_hh = torch.cat(
+                [y_low_hat, scales_hh, means_hh] + hh_hats + lh_hats + hl_hats, dim=1
+            )
+            mu_hh, sc_hh = self.fusion_hh[i](sup_hh).chunk(2, 1)
+            idx_hh = self.gaussian_conditional_hf.build_indexes(sc_hh)
+            strings_hh = self.gaussian_conditional_hf.compress(
+                y_hh_slices[i], idx_hh, means=mu_hh
+            )
+            y_hat_hh = self.gaussian_conditional_hf.decompress(
+                strings_hh, idx_hh, means=mu_hh
+            )
             y_hat_hh = y_hat_hh + 0.5 * torch.tanh(
                 self.lrp_transforms_hh[i](torch.cat([sup_hh, y_hat_hh], dim=1))
             )
-
-            lh_hats.append(y_hat_lh)
-            hl_hats.append(y_hat_hl)
             hh_hats.append(y_hat_hh)
-            y_high_strings.append(y_hf_strings)
+
+            y_high_strings.append([strings_lh, strings_hl, strings_hh])
 
         return {
             "strings": [[y_low_strings, y_high_strings], z_strings],
@@ -1065,48 +1074,46 @@ class WMDC(CompressionModel):
         lh_hats, hl_hats, hh_hats = [], [], []
 
         for i in range(self.num_slices):
-            q_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
-            q_hl = torch.cat([y_low_hat, scales_hl, means_hl] + hl_hats, dim=1)
-            q_hh = torch.cat([y_low_hat, scales_hh, means_hh] + hh_hats, dim=1)
+            strings_lh, strings_hl, strings_hh = y_high_strings[i]
 
-            dict_lh, dict_hl, dict_hh = (
-                self.dt_attn_lh[i](q_lh, self.dt),
-                self.dt_attn_hl[i](q_hl, self.dt),
-                self.dt_attn_hh[i](q_hh, self.dt),
+            # 1. LH
+            sup_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
+            mu_lh, sc_lh = self.fusion_lh[i](sup_lh).chunk(2, 1)
+            idx_lh = self.gaussian_conditional_hf.build_indexes(sc_lh)
+            y_hat_lh = self.gaussian_conditional_hf.decompress(
+                strings_lh, idx_lh, means=mu_lh
             )
-            sup_lh, sup_hl, sup_hh = (
-                torch.cat([q_lh, dict_lh], dim=1),
-                torch.cat([q_hl, dict_hl], dim=1),
-                torch.cat([q_hh, dict_hh], dim=1),
-            )
-
-            mu_lh, sc_lh = self.cc_transforms_lh[i](sup_lh).chunk(2, 1)
-            mu_hl, sc_hl = self.cc_transforms_hl[i](sup_hl).chunk(2, 1)
-            mu_hh, sc_hh = self.cc_transforms_hh[i](sup_hh).chunk(2, 1)
-
-            mu = torch.cat([mu_lh, mu_hl, mu_hh], dim=1)
-            scale = torch.cat([sc_lh, sc_hl, sc_hh], dim=1)
-
-            indexes = self.gaussian_conditional_hf.build_indexes(scale)
-            y_hf_strings = y_high_strings[i]
-            y_hat_slice = self.gaussian_conditional_hf.decompress(
-                y_hf_strings, indexes, means=mu
-            )
-
-            y_hat_lh, y_hat_hl, y_hat_hh = y_hat_slice.chunk(3, dim=1)
-
             y_hat_lh = y_hat_lh + 0.5 * torch.tanh(
                 self.lrp_transforms_lh[i](torch.cat([sup_lh, y_hat_lh], dim=1))
+            )
+            lh_hats.append(y_hat_lh)
+
+            # 2. HL
+            sup_hl = torch.cat(
+                [y_low_hat, scales_hl, means_hl] + hl_hats + lh_hats, dim=1
+            )
+            mu_hl, sc_hl = self.fusion_hl[i](sup_hl).chunk(2, 1)
+            idx_hl = self.gaussian_conditional_hf.build_indexes(sc_hl)
+            y_hat_hl = self.gaussian_conditional_hf.decompress(
+                strings_hl, idx_hl, means=mu_hl
             )
             y_hat_hl = y_hat_hl + 0.5 * torch.tanh(
                 self.lrp_transforms_hl[i](torch.cat([sup_hl, y_hat_hl], dim=1))
             )
+            hl_hats.append(y_hat_hl)
+
+            # 3. HH
+            sup_hh = torch.cat(
+                [y_low_hat, scales_hh, means_hh] + hh_hats + lh_hats + hl_hats, dim=1
+            )
+            mu_hh, sc_hh = self.fusion_hh[i](sup_hh).chunk(2, 1)
+            idx_hh = self.gaussian_conditional_hf.build_indexes(sc_hh)
+            y_hat_hh = self.gaussian_conditional_hf.decompress(
+                strings_hh, idx_hh, means=mu_hh
+            )
             y_hat_hh = y_hat_hh + 0.5 * torch.tanh(
                 self.lrp_transforms_hh[i](torch.cat([sup_hh, y_hat_hh], dim=1))
             )
-
-            lh_hats.append(y_hat_lh)
-            hl_hats.append(y_hat_hl)
             hh_hats.append(y_hat_hh)
 
         y_high_hat = torch.cat(
