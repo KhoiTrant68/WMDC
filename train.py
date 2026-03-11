@@ -237,7 +237,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             out_net["x_hat"].clamp_(0, 1)
             x_hat = crop_image(out_net["x_hat"], padding)
 
-            num_pixels = d.size(0) * d.size(2) * d.size(3)
+            num_pixels = d_padded.size(0) * d_padded.size(2) * d_padded.size(3)
             bpp_val = compute_bpp(out_net, num_pixels)
             mse_val = F.mse_loss(x_hat, d)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100

@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=32):
+def pad_image(x, p=128):
     """Pads image to be divisible by p"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
@@ -45,13 +45,14 @@ def crop_image(x, padding):
 
 def compute_actual_bpp(strings, num_pixels):
     """Safely recursively calculates the size of the bitstream in bytes, converts to BPP"""
+
     def get_size(obj):
         if isinstance(obj, bytes):
             return len(obj)
         elif isinstance(obj, (list, tuple)):
             return sum(get_size(s) for s in obj)
         return 0
-    
+
     total_bytes = get_size(strings)
     return (total_bytes * 8) / num_pixels
 

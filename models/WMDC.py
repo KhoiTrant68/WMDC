@@ -469,11 +469,14 @@ class WMDC(CompressionModel):
             y_high_hat_slices.append(y_hat_slice)
 
         # y_high_hat = torch.cat(y_high_hat_slices, dim=1)
-        y_high_hat = torch.cat([
-            torch.cat(lh_hats, dim=1),
-            torch.cat(hl_hats, dim=1),
-            torch.cat(hh_hats, dim=1)
-        ], dim=1)
+        y_high_hat = torch.cat(
+            [
+                torch.cat(lh_hats, dim=1),
+                torch.cat(hl_hats, dim=1),
+                torch.cat(hh_hats, dim=1),
+            ],
+            dim=1,
+        )
 
         y_high_likelihoods = torch.cat(y_high_likelihood, dim=1)
 
@@ -574,7 +577,12 @@ class WMDC(CompressionModel):
                 torch.cat([ctx_params_anchor_split[i], support], dim=1)
             ).chunk(2, 1)
             means_anchor = self.anchor_atten_mean_lf[i](means_anchor)
-            scales_anchor = self.anchor_atten_scale_lf[i](scales_anchor)
+            scales_anchor = (
+                torch.nn.functional.softplus(
+                    self.anchor_atten_scale_lf[i](scales_anchor)
+                )
+                + 1e-6
+            )
 
             B_anchor, C_anchor, H_anchor, W_anchor = y_anchor.size()
             y_anchor_encode = torch.zeros(
@@ -621,7 +629,12 @@ class WMDC(CompressionModel):
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
             means_non_anchor = self.anchor_atten_mean_lf[i](means_non_anchor)
-            scales_non_anchor = self.anchor_atten_scale_lf[i](scales_non_anchor)
+            scales_non_anchor = (
+                torch.nn.functional.softplus(
+                    self.anchor_atten_scale_lf[i](scales_non_anchor)
+                )
+                + 1e-6
+            )
 
             y_non_anchor_encode = torch.zeros(
                 B_anchor, C_anchor, H_anchor, W_anchor // 2
@@ -847,7 +860,12 @@ class WMDC(CompressionModel):
                 torch.cat([ctx_params_anchor_split[i], support], dim=1)
             ).chunk(2, 1)
             means_anchor = self.anchor_atten_mean_lf[i](means_anchor)
-            scales_anchor = self.anchor_atten_scale_lf[i](scales_anchor)
+            scales_anchor = (
+                torch.nn.functional.softplus(
+                    self.anchor_atten_scale_lf[i](scales_anchor)
+                )
+                + 1e-6
+            )
 
             B_anchor, C_anchor, H_anchor, W_anchor = means_anchor.size()
             means_anchor_encode = torch.zeros(
@@ -888,7 +906,12 @@ class WMDC(CompressionModel):
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
             means_non_anchor = self.anchor_atten_mean_lf[i](means_non_anchor)
-            scales_non_anchor = self.anchor_atten_scale_lf[i](scales_non_anchor)
+            scales_non_anchor = (
+                torch.nn.functional.softplus(
+                    self.anchor_atten_scale_lf[i](scales_non_anchor)
+                )
+                + 1e-6
+            )
 
             means_non_anchor_encode = torch.zeros(
                 B_anchor, C_anchor, H_anchor, W_anchor // 2
@@ -1012,12 +1035,15 @@ class WMDC(CompressionModel):
             hh_hats.append(y_hat_hh)
             y_high_hat_slices.append(y_hat_slice)
 
-        # y_high_hat = torch.cat(y_high_hat_slices, dim=1)
-        y_high_hat = torch.cat([
-            torch.cat(lh_hats, dim=1),
-            torch.cat(hl_hats, dim=1),
-            torch.cat(hh_hats, dim=1)
-        ], dim=1)
+        y_high_hat = torch.cat(y_high_hat_slices, dim=1)
+        # y_high_hat = torch.cat(
+        #     [
+        #         torch.cat(lh_hats, dim=1),
+        #         torch.cat(hl_hats, dim=1),
+        #         torch.cat(hh_hats, dim=1),
+        #     ],
+        #     dim=1,
+        # )
 
         y_freq_hat = torch.cat([y_low_hat, y_high_hat], dim=1)
         y_tilde = self.idwt(y_freq_hat)

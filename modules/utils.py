@@ -34,17 +34,19 @@ def ste_round(x: Tensor) -> Tensor:
 
 
 class CheckboardMaskedConv2d(nn.Conv2d):
-    """
-    Checkerboard Context Model Layer.
-    Optimized Note: Because the input tensor is dynamically masked (zeroed)
-    at non-anchor positions prior to passing into this module in WMDC.py,
-    applying a hard weight mask is mathematically redundant and disables native
-    cuDNN backend optimizations. This wrapper leverages standard nn.Conv2d
-    efficiency while fulfilling structural logic.
-    """
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.register_buffer("mask", torch.ones_like(self.weight))
+        self.mask[:, :, 0::2, 1::2] = 0
+        self.mask[:, :, 1::2, 0::2] = 0
 
     def forward(self, x):
-        return super().forward(x)
+        return nn.functional.conv2d(
+            x,
+            self.weight * self.mask,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
