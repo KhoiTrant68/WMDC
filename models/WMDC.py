@@ -125,7 +125,6 @@ class WMDC(CompressionModel):
         self.gaussian_conditional_lf = GaussianConditional(None)
 
         # E. PATH B: HIGH FREQUENCY DICTIONARY ATTENTION
-        # HF relies entirely on querying the LF dictionary.
         self.fusion_lh, self.fusion_hl, self.fusion_hh = (
             nn.ModuleList(),
             nn.ModuleList(),
@@ -171,7 +170,6 @@ class WMDC(CompressionModel):
         )
 
     def _quantize(self, y, means=None):
-        """Mathematically sound quantization substitution."""
         if self.training:
             return y + torch.empty_like(y).uniform_(-0.5, 0.5)
         else:
@@ -223,8 +221,11 @@ class WMDC(CompressionModel):
 
         # LOW FREQUENCY (LF) Path
         for i, y_slice in enumerate(y_low_slices):
+            mean_support = torch.cat(
+                mean_support_list, dim=1
+            )  # Moved outside of if i > 0
+
             if i > 0:
-                mean_support = torch.cat(mean_support_list, dim=1)
                 mu = self.cc_mean_transforms_lf[i](mean_support)[
                     :, :, : y_shape[0] // 2, : y_shape[1] // 2
                 ]
@@ -414,8 +415,9 @@ class WMDC(CompressionModel):
         mean_support_list, scale_support_list = [latent_means_lf], [latent_scales_lf]
 
         for i, y_slice in enumerate(y_low_slices):
+            mean_support = torch.cat(mean_support_list, dim=1)
+
             if i > 0:
-                mean_support = torch.cat(mean_support_list, dim=1)
                 mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
 
                 scale_support = torch.cat(scale_support_list, dim=1)
@@ -613,8 +615,9 @@ class WMDC(CompressionModel):
 
         # LOW FREQUENCY (LF) Decompression
         for i in range(self.num_slices):
+            mean_support = torch.cat(mean_support_list, dim=1)
+
             if i > 0:
-                mean_support = torch.cat(mean_support_list, dim=1)
                 mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
 
                 scale_support = torch.cat(scale_support_list, dim=1)
