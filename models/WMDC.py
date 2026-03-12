@@ -240,7 +240,13 @@ class WMDC(CompressionModel):
             )
 
             # Anchor
-            means_anchor, scales_anchor = self.context_vss_lf[i](support).chunk(2, 1)
+            empty_context = torch.zeros(
+                support.size(0), self.slice_ch_lf, support.size(2), support.size(3),
+                device=support.device, dtype=support.dtype
+            )
+            means_anchor, scales_anchor = self.context_vss_lf[i](
+                torch.cat([empty_context, support], dim=1)
+            ).chunk(2, 1)
 
             scales_hat_split, means_hat_split = torch.zeros_like(
                 y_slice
@@ -418,7 +424,13 @@ class WMDC(CompressionModel):
             )
 
             # Anchor Compression
-            means_anchor, scales_anchor = self.context_vss_lf[i](support).chunk(2, 1)
+            empty_context = torch.zeros(
+                support.size(0), self.slice_ch_lf, support.size(2), support.size(3),
+                device=support.device, dtype=support.dtype
+            )
+            means_anchor, scales_anchor = self.context_vss_lf[i](
+                torch.cat([empty_context, support], dim=1)
+            ).chunk(2, 1)
 
             B_slice, C_slice, H_slice, W_slice = y_slice.size()
             y_anchor_encode = torch.zeros(
@@ -606,8 +618,13 @@ class WMDC(CompressionModel):
             )
 
             # Anchor Decompression
-            means_anchor, scales_anchor = self.context_vss_lf[i](support).chunk(2, 1)
-
+            empty_context = torch.zeros(
+                support.size(0), self.slice_ch_lf, support.size(2), support.size(3),
+                device=support.device, dtype=support.dtype
+            )
+            means_anchor, scales_anchor = self.context_vss_lf[i](
+                torch.cat([empty_context, support], dim=1)
+            ).chunk(2, 1)
             C_slice = means_anchor.size(1)
             means_anchor_encode = torch.zeros(
                 B, C_slice, H_wave, W_wave // 2, device=z_hat.device
