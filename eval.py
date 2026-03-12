@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=32):
+def pad_image(x, p=64):
     """Pads image to be divisible by exactly 32"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
@@ -86,7 +86,7 @@ def main():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-            x_padded, padding = pad_image(x, p=32)
+            x_padded, padding = pad_image(x)
             num_pixels_original = x.size(2) * x.size(3)
 
             t0 = time.time()
