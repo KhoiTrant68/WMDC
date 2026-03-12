@@ -151,20 +151,19 @@ def train_one_epoch(
     for i, d in pbar:
         out_net = model(d)
         out_criterion = criterion(out_net, d)
-
-        # 1. Main model backward pass
+        total_loss = out_criterion["loss"] + out_net["aux_loss"]
+        
         optimizer.zero_grad()
-        accelerator.backward(out_criterion["loss"])
+        aux_optimizer.zero_grad()
+
+        accelerator.backward(total_loss)
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
             ]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
-        optimizer.step()
 
-        # 2. Entropy bottleneck (aux) backward pass
-        aux_optimizer.zero_grad()
-        accelerator.backward(out_net["aux_loss"])
+        optimizer.step()
         aux_optimizer.step()
 
         loss_val = out_criterion["loss"].item()
