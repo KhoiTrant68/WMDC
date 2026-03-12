@@ -159,7 +159,7 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         # Linear O(128 * HW) Cross Attention
         sim = torch.einsum("benc,bedc->bend", q, k) * self.scale
         probs = torch.softmax(sim, dim=-1)
-
+        self.attn_probs = probs.detach()
         output = torch.einsum("bend,bedc->benc", probs, dt)
         output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
 
