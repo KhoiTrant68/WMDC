@@ -52,7 +52,7 @@ class AverageMeter:
 
 
 def pad_image(x, p=32):
-    """Padded specifically for model spatial downsampling (32x)"""
+    """Padded specifically for model spatial downsampling (16x CNN + 2x Wavelet)"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
     new_w = (w + p - 1) // p * p
@@ -67,21 +67,18 @@ def pad_image(x, p=32):
         and padding_bottom == 0
     ):
         return x, (0, 0, 0, 0)
-    x_padded = F.pad(
+    return F.pad(
         x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect"
-    )
-    return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
+    ), (padding_left, padding_right, padding_top, padding_bottom)
 
 
 def crop_image(x, padding):
-    """Crops back to original size"""
     if sum(padding) == 0:
         return x
     return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
 
 
 def compute_bpp(out_net, num_pixels):
-    """Safely calculates Bits Per Pixel using fp32 precision to avoid log(0) underflow"""
     bpp_loss = sum(
         torch.log(likelihoods.float()).sum() / (-math.log(2) * num_pixels)
         for likelihoods in out_net["likelihoods"].values()
@@ -100,7 +97,6 @@ class RateDistortionLoss(nn.Module):
         N, _, H, W = target.size()
         out = {}
         num_pixels = N * H * W
-
         out["bpp_loss"] = compute_bpp(output, num_pixels)
 
         if self.metric == "mse":
@@ -109,16 +105,9 @@ class RateDistortionLoss(nn.Module):
         elif self.metric == "ms-ssim":
             out["ms_ssim_loss"] = 1 - ms_ssim(output["x_hat"], target, data_range=1.0)
             distortion = out["ms_ssim_loss"]
-        else:
-            raise ValueError(f"Unknown metric: {self.metric}")
 
         out["loss"] = self.lmbda * distortion + out["bpp_loss"]
         return out
-
-
-# =========================================================
-#  OPTIMIZER SETUP
-# =========================================================
 
 
 def configure_optimizers(net, args):
@@ -132,15 +121,9 @@ def configure_optimizers(net, args):
         for n, p in net.named_parameters()
         if n.endswith(".quantiles") and p.requires_grad
     }
-
     optimizer = optim.Adam(parameters.values(), lr=args.learning_rate)
     aux_optimizer = optim.Adam(aux_parameters.values(), lr=args.aux_learning_rate)
     return optimizer, aux_optimizer
-
-
-# =========================================================
-#  TRAINING LOOP
-# =========================================================
 
 
 def train_one_epoch(
@@ -156,8 +139,7 @@ def train_one_epoch(
     accelerator,
 ):
     model.train()
-    loss_meter = AverageMeter()
-    bpp_meter = AverageMeter()
+    loss_meter, bpp_meter = AverageMeter(), AverageMeter()
 
     pbar = tqdm(
         enumerate(train_dataloader),
@@ -167,53 +149,43 @@ def train_one_epoch(
     )
 
     for i, d in pbar:
-        optimizer.zero_grad()
-        aux_optimizer.zero_grad()
-
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
-        loss = out_criterion["loss"] + out_net["aux_loss"]
-        accelerator.backward(loss)
-
+        # 1. Main model backward pass
+        optimizer.zero_grad()
+        accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
             ]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
-
         optimizer.step()
+
+        # 2. Entropy bottleneck (aux) backward pass
+        aux_optimizer.zero_grad()
+        accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
 
         loss_val = out_criterion["loss"].item()
         bpp_val = out_criterion["bpp_loss"].item()
-
         loss_meter.update(loss_val)
         bpp_meter.update(bpp_val)
 
         pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
 
-        if accelerator.is_main_process:
-            step = epoch * len(train_dataloader) + i
-
-            # 1. Periodically log to TensorBoard and the Text File
-            if i % 100 == 0:
-                if writer is not None:
-                    writer.add_scalar("Train/Total_Loss", loss_val, step)
-                    writer.add_scalar("Train/Bpp", bpp_val, step)
-
-                if logger is not None:
-                    logger.info(
-                        f"Train Epoch: {epoch} [{i}/{len(train_dataloader)}] "
-                        f"Loss: {loss_val:.4f} | Bpp: {bpp_val:.4f}"
-                    )
-
-    # 2. Log the final epoch summary
-    if accelerator.is_main_process and logger is not None:
-        logger.info(
-            f"====> Epoch: {epoch} Average Train Loss: {loss_meter.avg:.4f} | "
-            f"Average Train Bpp: {bpp_meter.avg:.4f}"
-        )
+        if accelerator.is_main_process and i % 100 == 0:
+            if writer:
+                writer.add_scalar(
+                    "Train/Total_Loss", loss_val, epoch * len(train_dataloader) + i
+                )
+                writer.add_scalar(
+                    "Train/Bpp", bpp_val, epoch * len(train_dataloader) + i
+                )
+            if logger:
+                logger.info(
+                    f"Train Epoch: {epoch}[{i}/{len(train_dataloader)}] Loss: {loss_val:.4f} | Bpp: {bpp_val:.4f}"
+                )
 
     return loss_meter.avg
 
@@ -221,18 +193,16 @@ def train_one_epoch(
 def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
     model.eval()
     psnr_meter, bpp_meter, loss_meter = AverageMeter(), AverageMeter(), AverageMeter()
-
     pbar = tqdm(
         enumerate(test_dataloader),
         total=len(test_dataloader),
         desc=f"Test Epoch {epoch}",
         disable=not accelerator.is_local_main_process,
     )
-    count_images = 0
+
     with torch.no_grad():
         for i, d in pbar:
-            d_padded, padding = pad_image(d, p=128)
-
+            d_padded, padding = pad_image(d, p=32)
             out_net = model(d_padded)
             out_net["x_hat"].clamp_(0, 1)
             x_hat = crop_image(out_net["x_hat"], padding)
@@ -241,52 +211,37 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             bpp_val = compute_bpp(out_net, num_pixels)
             mse_val = F.mse_loss(x_hat, d)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100
-
-            if criterion.metric == "mse":
-                loss_val = criterion.lmbda * 255**2 * mse_val + bpp_val
-            else:
-                loss_val = (
-                    criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
-                )
+            loss_val = (
+                criterion.lmbda * 255**2 * mse_val + bpp_val
+                if criterion.metric == "mse"
+                else criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
+            )
 
             metrics = torch.tensor(
                 [psnr_val, bpp_val, loss_val], device=accelerator.device
             )
-            gathered_metrics = accelerator.gather(metrics)
+            gathered_metrics = accelerator.gather(metrics).view(-1, 3).mean(dim=0)
 
-            if gathered_metrics.ndim == 1:
-                gathered_metrics = gathered_metrics.view(-1, 3)
+            psnr_meter.update(gathered_metrics[0].item())
+            bpp_meter.update(gathered_metrics[1].item())
+            loss_meter.update(gathered_metrics[2].item())
 
-            avg_metrics = gathered_metrics.mean(dim=0)
-
-            psnr_meter.update(avg_metrics[0].item())
-            bpp_meter.update(avg_metrics[1].item())
-            loss_meter.update(avg_metrics[2].item())
-            count_images += d.size(0)
-            if i == 0 and accelerator.is_main_process and writer is not None:
-                comparison = torch.cat([d, x_hat], dim=0)
-                grid = make_grid(comparison, nrow=d.size(0))
-                writer.add_image("Test/Reconstruction", grid, epoch)
+            if i == 0 and accelerator.is_main_process and writer:
+                writer.add_image(
+                    "Test/Reconstruction",
+                    make_grid(torch.cat([d, x_hat], dim=0), nrow=d.size(0)),
+                    epoch,
+                )
 
     if accelerator.is_main_process:
-        total_saw = count_images * accelerator.num_processes
-        logger.info(
-            f"[Sanity Check] Processed approx {total_saw} images across {accelerator.num_processes} GPUs."
-        )
         logger.info(
             f"Test Epoch {epoch}: Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
         )
-        if writer is not None:
+        if writer:
             writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
             writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
-            writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
 
     return loss_meter.avg
-
-
-# =========================================================
-#  MAIN
-# =========================================================
 
 
 def parse_args():
@@ -308,17 +263,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 def main():
     args = parse_args()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
     set_seed(args.seed)
 
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
@@ -355,7 +304,6 @@ def main():
         shuffle=True,
         num_workers=4,
         pin_memory=True,
-        worker_init_fn=seed_worker,
         generator=g,
     )
     test_loader = DataLoader(
@@ -364,7 +312,6 @@ def main():
         shuffle=False,
         num_workers=4,
         pin_memory=True,
-        worker_init_fn=seed_worker,
         generator=g,
     )
 
@@ -379,8 +326,8 @@ def main():
             model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
         )
     )
-
     criterion = RateDistortionLoss(lmbda=args.lmbda, metric=args.metric)
+
     start_epoch = 0
     best_loss = float("inf")
 
@@ -391,10 +338,8 @@ def main():
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         start_epoch = ckpt["epoch"] + 1
-        best_loss = ckpt.get("loss", float("inf"))
 
     for epoch in range(start_epoch, args.epochs):
-
         train_loss = train_one_epoch(
             model,
             criterion,
@@ -426,9 +371,6 @@ def main():
             if test_loss < best_loss:
                 best_loss = test_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
-
-    if writer:
-        writer.close()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 import pywt
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from compressai.layers import GDN, conv3x3, subpel_conv3x3
 from torch import Tensor
 from torch.autograd import Function
@@ -9,16 +8,12 @@ from torch.autograd import Function
 from modules.utils import conv1x1
 
 
-# ==============================================================================
-# 1. DWT AND IDWT FUNCTIONS
-# ==============================================================================
 class DWT_Function(Function):
     @staticmethod
     def forward(ctx, x, w_ll, w_lh, w_hl, w_hh):
         x = x.contiguous()
         ctx.save_for_backward(w_ll, w_lh, w_hl, w_hh)
         ctx.shape = x.shape
-
         dim = x.shape[1]
         x_ll = torch.nn.functional.conv2d(
             x, w_ll.expand(dim, -1, -1, -1), stride=2, groups=dim
@@ -32,20 +27,20 @@ class DWT_Function(Function):
         x_hh = torch.nn.functional.conv2d(
             x, w_hh.expand(dim, -1, -1, -1), stride=2, groups=dim
         )
-        x = torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
-        return x
+        return torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
 
     @staticmethod
     def backward(ctx, dx):
         if ctx.needs_input_grad[0]:
             w_ll, w_lh, w_hl, w_hh = ctx.saved_tensors
             B, C, H, W = ctx.shape
-            dx = dx.view(B, 4, -1, H // 2, W // 2)
-
-            dx = dx.transpose(1, 2).reshape(B, -1, H // 2, W // 2)
+            dx = (
+                dx.view(B, 4, -1, H // 2, W // 2)
+                .transpose(1, 2)
+                .reshape(B, -1, H // 2, W // 2)
+            )
             filters = torch.cat([w_ll, w_lh, w_hl, w_hh], dim=0).repeat(C, 1, 1, 1)
             dx = torch.nn.functional.conv_transpose2d(dx, filters, stride=2, groups=C)
-
         return dx, None, None, None, None
 
 
@@ -54,14 +49,11 @@ class IDWT_Function(Function):
     def forward(ctx, x, filters):
         ctx.save_for_backward(filters)
         ctx.shape = x.shape
-
         B, _, H, W = x.shape
-        x = x.view(B, 4, -1, H, W).transpose(1, 2)
+        x = x.view(B, 4, -1, H, W).transpose(1, 2).reshape(B, -1, H, W)
         C = x.shape[1]
-        x = x.reshape(B, -1, H, W)
         filters = filters.repeat(C, 1, 1, 1)
-        x = torch.nn.functional.conv_transpose2d(x, filters, stride=2, groups=C)
-        return x
+        return torch.nn.functional.conv_transpose2d(x, filters, stride=2, groups=C)
 
     @staticmethod
     def backward(ctx, dx):
@@ -70,7 +62,6 @@ class IDWT_Function(Function):
             B, C, H, W = ctx.shape
             C = C // 4
             dx = dx.contiguous()
-
             w_ll, w_lh, w_hl, w_hh = torch.unbind(filters, dim=0)
             x_ll = torch.nn.functional.conv2d(
                 dx, w_ll.unsqueeze(1).expand(C, -1, -1, -1), stride=2, groups=C
@@ -92,18 +83,23 @@ class DWT_2D(nn.Module):
     def __init__(self, wave="haar"):
         super(DWT_2D, self).__init__()
         w = pywt.Wavelet(wave)
-        dec_hi = torch.Tensor(w.dec_hi[::-1])
-        dec_lo = torch.Tensor(w.dec_lo[::-1])
-
-        w_ll = dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1)
-        w_lh = dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1)
-        w_hl = dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1)
-        w_hh = dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)
-
-        self.register_buffer("w_ll", w_ll.unsqueeze(0).unsqueeze(0))
-        self.register_buffer("w_lh", w_lh.unsqueeze(0).unsqueeze(0))
-        self.register_buffer("w_hl", w_hl.unsqueeze(0).unsqueeze(0))
-        self.register_buffer("w_hh", w_hh.unsqueeze(0).unsqueeze(0))
+        dec_hi, dec_lo = torch.Tensor(w.dec_hi[::-1]), torch.Tensor(w.dec_lo[::-1])
+        self.register_buffer(
+            "w_ll",
+            (dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1)).unsqueeze(0).unsqueeze(0),
+        )
+        self.register_buffer(
+            "w_lh",
+            (dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1)).unsqueeze(0).unsqueeze(0),
+        )
+        self.register_buffer(
+            "w_hl",
+            (dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1)).unsqueeze(0).unsqueeze(0),
+        )
+        self.register_buffer(
+            "w_hh",
+            (dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)).unsqueeze(0).unsqueeze(0),
+        )
 
     def forward(self, x):
         return DWT_Function.apply(
@@ -119,88 +115,39 @@ class IDWT_2D(nn.Module):
     def __init__(self, wave="haar"):
         super(IDWT_2D, self).__init__()
         w = pywt.Wavelet(wave)
-        rec_hi = torch.Tensor(w.rec_hi)
-        rec_lo = torch.Tensor(w.rec_lo)
-
+        rec_hi, rec_lo = torch.Tensor(w.rec_hi), torch.Tensor(w.rec_lo)
         w_ll = rec_lo.unsqueeze(0) * rec_lo.unsqueeze(1)
         w_lh = rec_lo.unsqueeze(0) * rec_hi.unsqueeze(1)
         w_hl = rec_hi.unsqueeze(0) * rec_lo.unsqueeze(1)
         w_hh = rec_hi.unsqueeze(0) * rec_hi.unsqueeze(1)
-
-        filters = torch.cat(
-            [
-                w_ll.unsqueeze(0).unsqueeze(1),
-                w_lh.unsqueeze(0).unsqueeze(1),
-                w_hl.unsqueeze(0).unsqueeze(1),
-                w_hh.unsqueeze(0).unsqueeze(1),
-            ],
-            dim=0,
+        self.register_buffer(
+            "filters",
+            torch.cat(
+                [
+                    w_ll.unsqueeze(0).unsqueeze(1),
+                    w_lh.unsqueeze(0).unsqueeze(1),
+                    w_hl.unsqueeze(0).unsqueeze(1),
+                    w_hh.unsqueeze(0).unsqueeze(1),
+                ],
+                dim=0,
+            ),
         )
-        self.register_buffer("filters", filters)
 
     def forward(self, x):
         return IDWT_Function.apply(x, self.filters.to(x.dtype))
 
 
-# ==============================================================================
-# 2. SHIFT-INVARIANT ANTI-ALIASED WAVELETS (NOVELTY)
-# ==============================================================================
-class AntiAliasedDWT(nn.Module):
-    """
-    Applies a Binomial Blur filter prior to Decimation to ensure
-    Shift-Invariant Latent Spaces (Massively reduces entropy variance).
-    """
-
-    def __init__(self, wave="haar"):
-        super().__init__()
-        self.dwt = DWT_2D(wave=wave)
-        a = torch.tensor([1.0, 2.0, 1.0]) / 4.0
-        filt = a[:, None] * a[None, :]
-        self.register_buffer("blur_filter", filt[None, None, :, :])
-
-    def forward(self, x):
-        C = x.size(1)
-        filt = self.blur_filter.repeat(C, 1, 1, 1)
-        x_pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
-        x_blurred = F.conv2d(x_pad, filt, groups=C)
-        return self.dwt(x_blurred)
-
-
-class AntiAliasedIDWT(nn.Module):
-    def __init__(self, wave="haar"):
-        super().__init__()
-        self.idwt = IDWT_2D(wave=wave)
-        a = torch.tensor([1.0, 2.0, 1.0]) / 4.0
-        filt = a[:, None] * a[None, :]
-        self.register_buffer("blur_filter", filt[None, None, :, :])
-
-    def forward(self, x):
-        y = self.idwt(x)
-        C = y.size(1)
-        filt = self.blur_filter.repeat(C, 1, 1, 1)
-        y_pad = F.pad(y, (1, 1, 1, 1), mode="reflect")
-        y_blurred = F.conv2d(y_pad, filt, groups=C)
-        return y_blurred
-
-
-# ==============================================================================
-# 3. WAVELET RESIDUAL BLOCKS
-# ==============================================================================
 class ResidualBlockWithStride_wave(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, stride: int = 2, wavelet="haar"):
         super().__init__()
         self.conv1 = conv3x3(in_ch, out_ch, stride=stride)
         self.leaky_relu = nn.LeakyReLU(inplace=True)
-
-        self.dwt = AntiAliasedDWT(wave=wavelet)
-        self.idwt = AntiAliasedIDWT(wave=wavelet)
-
+        self.dwt = DWT_2D(wave=wavelet)
+        self.idwt = IDWT_2D(wave=wavelet)
         self.low_freq_conv = conv3x3(out_ch, out_ch)
         self.gdn_low = GDN(out_ch)
-
         self.high_freq_conv = conv3x3(3 * out_ch, 3 * out_ch)
         self.gdn_high = GDN(3 * out_ch)
-
         self.skip = (
             conv1x1(in_ch, out_ch, stride=stride)
             if (stride != 1 or in_ch != out_ch)
@@ -209,21 +156,15 @@ class ResidualBlockWithStride_wave(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         identity = self.skip(x)
-
         out = self.leaky_relu(self.conv1(x))
-
         dwt_output = self.dwt(out)
-
-        low_freq = dwt_output[:, : out.size(1), :, :]
-        high_freq = dwt_output[:, out.size(1) :, :, :]
-
+        low_freq, high_freq = dwt_output[:, : out.size(1)], dwt_output[:, out.size(1) :]
         low_freq_processed = self.gdn_low(self.low_freq_conv(low_freq))
         high_freq_processed = self.gdn_high(self.high_freq_conv(high_freq))
-
-        dwt_processed = torch.cat([low_freq_processed, high_freq_processed], dim=1)
-        output = self.idwt(dwt_processed)
-
-        return output + identity
+        return (
+            self.idwt(torch.cat([low_freq_processed, high_freq_processed], dim=1))
+            + identity
+        )
 
 
 class ResidualBlockUpsample_wave(nn.Module):
@@ -231,32 +172,22 @@ class ResidualBlockUpsample_wave(nn.Module):
         super().__init__()
         self.subpel_conv = subpel_conv3x3(in_ch, out_ch, upsample)
         self.leaky_relu = nn.LeakyReLU(inplace=True)
-
-        self.dwt = AntiAliasedDWT(wave=wavelet)
-        self.idwt = AntiAliasedIDWT(wave=wavelet)
-
+        self.dwt = DWT_2D(wave=wavelet)
+        self.idwt = IDWT_2D(wave=wavelet)
         self.low_freq_conv = conv3x3(out_ch, out_ch)
         self.igdn_low = GDN(out_ch, inverse=True)
-
         self.high_freq_conv = conv3x3(3 * out_ch, 3 * out_ch)
         self.igdn_high = GDN(3 * out_ch, inverse=True)
-
         self.upsample_skip = subpel_conv3x3(in_ch, out_ch, upsample)
 
     def forward(self, x: Tensor) -> Tensor:
         identity = self.upsample_skip(x)
-
         out = self.leaky_relu(self.subpel_conv(x))
-
         dwt_output = self.dwt(out)
-
-        low_freq = dwt_output[:, : out.size(1), :, :]
-        high_freq = dwt_output[:, out.size(1) :, :, :]
-
+        low_freq, high_freq = dwt_output[:, : out.size(1)], dwt_output[:, out.size(1) :]
         low_freq_processed = self.igdn_low(self.low_freq_conv(low_freq))
         high_freq_processed = self.igdn_high(self.high_freq_conv(high_freq))
-
-        dwt_processed = torch.cat([low_freq_processed, high_freq_processed], dim=1)
-        output = self.idwt(dwt_processed)
-
-        return output + identity
+        return (
+            self.idwt(torch.cat([low_freq_processed, high_freq_processed], dim=1))
+            + identity
+        )

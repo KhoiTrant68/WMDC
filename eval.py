@@ -14,8 +14,8 @@ from torchvision.utils import save_image
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=128):
-    """Pads image to be divisible by p"""
+def pad_image(x, p=32):
+    """Pads image to be divisible by exactly 32"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
     new_w = (w + p - 1) // p * p
@@ -30,22 +30,18 @@ def pad_image(x, p=128):
         and padding_bottom == 0
     ):
         return x, (0, 0, 0, 0)
-    x_padded = F.pad(
+    return F.pad(
         x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect"
-    )
-    return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
+    ), (padding_left, padding_right, padding_top, padding_bottom)
 
 
 def crop_image(x, padding):
-    """Crops back to original size"""
     if sum(padding) == 0:
         return x
     return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
 
 
 def compute_actual_bpp(strings, num_pixels):
-    """Safely recursively calculates the size of the bitstream in bytes, converts to BPP"""
-
     def get_size(obj):
         if isinstance(obj, bytes):
             return len(obj)
@@ -53,12 +49,11 @@ def compute_actual_bpp(strings, num_pixels):
             return sum(get_size(s) for s in obj)
         return 0
 
-    total_bytes = get_size(strings)
-    return (total_bytes * 8) / num_pixels
+    return (get_size(strings) * 8) / num_pixels
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate WMDC performance")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, default="output")
@@ -68,7 +63,6 @@ def main():
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-
     os.makedirs(args.output, exist_ok=True)
     img_dir = os.path.join(args.output, "images")
     os.makedirs(img_dir, exist_ok=True)
@@ -89,39 +83,22 @@ def main():
     results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
 
     with torch.no_grad():
-        dummy_x = torch.zeros(1, 3, 256, 256).to(device)
-        _ = model.compress(dummy_x)
-        if args.cuda:
-            torch.cuda.synchronize()
-
-    with torch.no_grad():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-
-            x_padded, padding = pad_image(x, p=128)
+            x_padded, padding = pad_image(x, p=32)
             num_pixels_original = x.size(2) * x.size(3)
 
-            if args.cuda:
-                torch.cuda.synchronize()
             t0 = time.time()
             out_enc = model.compress(x_padded)
-            if args.cuda:
-                torch.cuda.synchronize()
             enc_time = time.time() - t0
 
-            if args.cuda:
-                torch.cuda.synchronize()
             t1 = time.time()
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
-            if args.cuda:
-                torch.cuda.synchronize()
             dec_time = time.time() - t1
 
             x_hat = crop_image(out_dec["x_hat"], padding).clamp_(0, 1)
-
-            img_filename = os.path.basename(img_path)
-            save_image(x_hat, os.path.join(img_dir, img_filename))
+            save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)
             mse = F.mse_loss(x, x_hat)
@@ -133,8 +110,9 @@ def main():
             results["ms_ssim"].append(msssim)
             results["enc_time"].append(enc_time)
             results["dec_time"].append(dec_time)
+
             print(
-                f"Image: {img_filename} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | MS-SSIM: {msssim:.4f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
+                f"Image: {os.path.basename(img_path)} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
             )
 
     avg_results = {k: sum(v) / len(v) for k, v in results.items()}

@@ -13,7 +13,8 @@ from torchvision import transforms
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=128):
+def pad_image(x, p=32):
+    """Padding fixed to exactly 32 to match the model's spatial downsampling"""
     h, w = x.size(2), x.size(3)
     pad_h = (p - h % p) % p
     pad_w = (p - w % p) % p
@@ -87,7 +88,7 @@ def main():
     def get_attention_probs(module, input, output):
         extracted_probs.append(output.detach().cpu())
 
-    target_module = model.dt_attn_lh[args.slice].softmax
+    target_module = model.fusion_lh[args.slice].softmax
     hook_handle = target_module.register_forward_hook(get_attention_probs)
 
     img_files = sorted(
@@ -97,6 +98,7 @@ def main():
             if f.lower().endswith((".png", ".jpg", ".jpeg"))
         ]
     )[:5]
+
     num_images = len(img_files)
     num_cols = len(target_maps) + 1
 
@@ -116,11 +118,14 @@ def main():
 
         orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
 
-        x_pad = pad_image(x, p=128)
+        x_pad = pad_image(x, p=32)
 
         # The downsampling factor in WMDC to the latent space is 32x (16x from g_a, 2x from DWT)
         latent_h = x_pad.size(2) // 32
         latent_w = x_pad.size(3) // 32
+        max_dict_idx = (
+            latent_h * latent_w
+        ) - 1  # Maximum valid index in the dictionary
 
         extracted_probs.clear()
         with torch.no_grad():
@@ -149,8 +154,12 @@ def main():
 
         # --- PLOT ATTENTION MAPS (Columns 1 to N) ---
         for col_idx, (entry_idx, head_idx) in enumerate(target_maps):
-            # Extract 2D heatmap: [latent_h, latent_w]
-            attn_map = probs[head_idx, :, :, entry_idx].numpy()
+
+            # FIX: Prevent IndexError if the image is too small (e.g. 256x256 gives a 64-token dictionary)
+            safe_entry_idx = min(entry_idx, max_dict_idx)
+
+            # Extract 2D heatmap:[latent_h, latent_w]
+            attn_map = probs[head_idx, :, :, safe_entry_idx].numpy()
 
             ax_map = axes[row_idx][col_idx + 1]
 
@@ -166,11 +175,10 @@ def main():
                 spine.set_linewidth(0.5)
 
             if row_idx == num_images - 1:
-                ax_map.set_xlabel(
-                    f"Dictionary\nEntry {entry_idx}, Head {head_idx}",
-                    fontsize=14,
-                    labelpad=10,
-                )
+                label_txt = f"Dictionary\nEntry {safe_entry_idx}, Head {head_idx}"
+                if safe_entry_idx != entry_idx:
+                    label_txt += "\n(Clamped)"
+                ax_map.set_xlabel(label_txt, fontsize=14, labelpad=10)
 
     hook_handle.remove()
     plt.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)

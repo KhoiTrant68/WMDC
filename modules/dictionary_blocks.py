@@ -14,17 +14,12 @@ class DWConv(nn.Module):
         x = rearrange(x, "b h w c -> b c h w")
         x = self.dwconv(x)
         x = rearrange(x, "b c h w -> b h w c")
-
         return x
 
 
 class ConvolutionalGLU(nn.Module):
     def __init__(
-        self,
-        in_features,
-        hidden_features=None,
-        out_features=None,
-        act_layer=nn.GELU,
+        self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU
     ):
         super().__init__()
         out_features = out_features or in_features
@@ -33,43 +28,12 @@ class ConvolutionalGLU(nn.Module):
         self.fc1 = nn.Linear(in_features, hidden_features * 2)
         self.dwconv = DWConv(hidden_features)
         self.act = act_layer()
-
         self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
         x, v = self.fc1(x).chunk(2, dim=-1)
         x = self.act(self.dwconv(x)) * v
         x = self.fc2(x)
-        return x
-
-
-class ConvWithDW(nn.Module):
-    def __init__(self, input_dim=320, output_dim=320):
-        super(ConvWithDW, self).__init__()
-        self.in_trans = nn.Conv2d(
-            input_dim, output_dim, kernel_size=1, padding=0, stride=1, bias=True
-        )
-        self.act1 = nn.GELU()
-        self.dw_conv = nn.Conv2d(
-            output_dim,
-            output_dim,
-            kernel_size=3,
-            padding=1,
-            stride=1,
-            groups=output_dim,
-            bias=True,
-        )
-        self.act2 = nn.GELU()
-        self.out_trans = nn.Conv2d(
-            output_dim, output_dim, kernel_size=1, padding=0, stride=1, bias=True
-        )
-
-    def forward(self, x):
-        x = self.in_trans(x)
-        x = self.act1(x)
-        x = self.dw_conv(x)
-        x = self.act2(x)
-        x = self.out_trans(x)
         return x
 
 
@@ -81,19 +45,14 @@ class DenseBlock(nn.Module):
             [
                 nn.Sequential(
                     nn.GELU(),
-                    ConvWithDW(dim, dim),
+                    nn.Conv2d(
+                        dim, dim, kernel_size=3, padding=1, groups=dim
+                    ),  # Simplified ConvDW
                 )
-                for i in range(self.layer_num)
+                for _ in range(self.layer_num)
             ]
         )
-        self.proj = nn.Conv2d(
-            dim * (self.layer_num + 1),
-            dim,
-            kernel_size=1,
-            padding=0,
-            stride=1,
-            bias=True,
-        )
+        self.proj = nn.Conv2d(dim * (self.layer_num + 1), dim, kernel_size=1)
 
     def forward(self, x):
         outputs = [x]
@@ -120,7 +79,7 @@ class SpatialAttentionModule(nn.Module):
 class MultiScaleAggregation(nn.Module):
     def __init__(self, dim):
         super(MultiScaleAggregation, self).__init__()
-        self.s = nn.Conv2d(dim, dim, kernel_size=1, padding=0, stride=1, bias=True)
+        self.s = nn.Conv2d(dim, dim, kernel_size=1)
         self.spatial_atte = SpatialAttentionModule()
         self.dense = DenseBlock(dim)
 
@@ -134,29 +93,42 @@ class MultiScaleAggregation(nn.Module):
 
 
 class Scale(nn.Module):
-    def __init__(self, dim, init_value=1.0, trainable=True):
+    def __init__(self, dim, init_value=1.0):
         super().__init__()
-        self.scale = nn.Parameter(init_value * torch.ones(dim), requires_grad=trainable)
+        self.scale = nn.Parameter(init_value * torch.ones(dim))
 
     def forward(self, x):
         return x * self.scale
 
 
 class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
-    def __init__(self, input_dim, output_dim, mlp_rate=4, head_num=20, qkv_bias=True):
+    def __init__(
+        self,
+        input_dim,
+        dict_input_dim,
+        output_dim,
+        mlp_rate=4,
+        head_num=20,
+        qkv_bias=True,
+    ):
         super().__init__()
-
         dict_dim = 32 * head_num
         self.head_num = head_num
 
         self.scale = nn.Parameter(torch.ones(head_num, 1, 1))
+
+        # Projections
         self.x_trans = nn.Linear(input_dim, dict_dim, bias=qkv_bias)
+        self.dt_trans = nn.Linear(
+            dict_input_dim, dict_dim, bias=qkv_bias
+        )  # Maps LF latent to dict dim
 
         self.ln_scale = nn.LayerNorm(dict_dim)
         self.msa = MultiScaleAggregation(dict_dim)
 
         self.lnx = nn.LayerNorm(dict_dim)
         self.q_trans = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
+
         self.dict_ln = nn.LayerNorm(dict_dim)
         self.k = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
 
@@ -167,9 +139,9 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         self.output_trans = nn.Sequential(nn.Linear(dict_dim, output_dim))
         self.softmax = torch.nn.Softmax(dim=-1)
 
-        self.res_scale_1 = Scale(dict_dim, init_value=1.0)
-        self.res_scale_2 = Scale(dict_dim, init_value=1.0)
-        self.res_scale_3 = Scale(dict_dim, init_value=1.0)
+        self.res_scale_1 = Scale(dict_dim)
+        self.res_scale_2 = Scale(dict_dim)
+        self.res_scale_3 = Scale(dict_dim)
 
     def forward(self, x, dt):
         B, C, H, W = x.size()
@@ -177,22 +149,24 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         x = self.x_trans(x)
 
         x = self.msa(self.ln_scale(x)) + self.res_scale_1(x)
-
         shortcut = x
         x = self.lnx(x)
         x = self.q_trans(x)
 
         q = rearrange(x, "b h w (e c) -> b e (h w) c", e=self.head_num)
 
+        dt = self.dt_trans(dt)
         dt = self.dict_ln(dt)
         k = self.k(dt)
-        k = rearrange(k, "n (e c) -> e n c", e=self.head_num)
-        dt_val = rearrange(dt, "n (e c) -> e n c", e=self.head_num)
 
-        sim = torch.einsum("belc,enc->beln", q, k) * self.scale
+        # BATCH DIMENSION
+        k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
+        dt_val = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
+
+        sim = torch.einsum("belc,benc->beln", q, k) * self.scale
         probs = self.softmax(sim)
 
-        output = torch.einsum("beln,enc->belc", probs, dt_val)
+        output = torch.einsum("beln,benc->belc", probs, dt_val)
         output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
 
         output = self.linear(output) + self.res_scale_2(shortcut)
