@@ -102,34 +102,21 @@ class Scale(nn.Module):
 
 
 class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        dict_input_dim,
-        output_dim,
-        mlp_rate=4,
-        head_num=20,
-        qkv_bias=True,
-    ):
+    def __init__(self, input_dim, output_dim, mlp_rate=4, head_num=20, qkv_bias=True):
         super().__init__()
         dict_dim = 32 * head_num
         self.head_num = head_num
 
         self.scale = nn.Parameter(torch.ones(head_num, 1, 1))
-
-        # Projections
         self.x_trans = nn.Linear(input_dim, dict_dim, bias=qkv_bias)
-        self.dt_trans = nn.Linear(
-            dict_input_dim, dict_dim, bias=qkv_bias
-        )  # Maps LF latent to dict dim
 
         self.ln_scale = nn.LayerNorm(dict_dim)
         self.msa = MultiScaleAggregation(dict_dim)
 
         self.lnx = nn.LayerNorm(dict_dim)
         self.q_trans = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
-
         self.dict_ln = nn.LayerNorm(dict_dim)
+
         self.k = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
 
         self.linear = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
@@ -137,41 +124,50 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
 
         self.mlp = ConvolutionalGLU(dict_dim, mlp_rate * dict_dim)
         self.output_trans = nn.Sequential(nn.Linear(dict_dim, output_dim))
-        self.softmax = torch.nn.Softmax(dim=-1)
 
-        self.res_scale_1 = Scale(dict_dim)
-        self.res_scale_2 = Scale(dict_dim)
-        self.res_scale_3 = Scale(dict_dim)
+        self.res_scale_1 = Scale(dict_dim, init_value=1.0)
+        self.res_scale_2 = Scale(dict_dim, init_value=1.0)
+        self.res_scale_3 = Scale(dict_dim, init_value=1.0)
 
     def forward(self, x, dt):
+        """
+        x: (B, C, H, W) - Local feature query
+        dt: (B, N, D) - Dynamically generated image-specific dictionary from HDDA
+        """
         B, C, H, W = x.size()
+
+        # Feature processing
         x = rearrange(x, "b c h w -> b h w c")
         x = self.x_trans(x)
-
         x = self.msa(self.ln_scale(x)) + self.res_scale_1(x)
+
         shortcut = x
         x = self.lnx(x)
         x = self.q_trans(x)
 
+        # Generate Queries
         q = rearrange(x, "b h w (e c) -> b e (h w) c", e=self.head_num)
 
-        dt = self.dt_trans(dt)
+        # Generate Keys from Dynamic Dictionary
         dt = self.dict_ln(dt)
         k = self.k(dt)
-
-        # BATCH DIMENSION
         k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
-        dt_val = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
+        dt = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
 
-        sim = torch.einsum("belc,benc->beln", q, k) * self.scale
-        probs = self.softmax(sim)
+        self.scale = self.scale.to(q.device)
 
-        output = torch.einsum("beln,benc->belc", probs, dt_val)
+        # Linear O(128 * HW) Cross Attention
+        sim = torch.einsum("benc,bedc->bend", q, k) * self.scale
+        probs = torch.softmax(sim, dim=-1)
+
+        output = torch.einsum("bend,bedc->benc", probs, dt)
         output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
 
+        # FFN block
         output = self.linear(output) + self.res_scale_2(shortcut)
         output = self.mlp(self.ln_mlp(output)) + self.res_scale_3(output)
 
         output = self.output_trans(output)
         output = rearrange(output, "b h w c -> b c h w")
+
         return output

@@ -126,6 +126,12 @@ def configure_optimizers(net, args):
     return optimizer, aux_optimizer
 
 
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def train_one_epoch(
     model,
     criterion,
@@ -304,6 +310,7 @@ def main():
         num_workers=4,
         pin_memory=True,
         generator=g,
+        worker_init_fn=worker_init_fn,
     )
     test_loader = DataLoader(
         test_dataset,
