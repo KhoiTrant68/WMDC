@@ -53,7 +53,7 @@ class IDWT_Function(Function):
         x = x.view(B, 4, -1, H, W).transpose(1, 2).reshape(B, -1, H, W)
         C = x.shape[1]
         filters = filters.repeat(C // 4, 1, 1, 1)
-        return torch.nn.functional.conv_transpose2d(x, filters, stride=2, groups=C)
+        return torch.nn.functional.conv_transpose2d(x, filters, stride=2, groups=C//4)
 
     @staticmethod
     def backward(ctx, dx):
