@@ -2,6 +2,7 @@ import argparse
 import os
 
 import matplotlib
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -13,102 +14,66 @@ from torchvision import transforms
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=32):
-    """Padding fixed to exactly 32 to match the model's spatial downsampling"""
+def pad_image(x, p=64):
+    """Padding fixed to exactly 64. g_a (16x) * h_a (4x) = 64x."""
     h, w = x.size(2), x.size(3)
     pad_h = (p - h % p) % p
     pad_w = (p - w % p) % p
     if pad_w == 0 and pad_h == 0:
+        return x, (0, 0, 0, 0)
+    return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect"), (0, pad_w, 0, pad_h)
+
+
+def crop_image(x, padding):
+    """Crop the padded regions for accurate visualization overlay."""
+    _, pad_w, _, pad_h = padding
+    if pad_w == 0 and pad_h == 0:
         return x
-    return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+    return x[..., : x.size(2) - pad_h, : x.size(3) - pad_w]
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Visualize WMDC Dictionary Attention Maps"
-    )
-    parser.add_argument(
-        "-d",
-        "--img_dir",
-        type=str,
-        required=True,
-        help="Directory containing input images",
-    )
-    parser.add_argument(
-        "-c",
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to trained model checkpoint",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=str,
-        default="attention_maps_grid.pdf",
-        help="Output filename",
-    )
-    parser.add_argument(
-        "--slice",
-        type=int,
-        default=0,
-        help="Which slice to visualize (0 to num_slices-1)",
-    )
-    parser.add_argument("--N", type=int, default=192)
-    parser.add_argument("--M", type=int, default=320)
-    parser.add_argument("--cuda", action="store_true", help="Use GPU")
+    parser = argparse.ArgumentParser(description="Visualize HDDA Maps (CVPR Ready)")
+    parser.add_argument("-d", "--img_dir", type=str, required=True)
+    parser.add_argument("-c", "--checkpoint", type=str, required=True)
+    parser.add_argument("-o", "--output", type=str, default="hdda_attention_maps.pdf")
+    parser.add_argument("--slice", type=int, default=0, help="Latent slice (0-4)")
+    parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    # Format: (Entry Index, Head Index)
+    # Format: (Dictionary Entry Index[0-127], Head Index [0-19])
+    # Pick a mix of early and late heads/tokens to show diversity
     target_maps = [
         (0, 0),
-        (10, 0),
-        (50, 0),
-        (99, 0),
-        (120, 0),
-        (0, 1),
-        (10, 1),
-        (50, 1),
-        (99, 1),
-        (120, 1),
+        (32, 2),
+        (64, 5),
+        (127, 19),
     ]
 
-    model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
+    # Initialize new FD-SSM + HDDA Model
+    model = WMDC(N=192, M=320, num_slices=5).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if "state_dict" in ckpt:
-        model.load_state_dict(ckpt["state_dict"])
-    else:
-        model.load_state_dict(ckpt)
+    model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
 
-    extracted_probs = []
-
-    def get_attention_probs(module, input, output):
-        extracted_probs.append(output.detach().cpu())
-
-    target_module = model.fusion_lh[args.slice].softmax
-    hook_handle = target_module.register_forward_hook(get_attention_probs)
-
     img_files = sorted(
-        [
-            f
-            for f in os.listdir(args.img_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ]
-    )[:5]
+        [f for f in os.listdir(args.img_dir) if f.lower().endswith((".png", ".jpg"))]
+    )[
+        :4
+    ]  # Process top 4 images
 
     num_images = len(img_files)
     num_cols = len(target_maps) + 1
 
     fig, axes = plt.subplots(
-        nrows=num_images, ncols=num_cols, figsize=(3 * num_cols, 2 * num_images)
+        nrows=num_images, ncols=num_cols, figsize=(4 * num_cols, 3 * num_images)
     )
     if num_images == 1:
-        axes = [axes]  # Ensure 2D indexing works
+        axes = [axes]
 
-    plt.subplots_adjust(wspace=0.05, hspace=0.05)  # Tight layout like the paper
+    plt.subplots_adjust(wspace=0.02, hspace=0.02)
 
     for row_idx, img_name in enumerate(img_files):
         print(f"Processing {img_name}...")
@@ -116,76 +81,64 @@ def main():
         img = Image.open(img_path).convert("RGB")
         x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-        orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+        # Pad securely to 64x
+        x_pad, padding = pad_image(x, p=64)
 
-        x_pad = pad_image(x, p=32)
-
-        # The downsampling factor in WMDC to the latent space is 32x (16x from g_a, 2x from DWT)
-        latent_h = x_pad.size(2) // 32
-        latent_w = x_pad.size(3) // 32
-        max_dict_idx = (
-            latent_h * latent_w
-        ) - 1  # Maximum valid index in the dictionary
-
-        extracted_probs.clear()
         with torch.no_grad():
             _ = model(x_pad)
 
-        # Grab the extracted attention tensor
-        # Shape:[1, head_num, (latent_h * latent_w), dict_num]
-        probs = extracted_probs[0].squeeze(0)
+        # 1. Grab attention from our class attribute (B, Head, HW, Dict_Num)
+        # Assuming batch size 1, squeeze batch dim -> (Head, HW, 128)
+        probs = model.dt_cross_attention[args.slice].attn_probs.squeeze(0).cpu()
 
-        # Reshape spatial dimension back to 2D
-        # Shape:[head_num, latent_h, latent_w, dict_num]
+        # 2. Reshape to spatial grid: y is strictly 1/16th of x_pad
+        latent_h, latent_w = x_pad.size(2) // 16, x_pad.size(3) // 16
         probs = probs.view(probs.size(0), latent_h, latent_w, probs.size(-1))
 
+        # Original image for overlay (cropped back to original size)
+        orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+        h_orig, w_orig = orig_np.shape[0], orig_np.shape[1]
+
+        # --- PLOT INPUT IMAGE ---
         ax_img = axes[row_idx][0]
         ax_img.imshow(orig_np)
+        ax_img.axis("off")
+        if row_idx == 0:
+            ax_img.set_title("Input Image", fontsize=16, pad=10)
 
-        if row_idx == num_images - 1:
-            ax_img.set_xlabel("Input\nImage", fontsize=16, labelpad=10)
-            ax_img.xaxis.set_label_position("bottom")
+        # --- PLOT ATTENTION OVERLAYS ---
+        for col_idx, (dict_idx, head_idx) in enumerate(target_maps):
 
-        ax_img.set_xticks([])
-        ax_img.set_yticks([])
-        for spine in ax_img.spines.values():
-            spine.set_edgecolor("gray")
-            spine.set_linewidth(1.5)
+            # Extract 2D heatmap: [latent_h, latent_w]
+            attn_map = probs[head_idx, :, :, dict_idx].unsqueeze(0).unsqueeze(0)
 
-        # --- PLOT ATTENTION MAPS (Columns 1 to N) ---
-        for col_idx, (entry_idx, head_idx) in enumerate(target_maps):
+            # Crop the padded area out of the attention map conceptually,
+            # then interpolate to original resolution for smooth overlay.
+            attn_cropped = crop_image(attn_map, [p // 16 for p in padding])
+            attn_resized = F.interpolate(
+                attn_cropped, size=(h_orig, w_orig), mode="bicubic", align_corners=False
+            )
+            attn_np = attn_resized.squeeze().numpy()
 
-            # FIX: Prevent IndexError if the image is too small (e.g. 256x256 gives a 64-token dictionary)
-            safe_entry_idx = min(entry_idx, max_dict_idx)
-
-            # Extract 2D heatmap:[latent_h, latent_w]
-            attn_map = probs[head_idx, :, :, safe_entry_idx].numpy()
+            # Normalize for visualization
+            attn_np = (attn_np - attn_np.min()) / (attn_np.max() - attn_np.min() + 1e-8)
 
             ax_map = axes[row_idx][col_idx + 1]
 
-            # Use 'hot' colormap
-            im = ax_map.imshow(
-                attn_map, cmap="gist_heat", aspect="auto", interpolation="nearest"
-            )
+            # Alpha Blending
+            ax_map.imshow(orig_np)  # Background
+            im = ax_map.imshow(attn_np, cmap="jet", alpha=0.5)  # Heatmap overlay
 
-            # Format axes
-            ax_map.tick_params(axis="both", which="major", labelsize=6)
-            for spine in ax_map.spines.values():
-                spine.set_edgecolor("black")
-                spine.set_linewidth(0.5)
+            ax_map.axis("off")
 
-            if row_idx == num_images - 1:
-                label_txt = f"Dictionary\nEntry {safe_entry_idx}, Head {head_idx}"
-                if safe_entry_idx != entry_idx:
-                    label_txt += "\n(Clamped)"
-                ax_map.set_xlabel(label_txt, fontsize=14, labelpad=10)
+            if row_idx == 0:
+                ax_map.set_title(
+                    f"Dict Token {dict_idx} | Head {head_idx}", fontsize=14, pad=10
+                )
 
-    hook_handle.remove()
     plt.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)
-    plt.savefig(
-        args.output.replace(".pdf", ".jpg"), format="jpg", bbox_inches="tight", dpi=300
-    )
     plt.close()
+    print(f"Saved highly-interpretable attention maps to {args.output}")
 
 
 if __name__ == "__main__":
