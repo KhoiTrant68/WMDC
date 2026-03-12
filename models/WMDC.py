@@ -38,25 +38,28 @@ class WMDC(CompressionModel):
         self.idwt = IDWT_2D(wave="haar")
 
         # C. HYPER-PRIOR AUTOENCODER
+        # drop_path set strictly to 0.0 to prevent BPP leakage
+        # caused by shifting latent distributions during inference.
         self.h_a = nn.Sequential(
             conv(4 * M, N, kernel_size=5, stride=2),
-            VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
+            VSSBlock(hidden_dim=N, drop_path=0.0, ssm_d_state=16),
             conv(N, 192, kernel_size=5, stride=2),
         )
         self.entropy_bottleneck = EntropyBottleneck(192)
 
         self.h_mean_s = nn.Sequential(
             deconv(192, N, kernel_size=5, stride=2),
-            VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
+            VSSBlock(hidden_dim=N, drop_path=0.0, ssm_d_state=16),
             deconv(N, 4 * M, kernel_size=5, stride=2),
         )
         self.h_scale_s = nn.Sequential(
             deconv(192, N, kernel_size=5, stride=2),
-            VSSBlock(hidden_dim=N, drop_path=0.1, ssm_d_state=16),
+            VSSBlock(hidden_dim=N, drop_path=0.0, ssm_d_state=16),
             deconv(N, 4 * M, kernel_size=5, stride=2),
         )
 
         # D. PATH A: LOW FREQUENCY ENTROPY MODEL (Mamba + Spatial Context)
+        # Slice 0 does not use conditional mean/scale transforms.
         self.cc_mean_transforms_lf = nn.ModuleList(
             nn.Sequential(
                 conv(M + self.slice_ch_lf * min(i, 5), 224, stride=1, kernel_size=3),
@@ -65,7 +68,7 @@ class WMDC(CompressionModel):
                 nn.GELU(),
                 conv(128, self.slice_ch_lf, stride=1, kernel_size=3),
             )
-            for i in range(self.num_slices)
+            for i in range(1, self.num_slices)
         )
         self.cc_scale_transforms_lf = nn.ModuleList(
             nn.Sequential(
@@ -75,7 +78,7 @@ class WMDC(CompressionModel):
                 nn.GELU(),
                 conv(128, self.slice_ch_lf, stride=1, kernel_size=3),
             )
-            for i in range(self.num_slices)
+            for i in range(1, self.num_slices)
         )
 
         # Mamba captures global LF structure
@@ -87,7 +90,7 @@ class WMDC(CompressionModel):
                         if i == 0
                         else 2 * M + 3 * self.slice_ch_lf
                     ),
-                    drop_path=0.0,
+                    drop_path=0.0,  
                     ssm_d_state=16,
                 ),
                 conv(
@@ -185,9 +188,9 @@ class WMDC(CompressionModel):
         y_low, y_high = y_freq[:, : self.M], y_freq[:, self.M :]
 
         z = self.h_a(y_freq)
-        _, z_likelihoods = self.entropy_bottleneck(z)
-        z_offset = self.entropy_bottleneck._get_medians().detach()
-        z_hat = self._quantize(z - z_offset) + z_offset
+
+        # Use natively quantised z_hat to preserve RD bounds
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -221,17 +224,15 @@ class WMDC(CompressionModel):
 
         # LOW FREQUENCY (LF) Path
         for i, y_slice in enumerate(y_low_slices):
-            mean_support = torch.cat(
-                mean_support_list, dim=1
-            )  # Moved outside of if i > 0
+            mean_support = torch.cat(mean_support_list, dim=1)
 
             if i > 0:
-                mu = self.cc_mean_transforms_lf[i](mean_support)[
+                mu = self.cc_mean_transforms_lf[i - 1](mean_support)[
                     :, :, : y_shape[0] // 2, : y_shape[1] // 2
                 ]
 
                 scale_support = torch.cat(scale_support_list, dim=1)
-                scale = self.cc_scale_transforms_lf[i](scale_support)[
+                scale = self.cc_scale_transforms_lf[i - 1](scale_support)[
                     :, :, : y_shape[0] // 2, : y_shape[1] // 2
                 ]
 
@@ -250,9 +251,13 @@ class WMDC(CompressionModel):
                 device=support.device,
                 dtype=support.dtype,
             )
-            means_anchor, scales_anchor = self.context_vss_lf[i](
+
+            means_anchor, raw_scales_anchor = self.context_vss_lf[i](
                 torch.cat([empty_context, support], dim=1)
             ).chunk(2, 1)
+
+            # Absolute value clamping strictly 
+            scales_anchor = torch.clamp(torch.abs(raw_scales_anchor), min=1e-5)
 
             scales_hat_split, means_hat_split = torch.zeros_like(
                 y_slice
@@ -272,9 +277,12 @@ class WMDC(CompressionModel):
 
             # Non-Anchor
             masked_context = self.context_prediction_lf[i](y_anchor_quantized)
-            means_non_anchor, scales_non_anchor = self.context_vss_lf[i](
+            means_non_anchor, raw_scales_non_anchor = self.context_vss_lf[i](
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
+
+            # Scale clamping
+            scales_non_anchor = torch.clamp(torch.abs(raw_scales_non_anchor), min=1e-5)
 
             scales_hat_split[:, :, 0::2, 1::2], scales_hat_split[:, :, 1::2, 0::2] = (
                 scales_non_anchor[:, :, 0::2, 1::2],
@@ -324,7 +332,9 @@ class WMDC(CompressionModel):
         for i in range(self.num_slices):
             # 1. LH
             sup_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
-            mu_lh, sc_lh = self.fusion_lh[i](sup_lh, dt_token).chunk(2, 1)
+            mu_lh, raw_sc_lh = self.fusion_lh[i](sup_lh, dt_token).chunk(2, 1)
+            sc_lh = torch.clamp(torch.abs(raw_sc_lh), min=1e-5)
+
             _, like_lh = self.gaussian_conditional_hf(
                 y_lh_slices[i], sc_lh, means=mu_lh
             )
@@ -334,7 +344,9 @@ class WMDC(CompressionModel):
             sup_hl = torch.cat(
                 [y_low_hat, scales_hl, means_hl] + hl_hats + lh_hats, dim=1
             )
-            mu_hl, sc_hl = self.fusion_hl[i](sup_hl, dt_token).chunk(2, 1)
+            mu_hl, raw_sc_hl = self.fusion_hl[i](sup_hl, dt_token).chunk(2, 1)
+            sc_hl = torch.clamp(torch.abs(raw_sc_hl), min=1e-5)
+
             _, like_hl = self.gaussian_conditional_hf(
                 y_hl_slices[i], sc_hl, means=mu_hl
             )
@@ -344,7 +356,9 @@ class WMDC(CompressionModel):
             sup_hh = torch.cat(
                 [y_low_hat, scales_hh, means_hh] + hh_hats + lh_hats + hl_hats, dim=1
             )
-            mu_hh, sc_hh = self.fusion_hh[i](sup_hh, dt_token).chunk(2, 1)
+            mu_hh, raw_sc_hh = self.fusion_hh[i](sup_hh, dt_token).chunk(2, 1)
+            sc_hh = torch.clamp(torch.abs(raw_sc_hh), min=1e-5)
+
             _, like_hh = self.gaussian_conditional_hf(
                 y_hh_slices[i], sc_hh, means=mu_hh
             )
@@ -418,10 +432,12 @@ class WMDC(CompressionModel):
             mean_support = torch.cat(mean_support_list, dim=1)
 
             if i > 0:
-                mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
+                mu = self.cc_mean_transforms_lf[i - 1](mean_support)[
+                    :, :, :H_wave, :W_wave
+                ]
 
                 scale_support = torch.cat(scale_support_list, dim=1)
-                scale = self.cc_scale_transforms_lf[i](scale_support)[
+                scale = self.cc_scale_transforms_lf[i - 1](scale_support)[
                     :, :, :H_wave, :W_wave
                 ]
 
@@ -440,9 +456,12 @@ class WMDC(CompressionModel):
                 device=support.device,
                 dtype=support.dtype,
             )
-            means_anchor, scales_anchor = self.context_vss_lf[i](
+            means_anchor, raw_scales_anchor = self.context_vss_lf[i](
                 torch.cat([empty_context, support], dim=1)
             ).chunk(2, 1)
+
+            # Scale clamping
+            scales_anchor = torch.clamp(torch.abs(raw_scales_anchor), min=1e-5)
 
             B_slice, C_slice, H_slice, W_slice = y_slice.size()
             y_anchor_encode = torch.zeros(
@@ -480,9 +499,12 @@ class WMDC(CompressionModel):
 
             # Non-Anchor Compression
             masked_context = self.context_prediction_lf[i](y_anchor_decode)
-            means_non_anchor, scales_non_anchor = self.context_vss_lf[i](
+            means_non_anchor, raw_scales_non_anchor = self.context_vss_lf[i](
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
+
+            # Scale clamping
+            scales_non_anchor = torch.clamp(torch.abs(raw_scales_non_anchor), min=1e-5)
 
             y_non_anchor_encode = torch.zeros(
                 B_slice, C_slice, H_slice, W_slice // 2, device=x.device
@@ -548,7 +570,9 @@ class WMDC(CompressionModel):
         for i in range(self.num_slices):
             # 1. LH
             sup_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
-            mu_lh, sc_lh = self.fusion_lh[i](sup_lh, dt_token).chunk(2, 1)
+            mu_lh, raw_sc_lh = self.fusion_lh[i](sup_lh, dt_token).chunk(2, 1)
+            sc_lh = torch.clamp(torch.abs(raw_sc_lh), min=1e-5)
+
             idx_lh = self.gaussian_conditional_hf.build_indexes(sc_lh)
             strings_lh = self.gaussian_conditional_hf.compress(
                 y_lh_slices[i], idx_lh, means=mu_lh
@@ -561,7 +585,9 @@ class WMDC(CompressionModel):
             sup_hl = torch.cat(
                 [y_low_hat, scales_hl, means_hl] + hl_hats + lh_hats, dim=1
             )
-            mu_hl, sc_hl = self.fusion_hl[i](sup_hl, dt_token).chunk(2, 1)
+            mu_hl, raw_sc_hl = self.fusion_hl[i](sup_hl, dt_token).chunk(2, 1)
+            sc_hl = torch.clamp(torch.abs(raw_sc_hl), min=1e-5)
+
             idx_hl = self.gaussian_conditional_hf.build_indexes(sc_hl)
             strings_hl = self.gaussian_conditional_hf.compress(
                 y_hl_slices[i], idx_hl, means=mu_hl
@@ -574,7 +600,9 @@ class WMDC(CompressionModel):
             sup_hh = torch.cat(
                 [y_low_hat, scales_hh, means_hh] + hh_hats + lh_hats + hl_hats, dim=1
             )
-            mu_hh, sc_hh = self.fusion_hh[i](sup_hh, dt_token).chunk(2, 1)
+            mu_hh, raw_sc_hh = self.fusion_hh[i](sup_hh, dt_token).chunk(2, 1)
+            sc_hh = torch.clamp(torch.abs(raw_sc_hh), min=1e-5)
+
             idx_hh = self.gaussian_conditional_hf.build_indexes(sc_hh)
             strings_hh = self.gaussian_conditional_hf.compress(
                 y_hh_slices[i], idx_hh, means=mu_hh
@@ -618,10 +646,12 @@ class WMDC(CompressionModel):
             mean_support = torch.cat(mean_support_list, dim=1)
 
             if i > 0:
-                mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
+                mu = self.cc_mean_transforms_lf[i - 1](mean_support)[
+                    :, :, :H_wave, :W_wave
+                ]
 
                 scale_support = torch.cat(scale_support_list, dim=1)
-                scale = self.cc_scale_transforms_lf[i](scale_support)[
+                scale = self.cc_scale_transforms_lf[i - 1](scale_support)[
                     :, :, :H_wave, :W_wave
                 ]
 
@@ -640,9 +670,13 @@ class WMDC(CompressionModel):
                 device=support.device,
                 dtype=support.dtype,
             )
-            means_anchor, scales_anchor = self.context_vss_lf[i](
+            means_anchor, raw_scales_anchor = self.context_vss_lf[i](
                 torch.cat([empty_context, support], dim=1)
             ).chunk(2, 1)
+
+            # Scale clamping
+            scales_anchor = torch.clamp(torch.abs(raw_scales_anchor), min=1e-5)
+
             C_slice = means_anchor.size(1)
             means_anchor_encode = torch.zeros(
                 B, C_slice, H_wave, W_wave // 2, device=z_hat.device
@@ -672,9 +706,12 @@ class WMDC(CompressionModel):
 
             # Non-Anchor Decompression
             masked_context = self.context_prediction_lf[i](y_anchor_decode)
-            means_non_anchor, scales_non_anchor = self.context_vss_lf[i](
+            means_non_anchor, raw_scales_non_anchor = self.context_vss_lf[i](
                 torch.cat([masked_context, support], dim=1)
             ).chunk(2, 1)
+
+            # Scale clamping
+            scales_non_anchor = torch.clamp(torch.abs(raw_scales_non_anchor), min=1e-5)
 
             means_non_anchor_encode = torch.zeros(
                 B, C_slice, H_wave, W_wave // 2, device=z_hat.device
@@ -727,7 +764,9 @@ class WMDC(CompressionModel):
 
             # 1. LH
             sup_lh = torch.cat([y_low_hat, scales_lh, means_lh] + lh_hats, dim=1)
-            mu_lh, sc_lh = self.fusion_lh[i](sup_lh, dt_token).chunk(2, 1)
+            mu_lh, raw_sc_lh = self.fusion_lh[i](sup_lh, dt_token).chunk(2, 1)
+            sc_lh = torch.clamp(torch.abs(raw_sc_lh), min=1e-5)
+
             idx_lh = self.gaussian_conditional_hf.build_indexes(sc_lh)
             lh_hats.append(
                 self.gaussian_conditional_hf.decompress(strings_lh, idx_lh, means=mu_lh)
@@ -737,7 +776,9 @@ class WMDC(CompressionModel):
             sup_hl = torch.cat(
                 [y_low_hat, scales_hl, means_hl] + hl_hats + lh_hats, dim=1
             )
-            mu_hl, sc_hl = self.fusion_hl[i](sup_hl, dt_token).chunk(2, 1)
+            mu_hl, raw_sc_hl = self.fusion_hl[i](sup_hl, dt_token).chunk(2, 1)
+            sc_hl = torch.clamp(torch.abs(raw_sc_hl), min=1e-5)
+
             idx_hl = self.gaussian_conditional_hf.build_indexes(sc_hl)
             hl_hats.append(
                 self.gaussian_conditional_hf.decompress(strings_hl, idx_hl, means=mu_hl)
@@ -747,7 +788,9 @@ class WMDC(CompressionModel):
             sup_hh = torch.cat(
                 [y_low_hat, scales_hh, means_hh] + hh_hats + lh_hats + hl_hats, dim=1
             )
-            mu_hh, sc_hh = self.fusion_hh[i](sup_hh, dt_token).chunk(2, 1)
+            mu_hh, raw_sc_hh = self.fusion_hh[i](sup_hh, dt_token).chunk(2, 1)
+            sc_hh = torch.clamp(torch.abs(raw_sc_hh), min=1e-5)
+
             idx_hh = self.gaussian_conditional_hf.build_indexes(sc_hh)
             hh_hats.append(
                 self.gaussian_conditional_hf.decompress(strings_hh, idx_hh, means=mu_hh)
