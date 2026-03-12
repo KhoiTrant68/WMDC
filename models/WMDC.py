@@ -223,26 +223,31 @@ class WMDC(CompressionModel):
 
         # LOW FREQUENCY (LF) Path
         for i, y_slice in enumerate(y_low_slices):
-            mean_support = torch.cat(mean_support_list, dim=1)
-            mu = self.cc_mean_transforms_lf[i](mean_support)[
-                :, :, : y_shape[0] // 2, : y_shape[1] // 2
-            ]
+            if i > 0:
+                mean_support = torch.cat(mean_support_list, dim=1)
+                mu = self.cc_mean_transforms_lf[i](mean_support)[
+                    :, :, : y_shape[0] // 2, : y_shape[1] // 2
+                ]
 
-            scale_support = torch.cat(scale_support_list, dim=1)
-            scale = self.cc_scale_transforms_lf[i](scale_support)[
-                :, :, : y_shape[0] // 2, : y_shape[1] // 2
-            ]
+                scale_support = torch.cat(scale_support_list, dim=1)
+                scale = self.cc_scale_transforms_lf[i](scale_support)[
+                    :, :, : y_shape[0] // 2, : y_shape[1] // 2
+                ]
 
-            support = (
-                torch.cat([latent_means_lf, latent_scales_lf], dim=1)
-                if i == 0
-                else torch.cat([mu, scale, latent_means_lf, latent_scales_lf], dim=1)
-            )
+                support = torch.cat(
+                    [mu, scale, latent_means_lf, latent_scales_lf], dim=1
+                )
+            else:
+                support = torch.cat([latent_means_lf, latent_scales_lf], dim=1)
 
             # Anchor
             empty_context = torch.zeros(
-                support.size(0), self.slice_ch_lf, support.size(2), support.size(3),
-                device=support.device, dtype=support.dtype
+                support.size(0),
+                self.slice_ch_lf,
+                support.size(2),
+                support.size(3),
+                device=support.device,
+                dtype=support.dtype,
             )
             means_anchor, scales_anchor = self.context_vss_lf[i](
                 torch.cat([empty_context, support], dim=1)
@@ -409,24 +414,29 @@ class WMDC(CompressionModel):
         mean_support_list, scale_support_list = [latent_means_lf], [latent_scales_lf]
 
         for i, y_slice in enumerate(y_low_slices):
-            mean_support = torch.cat(mean_support_list, dim=1)
-            mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
+            if i > 0:
+                mean_support = torch.cat(mean_support_list, dim=1)
+                mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
 
-            scale_support = torch.cat(scale_support_list, dim=1)
-            scale = self.cc_scale_transforms_lf[i](scale_support)[
-                :, :, :H_wave, :W_wave
-            ]
+                scale_support = torch.cat(scale_support_list, dim=1)
+                scale = self.cc_scale_transforms_lf[i](scale_support)[
+                    :, :, :H_wave, :W_wave
+                ]
 
-            support = (
-                torch.cat([latent_means_lf, latent_scales_lf], dim=1)
-                if i == 0
-                else torch.cat([mu, scale, latent_means_lf, latent_scales_lf], dim=1)
-            )
+                support = torch.cat(
+                    [mu, scale, latent_means_lf, latent_scales_lf], dim=1
+                )
+            else:
+                support = torch.cat([latent_means_lf, latent_scales_lf], dim=1)
 
             # Anchor Compression
             empty_context = torch.zeros(
-                support.size(0), self.slice_ch_lf, support.size(2), support.size(3),
-                device=support.device, dtype=support.dtype
+                support.size(0),
+                self.slice_ch_lf,
+                support.size(2),
+                support.size(3),
+                device=support.device,
+                dtype=support.dtype,
             )
             means_anchor, scales_anchor = self.context_vss_lf[i](
                 torch.cat([empty_context, support], dim=1)
@@ -603,24 +613,29 @@ class WMDC(CompressionModel):
 
         # LOW FREQUENCY (LF) Decompression
         for i in range(self.num_slices):
-            mean_support = torch.cat(mean_support_list, dim=1)
-            mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
+            if i > 0:
+                mean_support = torch.cat(mean_support_list, dim=1)
+                mu = self.cc_mean_transforms_lf[i](mean_support)[:, :, :H_wave, :W_wave]
 
-            scale_support = torch.cat(scale_support_list, dim=1)
-            scale = self.cc_scale_transforms_lf[i](scale_support)[
-                :, :, :H_wave, :W_wave
-            ]
+                scale_support = torch.cat(scale_support_list, dim=1)
+                scale = self.cc_scale_transforms_lf[i](scale_support)[
+                    :, :, :H_wave, :W_wave
+                ]
 
-            support = (
-                torch.cat([latent_means_lf, latent_scales_lf], dim=1)
-                if i == 0
-                else torch.cat([mu, scale, latent_means_lf, latent_scales_lf], dim=1)
-            )
+                support = torch.cat(
+                    [mu, scale, latent_means_lf, latent_scales_lf], dim=1
+                )
+            else:
+                support = torch.cat([latent_means_lf, latent_scales_lf], dim=1)
 
             # Anchor Decompression
             empty_context = torch.zeros(
-                support.size(0), self.slice_ch_lf, support.size(2), support.size(3),
-                device=support.device, dtype=support.dtype
+                support.size(0),
+                self.slice_ch_lf,
+                support.size(2),
+                support.size(3),
+                device=support.device,
+                dtype=support.dtype,
             )
             means_anchor, scales_anchor = self.context_vss_lf[i](
                 torch.cat([empty_context, support], dim=1)
