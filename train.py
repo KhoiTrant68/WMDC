@@ -51,7 +51,7 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def pad_image(x, p=32):
+def pad_image(x, p=64):
     """Padded specifically for model spatial downsampling (16x CNN + 2x Wavelet)"""
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
@@ -152,7 +152,7 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
         total_loss = out_criterion["loss"] + out_net["aux_loss"]
-        
+
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
@@ -201,7 +201,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
 
     with torch.no_grad():
         for i, d in pbar:
-            d_padded, padding = pad_image(d, p=32)
+            d_padded, padding = pad_image(d)
             out_net = model(d_padded)
             out_net["x_hat"].clamp_(0, 1)
             x_hat = crop_image(out_net["x_hat"], padding)
