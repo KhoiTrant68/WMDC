@@ -157,19 +157,21 @@ def train_one_epoch(
     for i, d in pbar:
         out_net = model(d)
         out_criterion = criterion(out_net, d)
-        total_loss = out_criterion["loss"] + out_net["aux_loss"]
-
+        
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        accelerator.backward(total_loss)
+        accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
-            main_params = [
+            main_params =[
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
             ]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
-
         optimizer.step()
+
+        # Auxiliary Loss
+        # We step the quantiles separately to maintain probability bounds
+        accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
 
         loss_val = out_criterion["loss"].item()

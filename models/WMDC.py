@@ -170,6 +170,17 @@ class WMDC(CompressionModel):
         updated |= super().update(force=force)
         return updated
 
+    def aux_loss(self):
+        """
+        Calculates the auxiliary loss over the EntropyBottleneck module(s).
+        This guarantees that the factorized density model's quantiles are
+        updated to match the marginal distribution of the hyper-prior latents.
+        """
+        aux_loss = sum(
+            m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck)
+        )
+        return aux_loss
+
     def forward(self, x):
         b = x.size(0)
 
