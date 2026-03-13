@@ -29,7 +29,7 @@ def crop_image(x, padding):
     _, pad_w, _, pad_h = padding
     if pad_w == 0 and pad_h == 0:
         return x
-    return x[..., : x.size(2) - pad_h, : x.size(3) - pad_w]
+    return x[..., : x.size[-2] - pad_h, : x.size[-1] - pad_w]
 
 
 def main():
@@ -43,14 +43,9 @@ def main():
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    # Format: (Dictionary Entry Index[0-127], Head Index [0-19])
-    # Pick a mix of early and late heads/tokens to show diversity
-    target_maps = [
-        (0, 0),
-        (32, 2),
-        (64, 5),
-        (127, 19),
-    ]
+    # Format: Target Dictionary Token Indices [0 to 127]
+    # EOT has no "Heads" like standard Multi-head Attention
+    target_maps = [0, 32, 64, 127]
 
     # Initialize new FD-SSM + HDDA Model
     model = WMDC(N=192, M=320, num_slices=5).to(device)
@@ -58,11 +53,8 @@ def main():
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
 
-    img_files = sorted(
-        [f for f in os.listdir(args.img_dir) if f.lower().endswith((".png", ".jpg"))]
-    )[
-        :4
-    ]  # Process top 4 images
+    img_files = sorted([f for f in os.listdir(args.img_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+    )[:4]  # Process top 4 images
 
     num_images = len(img_files)
     num_cols = len(target_maps) + 1
@@ -87,17 +79,15 @@ def main():
         with torch.no_grad():
             _ = model(x_pad)
 
-        # 1. Grab attention from our class attribute (B, Head, HW, Dict_Num)
-        # Assuming batch size 1, squeeze batch dim -> (Head, HW, 128)
-        probs = model.dt_cross_attention[args.slice].attn_probs.squeeze(0).cpu()
+        # 1. Grab attention: Shape (1, HW, 128) -> Squeeze batch -> (HW, 128)
+        probs = model.eot_attention[args.slice].attn_probs.squeeze(0).cpu()
 
-        # 2. Reshape to spatial grid: y is strictly 1/16th of x_pad
+        # 2. Reshape to spatial grid
         latent_h, latent_w = x_pad.size(2) // 16, x_pad.size(3) // 16
-        probs = probs.view(probs.size(0), latent_h, latent_w, probs.size(-1))
+        probs = probs.view(latent_h, latent_w, probs.size(-1)) # (H, W, 128)
 
-        # Original image for overlay (cropped back to original size)
+        # Original image for overlay
         orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
-        h_orig, w_orig = orig_np.shape[0], orig_np.shape[1]
 
         # --- PLOT INPUT IMAGE ---
         ax_img = axes[row_idx][0]
@@ -107,33 +97,33 @@ def main():
             ax_img.set_title("Input Image", fontsize=16, pad=10)
 
         # --- PLOT ATTENTION OVERLAYS ---
-        for col_idx, (dict_idx, head_idx) in enumerate(target_maps):
+        for col_idx, dict_idx in enumerate(target_maps):
 
-            # Extract 2D heatmap: [latent_h, latent_w]
-            attn_map = probs[head_idx, :, :, dict_idx].unsqueeze(0).unsqueeze(0)
+            # Extract 2D heatmap:[1, 1, latent_h, latent_w]
+            attn_map = probs[:, :, dict_idx].unsqueeze(0).unsqueeze(0)
 
-            # Crop the padded area out of the attention map conceptually,
-            # then interpolate to original resolution for smooth overlay.
-            attn_cropped = crop_image(attn_map, [p // 16 for p in padding])
+            # Interpolate FIRST using the padded dimensions, then CROP using exact pixel padding.
+            # This avoids sub-pixel misalignment caused by integer division (`p // 16`).
             attn_resized = F.interpolate(
-                attn_cropped, size=(h_orig, w_orig), mode="bicubic", align_corners=False
+                attn_map, size=(x_pad.size(2), x_pad.size(3)), mode="bicubic", align_corners=False
             )
-            attn_np = attn_resized.squeeze().numpy()
+            attn_cropped = crop_image(attn_resized, padding)
+            attn_np = attn_cropped.squeeze().numpy()
 
-            # Normalize for visualization
+            # Normalize for visualization [0, 1]
             attn_np = (attn_np - attn_np.min()) / (attn_np.max() - attn_np.min() + 1e-8)
 
             ax_map = axes[row_idx][col_idx + 1]
 
             # Alpha Blending
             ax_map.imshow(orig_np)  # Background
-            im = ax_map.imshow(attn_np, cmap="jet", alpha=0.5)  # Heatmap overlay
+            ax_map.imshow(attn_np, cmap="jet", alpha=0.55)  # Heatmap overlay
 
             ax_map.axis("off")
 
             if row_idx == 0:
                 ax_map.set_title(
-                    f"Dict Token {dict_idx} | Head {head_idx}", fontsize=14, pad=10
+                    f"Dict Token {dict_idx}", fontsize=14, pad=10
                 )
 
     plt.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)

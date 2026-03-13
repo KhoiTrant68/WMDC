@@ -109,7 +109,7 @@ class EntropicOptimalTransportAttention(nn.Module):
 
         # 3. Optimal Transport Plan (Sparse Attention Matrix)
         P = torch.exp((-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / self.epsilon)
-
+        self.attn_probs = P.detach()
         # 4. Gather Dictionary Values
         out = torch.bmm(P, v)  # (B, HW, D)
 
