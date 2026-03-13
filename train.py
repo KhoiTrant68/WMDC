@@ -145,7 +145,7 @@ def train_one_epoch(
     accelerator,
 ):
     model.train()
-    loss_meter, bpp_meter = AverageMeter(), AverageMeter()
+    loss_meter, aux_loss_meter, bpp_meter = AverageMeter(), AverageMeter(), AverageMeter()
 
     pbar = tqdm(
         enumerate(train_dataloader),
@@ -175,11 +175,14 @@ def train_one_epoch(
         aux_optimizer.step()
 
         loss_val = out_criterion["loss"].item()
+        aux_loss_val = out_net["aux_loss"].item()
         bpp_val = out_criterion["bpp_loss"].item()
+
         loss_meter.update(loss_val)
+        aux_loss_meter.upate(aux_loss_val)
         bpp_meter.update(bpp_val)
 
-        pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
+        pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", aux_loss=f"{aux_loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
 
         if accelerator.is_main_process and i % 100 == 0:
             if writer:
@@ -187,11 +190,14 @@ def train_one_epoch(
                     "Train/Total_Loss", loss_val, epoch * len(train_dataloader) + i
                 )
                 writer.add_scalar(
+                    "Train/Total_Aux_Loss", aux_loss_val, epoch * len(train_dataloader) + i
+                )
+                writer.add_scalar(
                     "Train/Bpp", bpp_val, epoch * len(train_dataloader) + i
                 )
             if logger:
                 logger.info(
-                    f"Train Epoch: {epoch}[{i}/{len(train_dataloader)}] Loss: {loss_val:.4f} | Bpp: {bpp_val:.4f}"
+                    f"Train Epoch: {epoch}[{i}/{len(train_dataloader)}] Loss: {loss_val:.4f} | Aux_Loss: {aux_loss_val:.4f}  | Bpp: {bpp_val:.4f}"
                 )
 
     return loss_meter.avg
