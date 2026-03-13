@@ -30,11 +30,11 @@ class DWT_Function(Function):
     def backward(ctx, dx):
         if ctx.needs_input_grad[0]:
             w_ll, w_lh, w_hl, w_hh = ctx.saved_tensors
-            B, C, H, W = dx.shape
+            B, C, H_out, W_out = dx.shape
             dx = (
-                dx.view(B, 4, -1, H // 2, W // 2)
+                dx.view(B, 4, -1, H_out, W_out)
                 .transpose(1, 2)
-                .reshape(B, -1, H // 2, W // 2)
+                .reshape(B, -1, H_out, W_out)
             )
             filters = torch.cat([w_ll, w_lh, w_hl, w_hh], dim=0).repeat(C // 4, 1, 1, 1)
             grad_x = torch.nn.functional.conv_transpose2d(

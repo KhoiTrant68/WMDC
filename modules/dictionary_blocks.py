@@ -115,4 +115,4 @@ class EntropicOptimalTransportAttention(nn.Module):
 
         # 5. Output Projection
         out = out.transpose(1, 2).view(B, -1, H, W)
-        return x + self.out_proj(out)
+        return self.out_proj(out)
