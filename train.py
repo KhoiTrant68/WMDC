@@ -179,7 +179,7 @@ def train_one_epoch(
         bpp_val = out_criterion["bpp_loss"].item()
 
         loss_meter.update(loss_val)
-        aux_loss_meter.upate(aux_loss_val)
+        aux_loss_meter.update(aux_loss_val)
         bpp_meter.update(bpp_val)
 
         pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", aux_loss=f"{aux_loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
