@@ -15,6 +15,13 @@ from modules.wavelet_blocks import FrequencyDisentangledMamba
 
 
 class WMDC(CompressionModel):
+    """
+    FD-EOT Model: Frequency-Disentangled Entropic Optimal Transport Compression.
+    1. FD-SSM: Mamba handles global structure (LL), CNN handles local texture (HF).
+    2. EOT-HDDA: DETR Queries + Sinkhorn Optimal Transport for balanced sparse context.
+    3. Spatial-Channel Autoregressive Transforms.
+    """
+
     def __init__(
         self,
         N=192,
@@ -33,7 +40,9 @@ class WMDC(CompressionModel):
         self.dict_num = dict_num
         self.dict_dim = 32 * dict_head_num  # 640
 
+        # ==========================================
         # 1. MAIN ENCODER & DECODER (FD-SSM)
+        # ==========================================
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
             FrequencyDisentangledMamba(N, drop_path=0.1),
@@ -54,7 +63,9 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
+        # ==========================================
         # 2. HYPER-PRIOR AUTOENCODER
+        # ==========================================
         self.h_a = nn.Sequential(
             conv(M, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.0),
@@ -76,16 +87,18 @@ class WMDC(CompressionModel):
         self.entropy_bottleneck = EntropyBottleneck(192)
         self.gaussian_conditional = GaussianConditional(None)
 
-        # 3. EOT-HDDA: QUERY-BASED DICTIONARY + OPTIMAL TRANSPORT
+        # ==========================================
+        # 3. EOT-HDDA: OPTIMAL TRANSPORT DICTIONARY
+        # ==========================================
         self.hyper_to_dict = QueryDictionaryGenerator(
             in_dim=192, dict_num=self.dict_num, dict_dim=self.dict_dim, num_heads=4
         )
 
-        # Replace Dense Attention with EOT Attention
         self.eot_attention = nn.ModuleList(
             EntropicOptimalTransportAttention(
                 input_dim=2 * M + self.slice_ch * min(i, self.max_support_slices),
                 output_dim=M,
+                dict_num=self.dict_num,
                 dict_dim=self.dict_dim,
                 epsilon=0.05,
                 iters=3,
@@ -93,7 +106,9 @@ class WMDC(CompressionModel):
             for i in range(num_slices)
         )
 
+        # ==========================================
         # 4. SPATIAL-CHANNEL AUTOREGRESSION (ChARM+)
+        # ==========================================
         self.spatial_context = nn.ModuleList(
             (
                 nn.Sequential(
@@ -205,7 +220,6 @@ class WMDC(CompressionModel):
             else:
                 query = hyper_prior
 
-            # APPLY OPTIMAL TRANSPORT
             dict_info = self.eot_attention[i](query, dt)
             support = torch.cat([query, dict_info], dim=1)
 
