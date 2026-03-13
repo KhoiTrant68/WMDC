@@ -182,7 +182,7 @@ def train_one_epoch(
         aux_loss_meter.update(aux_loss_val)
         bpp_meter.update(bpp_val)
 
-        pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", aux_loss=f"{aux_loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
+        # pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", aux_loss=f"{aux_loss_meter.avg:.4f}", bpp=f"{bpp_meter.avg:.4f}")
 
         if accelerator.is_main_process and i % 100 == 0:
             if writer:
