@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 from modules.utils import conv1x1
+from modules.VSS_module import VSSBlock
 
 
 class DWT_Function(Function):
@@ -191,3 +192,47 @@ class ResidualBlockUpsample_wave(nn.Module):
             self.idwt(torch.cat([low_freq_processed, high_freq_processed], dim=1))
             + identity
         )
+
+
+class FrequencyDisentangledMamba(nn.Module):
+    """
+    Novelty: FD-SSM Block.
+    Explicitly decomposes feature map into Low Frequencies (structure) and High Frequencies (textures).
+    Routes LF to the heavy State-Space (Mamba) module for global receptive field.
+    Routes HF to a lightweight CNN for edge/texture preservation.
+    """
+
+    def __init__(self, dim, drop_path=0.1):
+        super().__init__()
+        self.dwt = DWT_2D(wave="haar")
+        self.idwt = IDWT_2D(wave="haar")
+
+        # Mamba operates on the Low-Low (LL) band (1x dimension)
+        self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
+
+        # Lightweight CNN for High Frequency (HF) bands (3x dimension)
+        self.hf_conv = nn.Sequential(
+            nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, groups=3),
+            nn.GELU(),
+            nn.Conv2d(dim * 3, dim * 3, kernel_size=1),
+        )
+
+        # Residual connection
+        self.skip = nn.Identity()
+
+    def forward(self, x):
+        identity = self.skip(x)
+
+        # 1. Wavelet Decomposition (Reduces spatial resolution by 2x, separating frequencies)
+        x_dwt = self.dwt(x)
+        x_ll = x_dwt[:, : x.size(1)]  # LL Band (Structure)
+        x_hf = x_dwt[:, x.size(1) :]  # LH, HL, HH Bands (Texture)
+
+        # 2. Parallel Processing
+        x_ll_out = self.ll_mamba(x_ll)
+        x_hf_out = self.hf_conv(x_hf)
+
+        # 3. Wavelet Reconstruction
+        out = self.idwt(torch.cat([x_ll_out, x_hf_out], dim=1))
+
+        return out + identity
