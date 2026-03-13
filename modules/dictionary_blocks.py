@@ -82,117 +82,178 @@ class QueryDictionaryGenerator(nn.Module):
         return dict_tokens
 
 
-class SpatialAttentionModule(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttentionModule, self).__init__()
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+# class SpatialAttentionModule(nn.Module):
+#     def __init__(self, kernel_size=7):
+#         super(SpatialAttentionModule, self).__init__()
+#         self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+#         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
+#     def forward(self, x):
+#         avg_out = torch.mean(x, dim=1, keepdim=True)
+#         max_out, _ = torch.max(x, dim=1, keepdim=True)
+#         x = torch.cat([avg_out, max_out], dim=1)
+#         x = self.conv1(x)
+#         return self.sigmoid(x)
 
 
-class DenseBlock(nn.Module):
-    def __init__(self, dim=320):
-        super(DenseBlock, self).__init__()
-        self.layer_num = 3
-        self.conv_layers = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.GELU(), nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
-                )
-                for _ in range(self.layer_num)
-            ]
+# class DenseBlock(nn.Module):
+#     def __init__(self, dim=320):
+#         super(DenseBlock, self).__init__()
+#         self.layer_num = 3
+#         self.conv_layers = nn.ModuleList(
+#             [
+#                 nn.Sequential(
+#                     nn.GELU(), nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+#                 )
+#                 for _ in range(self.layer_num)
+#             ]
+#         )
+#         self.proj = nn.Conv2d(dim * (self.layer_num + 1), dim, kernel_size=1)
+
+#     def forward(self, x):
+#         outputs = [x]
+#         for i in range(self.layer_num):
+#             outputs.append(self.conv_layers[i](outputs[-1]))
+#         return self.proj(torch.cat(outputs, dim=1))
+
+
+# class MultiScaleAggregation(nn.Module):
+#     def __init__(self, dim):
+#         super(MultiScaleAggregation, self).__init__()
+#         self.s = nn.Conv2d(dim, dim, kernel_size=1)
+#         self.spatial_atte = SpatialAttentionModule()
+#         self.dense = DenseBlock(dim)
+
+#     def forward(self, x):
+#         x = rearrange(x, "b h w c -> b c h w")
+#         s = self.s(x)
+#         s_out = self.dense(s)
+#         x = s_out * self.spatial_atte(s_out)
+#         return rearrange(x, "b c h w -> b h w c")
+
+
+# class Scale(nn.Module):
+#     def __init__(self, dim, init_value=1.0):
+#         super().__init__()
+#         self.scale = nn.Parameter(init_value * torch.ones(dim))
+
+#     def forward(self, x):
+#         return x * self.scale
+
+
+# class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
+#     def __init__(self, input_dim, output_dim, mlp_rate=4, head_num=20, qkv_bias=True):
+#         super().__init__()
+#         dict_dim = 32 * head_num
+#         self.head_num = head_num
+
+#         self.scale = nn.Parameter(torch.ones(head_num, 1, 1))
+#         self.x_trans = nn.Linear(input_dim, dict_dim, bias=qkv_bias)
+
+#         self.ln_scale = nn.LayerNorm(dict_dim)
+#         self.msa = MultiScaleAggregation(dict_dim)
+
+#         self.lnx = nn.LayerNorm(dict_dim)
+#         self.q_trans = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
+#         self.dict_ln = nn.LayerNorm(dict_dim)
+
+#         self.k = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
+#         self.linear = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
+#         self.ln_mlp = nn.LayerNorm(dict_dim)
+
+#         self.mlp = ConvolutionalGLU(dict_dim, mlp_rate * dict_dim)
+#         self.output_trans = nn.Sequential(nn.Linear(dict_dim, output_dim))
+
+#         self.res_scale_1 = Scale(dict_dim)
+#         self.res_scale_2 = Scale(dict_dim)
+#         self.res_scale_3 = Scale(dict_dim)
+
+#     def forward(self, x, dt):
+#         B, C, H, W = x.size()
+
+#         x = rearrange(x, "b c h w -> b h w c")
+#         x = self.x_trans(x)
+#         x = self.msa(self.ln_scale(x)) + self.res_scale_1(x)
+
+#         shortcut = x
+#         x = self.lnx(x)
+#         x = self.q_trans(x)
+
+#         q = rearrange(x, "b h w (e c) -> b e (h w) c", e=self.head_num)
+
+#         dt = self.dict_ln(dt)
+#         k = self.k(dt)
+#         k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
+#         dt_val = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
+
+#         sim = torch.einsum("benc,bedc->bend", q, k) * self.scale
+#         probs = torch.softmax(sim, dim=-1)
+#         output = torch.einsum("bend,bedc->benc", probs, dt_val)
+#         output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
+
+#         output = self.linear(output) + self.res_scale_2(shortcut)
+#         output = self.mlp(self.ln_mlp(output)) + self.res_scale_3(output)
+
+#         output = self.output_trans(output)
+#         return rearrange(output, "b h w c -> b c h w")
+
+
+class EntropicOptimalTransportAttention(nn.Module):
+    """
+    EOT-HDDA: Uses Sinkhorn algorithm for Sparse Dictionary Matching.
+    Mathematically prevents entropy inflation by restricting query-key assignments.
+    """
+
+    def __init__(self, input_dim, output_dim, dict_dim=640, epsilon=0.05, iters=3):
+        super().__init__()
+        self.epsilon = epsilon
+        self.iters = iters
+
+        self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
+        self.k_proj = nn.Linear(dict_dim, dict_dim)
+        self.v_proj = nn.Linear(dict_dim, dict_dim)
+
+        # Output projection and residual scaling
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
+            nn.GELU(),
+            nn.Conv2d(dict_dim, output_dim, 1),
         )
-        self.proj = nn.Conv2d(dim * (self.layer_num + 1), dim, kernel_size=1)
-
-    def forward(self, x):
-        outputs = [x]
-        for i in range(self.layer_num):
-            outputs.append(self.conv_layers[i](outputs[-1]))
-        return self.proj(torch.cat(outputs, dim=1))
-
-
-class MultiScaleAggregation(nn.Module):
-    def __init__(self, dim):
-        super(MultiScaleAggregation, self).__init__()
-        self.s = nn.Conv2d(dim, dim, kernel_size=1)
-        self.spatial_atte = SpatialAttentionModule()
-        self.dense = DenseBlock(dim)
-
-    def forward(self, x):
-        x = rearrange(x, "b h w c -> b c h w")
-        s = self.s(x)
-        s_out = self.dense(s)
-        x = s_out * self.spatial_atte(s_out)
-        return rearrange(x, "b c h w -> b h w c")
-
-
-class Scale(nn.Module):
-    def __init__(self, dim, init_value=1.0):
-        super().__init__()
-        self.scale = nn.Parameter(init_value * torch.ones(dim))
-
-    def forward(self, x):
-        return x * self.scale
-
-
-class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
-    def __init__(self, input_dim, output_dim, mlp_rate=4, head_num=20, qkv_bias=True):
-        super().__init__()
-        dict_dim = 32 * head_num
-        self.head_num = head_num
-
-        self.scale = nn.Parameter(torch.ones(head_num, 1, 1))
-        self.x_trans = nn.Linear(input_dim, dict_dim, bias=qkv_bias)
-
-        self.ln_scale = nn.LayerNorm(dict_dim)
-        self.msa = MultiScaleAggregation(dict_dim)
-
-        self.lnx = nn.LayerNorm(dict_dim)
-        self.q_trans = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
-        self.dict_ln = nn.LayerNorm(dict_dim)
-
-        self.k = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
-        self.linear = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
-        self.ln_mlp = nn.LayerNorm(dict_dim)
-
-        self.mlp = ConvolutionalGLU(dict_dim, mlp_rate * dict_dim)
-        self.output_trans = nn.Sequential(nn.Linear(dict_dim, output_dim))
-
-        self.res_scale_1 = Scale(dict_dim)
-        self.res_scale_2 = Scale(dict_dim)
-        self.res_scale_3 = Scale(dict_dim)
+        self.scale = dict_dim**-0.5
 
     def forward(self, x, dt):
-        B, C, H, W = x.size()
+        """
+        x: (B, C, H, W) - Local feature query
+        dt: (B, N, D) - Dynamic Global Dictionary
+        """
+        B, C, H, W = x.shape
 
-        x = rearrange(x, "b c h w -> b h w c")
-        x = self.x_trans(x)
-        x = self.msa(self.ln_scale(x)) + self.res_scale_1(x)
+        # Projections
+        q = self.q_proj(x).view(B, -1, H * W).transpose(1, 2)  # (B, HW, D)
+        k = self.k_proj(dt)  # (B, N, D)
+        v = self.v_proj(dt)  # (B, N, D)
 
-        shortcut = x
-        x = self.lnx(x)
-        x = self.q_trans(x)
+        # 1. Cost Matrix (Cosine Distance)
+        C_mat = 1.0 - torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, HW, N)
 
-        q = rearrange(x, "b h w (e c) -> b e (h w) c", e=self.head_num)
+        # 2. Sinkhorn Iterations (Log-Domain for numerical stability)
+        u = torch.zeros_like(C_mat[:, :, 0])  # (B, HW)
+        v_vec = torch.zeros_like(C_mat[:, 0, :])  # (B, N)
 
-        dt = self.dict_ln(dt)
-        k = self.k(dt)
-        k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
-        dt_val = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
+        for _ in range(self.iters):
+            u = self.epsilon * (
+                -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / self.epsilon, dim=2)
+            )
+            v_vec = self.epsilon * (
+                -torch.logsumexp((-C_mat + u.unsqueeze(2)) / self.epsilon, dim=1)
+            )
 
-        sim = torch.einsum("benc,bedc->bend", q, k) * self.scale
-        probs = torch.softmax(sim, dim=-1)
-        output = torch.einsum("bend,bedc->benc", probs, dt_val)
-        output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
+        # 3. Optimal Transport Plan (Sparse Attention Matrix)
+        P = torch.exp((-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / self.epsilon)
 
-        output = self.linear(output) + self.res_scale_2(shortcut)
-        output = self.mlp(self.ln_mlp(output)) + self.res_scale_3(output)
+        # 4. Gather Dictionary Values
+        out = torch.bmm(P, v)  # (B, HW, D)
 
-        output = self.output_trans(output)
-        return rearrange(output, "b h w c -> b c h w")
+        # 5. Output Projection
+        out = out.transpose(1, 2).view(B, -1, H, W)
+        return self.out_proj(out)
