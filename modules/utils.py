@@ -33,22 +33,3 @@ def deconv(in_channels, out_channels, kernel_size=5, stride=2):
 
 def ste_round(x: Tensor) -> Tensor:
     return torch.round(x) - x.detach() + x
-
-
-class CheckboardMaskedConv2d(nn.Conv2d):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.register_buffer("mask", torch.ones_like(self.weight))
-        self.mask[:, :, 0::2, 0::2] = 0
-        self.mask[:, :, 1::2, 1::2] = 0
-
-    def forward(self, x):
-        return nn.functional.conv2d(
-            x,
-            self.weight * self.mask,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
