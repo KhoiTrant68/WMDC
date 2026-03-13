@@ -15,24 +15,13 @@ from models.WMDC import WMDC
 
 
 def pad_image(x, p=64):
-    """Pads image to be divisible by exactly 32"""
     h, w = x.size(2), x.size(3)
-    new_h = (h + p - 1) // p * p
-    new_w = (w + p - 1) // p * p
-    padding_left = (new_w - w) // 2
-    padding_right = new_w - w - padding_left
-    padding_top = (new_h - h) // 2
-    padding_bottom = new_h - h - padding_top
-    if (
-        padding_left == 0
-        and padding_right == 0
-        and padding_top == 0
-        and padding_bottom == 0
-    ):
-        return x, (0, 0, 0, 0)
-    return F.pad(
-        x, (padding_left, padding_right, padding_top, padding_bottom), mode="reflect"
-    ), (padding_left, padding_right, padding_top, padding_bottom)
+    new_h, new_w = (h + p - 1) // p * p, (w + p - 1) // p * p
+    pad_l, pad_t = (new_w - w) // 2, (new_h - h) // 2
+    padding = (pad_l, new_w - w - pad_l, pad_t, new_h - h - pad_t)
+    if sum(padding) == 0:
+        return x, padding
+    return F.pad(x, padding, mode="reflect"), padding
 
 
 def crop_image(x, padding):
@@ -57,8 +46,6 @@ def main():
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, default="output")
-    parser.add_argument("--N", type=int, default=192)
-    parser.add_argument("--M", type=int, default=320)
     parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
 
@@ -67,7 +54,7 @@ def main():
     img_dir = os.path.join(args.output, "images")
     os.makedirs(img_dir, exist_ok=True)
 
-    model = WMDC(N=args.N, M=args.M, num_slices=5).to(device)
+    model = WMDC(N=192, M=320, num_slices=5).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()

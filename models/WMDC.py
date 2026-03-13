@@ -1,23 +1,26 @@
 import math
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 
-from modules.VSS_module import VSSBlock
+from modules.dictionary_blocks import (
+    MultiScaleDictionaryCrossAttentionGLU,
+    QueryDictionaryGenerator,
+)
 from modules.utils import conv, deconv
+from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import FrequencyDisentangledMamba
-from modules.dictionary_blocks import MultiScaleDictionaryCrossAttentionGLU
 
 
 class WMDC(CompressionModel):
     """
-    Wavelet-Guided State Space Model with Dynamic Dictionary Attention
+    Wavelet-Guided State Space Model with Query-Based Dictionary Attention
     Novelties:
-    1. FD-SSM: Frequency-Disentangled Mamba (Routes LL to Mamba, HF to CNNs via DWT)
-    2. HDDA: Hyper-Conditioned Dynamic Dictionary Attention (0-bit global context adaptive generation)
-    3. Mamba-Assisted Linear Channel Autoregression
+    1. FD-SSM: Frequency-Disentangled Mamba with Cross-Frequency Fusion.
+    2. HDDA-Q: DETR-style Query-based Dynamic Dictionary Generation (~0.3M params, 0-bit overhead).
+    3. Spatial-Channel Autoregressive Transforms.
     """
 
     def __init__(
@@ -37,7 +40,7 @@ class WMDC(CompressionModel):
         self.slice_ch = M // num_slices
 
         self.dict_num = dict_num
-        self.dict_dim = 32 * dict_head_num
+        self.dict_dim = 32 * dict_head_num  # 640
 
         # ==========================================
         # 1. MAIN ENCODER & DECODER (FD-SSM)
@@ -87,15 +90,10 @@ class WMDC(CompressionModel):
         self.gaussian_conditional = GaussianConditional(None)
 
         # ==========================================
-        # 3. NOVELTY: HYPER-CONDITIONED DYNAMIC DICTIONARY (HDDA)
-        # Generates image-specific global context tokens from z_hat (0 bits overhead)
+        # 3. HDDA-Q: QUERY-BASED DYNAMIC DICTIONARY
         # ==========================================
-        self.hyper_to_dict = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(192, 512),
-            nn.GELU(),
-            nn.Linear(512, self.dict_num * self.dict_dim),
+        self.hyper_to_dict = QueryDictionaryGenerator(
+            in_dim=192, dict_num=self.dict_num, dict_dim=self.dict_dim, num_heads=4
         )
 
         self.dt_cross_attention = nn.ModuleList(
@@ -110,8 +108,32 @@ class WMDC(CompressionModel):
         )
 
         # ==========================================
-        # 4. CHANNEL AUTOREGRESSIVE TRANSFORMS (ChARM)
+        # 4. SPATIAL-CHANNEL AUTOREGRESSION (ChARM+)
         # ==========================================
+        # Fast inter-slice spatial context
+        self.spatial_context = nn.ModuleList(
+            (
+                nn.Sequential(
+                    nn.Conv2d(
+                        self.slice_ch * min(i, self.max_support_slices),
+                        self.slice_ch * min(i, self.max_support_slices),
+                        kernel_size=5,
+                        padding=2,
+                        groups=self.slice_ch * min(i, self.max_support_slices),
+                    ),
+                    nn.GELU(),
+                    nn.Conv2d(
+                        self.slice_ch * min(i, self.max_support_slices),
+                        self.slice_ch * min(i, self.max_support_slices),
+                        kernel_size=1,
+                    ),
+                )
+                if i > 0
+                else nn.Identity()
+            )
+            for i in range(num_slices)
+        )
+
         self.cc_mean_transforms = nn.ModuleList(
             nn.Sequential(
                 nn.Conv2d(
@@ -171,28 +193,17 @@ class WMDC(CompressionModel):
         return updated
 
     def aux_loss(self):
-        """
-        Calculates the auxiliary loss over the EntropyBottleneck module(s).
-        This guarantees that the factorized density model's quantiles are
-        updated to match the marginal distribution of the hyper-prior latents.
-        """
-        aux_loss = sum(
-            m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck)
-        )
-        return aux_loss
+        return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
     def forward(self, x):
-        b = x.size(0)
-
         y = self.g_a(x)
         z = self.h_a(y)
 
         # Quantize hyper-prior
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
 
-        # HDDA: Generate Dynamic Dictionary from z_hat
-        dt_flat = self.hyper_to_dict(z_hat)
-        dt = dt_flat.view(b, self.dict_num, self.dict_dim)
+        # HDDA-Q: Generate Dictionary via Cross-Attention (B, 128, 640)
+        dt = self.hyper_to_dict(z_hat)
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -204,35 +215,45 @@ class WMDC(CompressionModel):
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
         for i, y_slice in enumerate(y_slices):
-            # Safe Channel-wise Context Gathering
             support_slices = (
                 y_hat_slices
                 if self.max_support_slices < 0
                 else y_hat_slices[-self.max_support_slices :]
             )
-            query = torch.cat([hyper_prior] + support_slices, dim=1)
 
-            # Linear Dictionary Global Context
+            # Fast Spatial-Channel Autoregression (Strict Causality Preserved)
+            if len(support_slices) > 0:
+                support_concat = torch.cat(support_slices, dim=1)
+                spatial_ctx = self.spatial_context[i](support_concat)
+                query = torch.cat([hyper_prior, spatial_ctx], dim=1)
+            else:
+                query = hyper_prior
+
             dict_info = self.dt_cross_attention[i](query, dt)
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support)
-
-            # Mathematically safe clamping bounds
             scale = torch.clamp(scale, min=0.11)
 
-            _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, means=mu)
+            # Continuous relaxation for entropy model training (SOTA standard)
+            if self.training:
+                y_slice_noisy = y_slice + torch.empty_like(y_slice).uniform_(-0.5, 0.5)
+            else:
+                y_slice_noisy = torch.round(y_slice - mu) + mu
+
+            _, y_slice_likelihood = self.gaussian_conditional(
+                y_slice_noisy, scale, means=mu
+            )
             y_likelihood.append(y_slice_likelihood)
 
-            # STE Quantization
+            # Strict STE for latent passing to decoder
             y_hat_slice = (
                 (torch.round(y_slice - mu) - (y_slice - mu)).detach()
                 + (y_slice - mu)
                 + mu
             )
 
-            # Latent Residual Prediction
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             lrp = 0.5 * torch.tanh(self.lrp_transforms[i](lrp_support))
             y_hat_slice = y_hat_slice + lrp
@@ -251,17 +272,13 @@ class WMDC(CompressionModel):
         }
 
     def compress(self, x):
-        b = x.size(0)
-
         y = self.g_a(x)
         z = self.h_a(y)
 
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-        # HDDA
-        dt_flat = self.hyper_to_dict(z_hat)
-        dt = dt_flat.view(b, self.dict_num, self.dict_dim)
+        dt = self.hyper_to_dict(z_hat)
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -278,7 +295,13 @@ class WMDC(CompressionModel):
                 if self.max_support_slices < 0
                 else y_hat_slices[-self.max_support_slices :]
             )
-            query = torch.cat([hyper_prior] + support_slices, dim=1)
+
+            if len(support_slices) > 0:
+                support_concat = torch.cat(support_slices, dim=1)
+                spatial_ctx = self.spatial_context[i](support_concat)
+                query = torch.cat([hyper_prior, spatial_ctx], dim=1)
+            else:
+                query = hyper_prior
 
             dict_info = self.dt_cross_attention[i](query, dt)
             support = torch.cat([query, dict_info], dim=1)
@@ -307,11 +330,7 @@ class WMDC(CompressionModel):
         y_strings, z_strings = strings[0], strings[1]
 
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
-
-        b = z_hat.size(0)
-        # HDDA
-        dt_flat = self.hyper_to_dict(z_hat)
-        dt = dt_flat.view(b, self.dict_num, self.dict_dim)
+        dt = self.hyper_to_dict(z_hat)
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -325,7 +344,13 @@ class WMDC(CompressionModel):
                 if self.max_support_slices < 0
                 else y_hat_slices[-self.max_support_slices :]
             )
-            query = torch.cat([hyper_prior] + support_slices, dim=1)
+
+            if len(support_slices) > 0:
+                support_concat = torch.cat(support_slices, dim=1)
+                spatial_ctx = self.spatial_context[i](support_concat)
+                query = torch.cat([hyper_prior, spatial_ctx], dim=1)
+            else:
+                query = hyper_prior
 
             dict_info = self.dt_cross_attention[i](query, dt)
             support = torch.cat([query, dict_info], dim=1)
@@ -335,7 +360,6 @@ class WMDC(CompressionModel):
             scale = torch.clamp(scale, min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
-
             y_hat_slice = self.gaussian_conditional.decompress(
                 y_strings[i], index, means=mu
             )

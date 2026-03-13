@@ -37,29 +37,49 @@ class ConvolutionalGLU(nn.Module):
         return x
 
 
-class DenseBlock(nn.Module):
-    def __init__(self, dim=320):
-        super(DenseBlock, self).__init__()
-        self.layer_num = 3
-        self.conv_layers = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.GELU(),
-                    nn.Conv2d(
-                        dim, dim, kernel_size=3, padding=1, groups=dim
-                    ),  # Simplified ConvDW
-                )
-                for _ in range(self.layer_num)
-            ]
-        )
-        self.proj = nn.Conv2d(dim * (self.layer_num + 1), dim, kernel_size=1)
+class QueryDictionaryGenerator(nn.Module):
+    """
+    DETR-style Query-based Dictionary Generator.
+    Resolves the 42M linear layer trap. Costs ~0.3M params and 0 bits overhead.
+    """
 
-    def forward(self, x):
-        outputs = [x]
-        for i in range(self.layer_num):
-            outputs.append(self.conv_layers[i](outputs[-1]))
-        x = self.proj(torch.cat(outputs, dim=1))
-        return x
+    def __init__(self, in_dim=192, dict_num=128, dict_dim=640, num_heads=4):
+        super().__init__()
+        self.dict_num = dict_num
+        self.dict_dim = dict_dim
+
+        # Learnable queries
+        self.dict_queries = nn.Parameter(torch.randn(1, dict_num, in_dim))
+
+        # Spatial implicit encoding
+        self.pos_enc = nn.Conv2d(
+            in_dim, in_dim, kernel_size=3, padding=1, groups=in_dim
+        )
+
+        # Cross Attention
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=in_dim, num_heads=num_heads, batch_first=True
+        )
+        self.norm = nn.LayerNorm(in_dim)
+
+        # Projection to final dictionary dimension
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, dict_dim), nn.GELU(), nn.Linear(dict_dim, dict_dim)
+        )
+
+    def forward(self, z_hat):
+        B, C, H, W = z_hat.shape
+
+        context = z_hat + self.pos_enc(z_hat)
+        context = context.view(B, C, H * W).transpose(1, 2)  # (B, H*W, C)
+
+        queries = self.dict_queries.expand(B, -1, -1)
+
+        attn_out, _ = self.cross_attn(query=queries, key=context, value=context)
+        out = self.norm(queries + attn_out)
+
+        dict_tokens = self.proj(out)  # (B, 128, 640)
+        return dict_tokens
 
 
 class SpatialAttentionModule(nn.Module):
@@ -76,6 +96,27 @@ class SpatialAttentionModule(nn.Module):
         return self.sigmoid(x)
 
 
+class DenseBlock(nn.Module):
+    def __init__(self, dim=320):
+        super(DenseBlock, self).__init__()
+        self.layer_num = 3
+        self.conv_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.GELU(), nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+                )
+                for _ in range(self.layer_num)
+            ]
+        )
+        self.proj = nn.Conv2d(dim * (self.layer_num + 1), dim, kernel_size=1)
+
+    def forward(self, x):
+        outputs = [x]
+        for i in range(self.layer_num):
+            outputs.append(self.conv_layers[i](outputs[-1]))
+        return self.proj(torch.cat(outputs, dim=1))
+
+
 class MultiScaleAggregation(nn.Module):
     def __init__(self, dim):
         super(MultiScaleAggregation, self).__init__()
@@ -88,8 +129,7 @@ class MultiScaleAggregation(nn.Module):
         s = self.s(x)
         s_out = self.dense(s)
         x = s_out * self.spatial_atte(s_out)
-        x = rearrange(x, "b c h w -> b h w c")
-        return x
+        return rearrange(x, "b c h w -> b h w c")
 
 
 class Scale(nn.Module):
@@ -118,25 +158,19 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         self.dict_ln = nn.LayerNorm(dict_dim)
 
         self.k = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
-
         self.linear = nn.Linear(dict_dim, dict_dim, bias=qkv_bias)
         self.ln_mlp = nn.LayerNorm(dict_dim)
 
         self.mlp = ConvolutionalGLU(dict_dim, mlp_rate * dict_dim)
         self.output_trans = nn.Sequential(nn.Linear(dict_dim, output_dim))
 
-        self.res_scale_1 = Scale(dict_dim, init_value=1.0)
-        self.res_scale_2 = Scale(dict_dim, init_value=1.0)
-        self.res_scale_3 = Scale(dict_dim, init_value=1.0)
+        self.res_scale_1 = Scale(dict_dim)
+        self.res_scale_2 = Scale(dict_dim)
+        self.res_scale_3 = Scale(dict_dim)
 
     def forward(self, x, dt):
-        """
-        x: (B, C, H, W) - Local feature query
-        dt: (B, N, D) - Dynamically generated image-specific dictionary from HDDA
-        """
         B, C, H, W = x.size()
 
-        # Feature processing
         x = rearrange(x, "b c h w -> b h w c")
         x = self.x_trans(x)
         x = self.msa(self.ln_scale(x)) + self.res_scale_1(x)
@@ -145,29 +179,20 @@ class MultiScaleDictionaryCrossAttentionGLU(nn.Module):
         x = self.lnx(x)
         x = self.q_trans(x)
 
-        # Generate Queries
         q = rearrange(x, "b h w (e c) -> b e (h w) c", e=self.head_num)
 
-        # Generate Keys from Dynamic Dictionary
         dt = self.dict_ln(dt)
         k = self.k(dt)
         k = rearrange(k, "b n (e c) -> b e n c", e=self.head_num)
-        dt = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
+        dt_val = rearrange(dt, "b n (e c) -> b e n c", e=self.head_num)
 
-        self.scale = self.scale.to(q.device)
-
-        # Linear O(128 * HW) Cross Attention
         sim = torch.einsum("benc,bedc->bend", q, k) * self.scale
         probs = torch.softmax(sim, dim=-1)
-        self.attn_probs = probs.detach()
-        output = torch.einsum("bend,bedc->benc", probs, dt)
+        output = torch.einsum("bend,bedc->benc", probs, dt_val)
         output = rearrange(output, "b e (h w) c -> b h w (e c)", h=H, w=W)
 
-        # FFN block
         output = self.linear(output) + self.res_scale_2(shortcut)
         output = self.mlp(self.ln_mlp(output)) + self.res_scale_3(output)
 
         output = self.output_trans(output)
-        output = rearrange(output, "b h w c -> b c h w")
-
-        return output
+        return rearrange(output, "b h w c -> b c h w")

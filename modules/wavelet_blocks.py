@@ -1,11 +1,8 @@
 import pywt
 import torch
 import torch.nn as nn
-from compressai.layers import GDN, conv3x3, subpel_conv3x3
-from torch import Tensor
 from torch.autograd import Function
 
-from modules.utils import conv1x1
 from modules.VSS_module import VSSBlock
 
 
@@ -138,101 +135,40 @@ class IDWT_2D(nn.Module):
         return IDWT_Function.apply(x, self.filters.to(x.dtype))
 
 
-class ResidualBlockWithStride_wave(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 2, wavelet="haar"):
-        super().__init__()
-        self.conv1 = conv3x3(in_ch, out_ch, stride=stride)
-        self.leaky_relu = nn.LeakyReLU(inplace=True)
-        self.dwt = DWT_2D(wave=wavelet)
-        self.idwt = IDWT_2D(wave=wavelet)
-        self.low_freq_conv = conv3x3(out_ch, out_ch)
-        self.gdn_low = GDN(out_ch)
-        self.high_freq_conv = conv3x3(3 * out_ch, 3 * out_ch)
-        self.gdn_high = GDN(3 * out_ch)
-        self.skip = (
-            conv1x1(in_ch, out_ch, stride=stride)
-            if (stride != 1 or in_ch != out_ch)
-            else nn.Identity()
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = self.skip(x)
-        out = self.leaky_relu(self.conv1(x))
-        dwt_output = self.dwt(out)
-        low_freq, high_freq = dwt_output[:, : out.size(1)], dwt_output[:, out.size(1) :]
-        low_freq_processed = self.gdn_low(self.low_freq_conv(low_freq))
-        high_freq_processed = self.gdn_high(self.high_freq_conv(high_freq))
-        return (
-            self.idwt(torch.cat([low_freq_processed, high_freq_processed], dim=1))
-            + identity
-        )
-
-
-class ResidualBlockUpsample_wave(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, upsample: int = 2, wavelet="haar"):
-        super().__init__()
-        self.subpel_conv = subpel_conv3x3(in_ch, out_ch, upsample)
-        self.leaky_relu = nn.LeakyReLU(inplace=True)
-        self.dwt = DWT_2D(wave=wavelet)
-        self.idwt = IDWT_2D(wave=wavelet)
-        self.low_freq_conv = conv3x3(out_ch, out_ch)
-        self.igdn_low = GDN(out_ch, inverse=True)
-        self.high_freq_conv = conv3x3(3 * out_ch, 3 * out_ch)
-        self.igdn_high = GDN(3 * out_ch, inverse=True)
-        self.upsample_skip = subpel_conv3x3(in_ch, out_ch, upsample)
-
-    def forward(self, x: Tensor) -> Tensor:
-        identity = self.upsample_skip(x)
-        out = self.leaky_relu(self.subpel_conv(x))
-        dwt_output = self.dwt(out)
-        low_freq, high_freq = dwt_output[:, : out.size(1)], dwt_output[:, out.size(1) :]
-        low_freq_processed = self.igdn_low(self.low_freq_conv(low_freq))
-        high_freq_processed = self.igdn_high(self.high_freq_conv(high_freq))
-        return (
-            self.idwt(torch.cat([low_freq_processed, high_freq_processed], dim=1))
-            + identity
-        )
-
-
 class FrequencyDisentangledMamba(nn.Module):
-    """
-    Novelty: FD-SSM Block.
-    Explicitly decomposes feature map into Low Frequencies (structure) and High Frequencies (textures).
-    Routes LF to the heavy State-Space (Mamba) module for global receptive field.
-    Routes HF to a lightweight CNN for edge/texture preservation.
-    """
-
     def __init__(self, dim, drop_path=0.1):
         super().__init__()
         self.dwt = DWT_2D(wave="haar")
         self.idwt = IDWT_2D(wave="haar")
 
-        # Mamba operates on the Low-Low (LL) band (1x dimension)
         self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
-
-        # Lightweight CNN for High Frequency (HF) bands (3x dimension)
         self.hf_conv = nn.Sequential(
             nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, groups=3),
             nn.GELU(),
             nn.Conv2d(dim * 3, dim * 3, kernel_size=1),
         )
 
-        # Residual connection
+        # Cross-Frequency Fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(dim * 4, dim * 4, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(dim * 4, dim * 4, kernel_size=1, groups=4),
+        )
         self.skip = nn.Identity()
 
     def forward(self, x):
         identity = self.skip(x)
-
-        # 1. Wavelet Decomposition (Reduces spatial resolution by 2x, separating frequencies)
         x_dwt = self.dwt(x)
-        x_ll = x_dwt[:, : x.size(1)]  # LL Band (Structure)
-        x_hf = x_dwt[:, x.size(1) :]  # LH, HL, HH Bands (Texture)
 
-        # 2. Parallel Processing
+        x_ll = x_dwt[:, : x.size(1)]
+        x_hf = x_dwt[:, x.size(1) :]
+
         x_ll_out = self.ll_mamba(x_ll)
         x_hf_out = self.hf_conv(x_hf)
 
-        # 3. Wavelet Reconstruction
-        out = self.idwt(torch.cat([x_ll_out, x_hf_out], dim=1))
+        # Fuse before IDWT for texture restoration
+        merged = torch.cat([x_ll_out, x_hf_out], dim=1)
+        fused = self.fusion(merged) + merged
 
+        out = self.idwt(fused)
         return out + identity
