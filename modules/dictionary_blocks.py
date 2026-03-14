@@ -39,11 +39,10 @@ class QueryDictionaryGenerator(nn.Module):
         return self.proj(out)  # (B, 128, 640)
 
 
-class UnbalancedEntropicOTAttention(nn.Module):
+class SpatialDispersionEOTAttention(nn.Module):
     """
-    Semi-Unbalanced EOT-HDDA: Uses Generalized Sinkhorn.
-    Allows the attention mechanism to dynamically drop unused dictionary tokens
-    while preserving strict query normalization. Includes momentum acceleration.
+    Integrates Spatial Cost Regularization (prevents spatial bitrate leakage)
+    and Dispersion Penalization (prevents 'drab'/blurry latents).
     """
 
     def __init__(
@@ -55,18 +54,23 @@ class UnbalancedEntropicOTAttention(nn.Module):
         epsilon=0.05,
         tau=0.5,
         iters=3,
-        momentum=1.5,
     ):
         super().__init__()
         self.dict_num = dict_num
         self.epsilon = epsilon
-        self.tau = tau  # Relaxation parameter for Unbalanced OT
+        self.tau = tau
         self.iters = iters
-        self.momentum = momentum  # Successive Over-Relaxation
 
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
         self.k_proj = nn.Linear(dict_dim, dict_dim)
         self.v_proj = nn.Linear(dict_dim, dict_dim)
+
+        # Enforces local spatial coherence in dictionary assignments, slashing BPP
+        self.spatial_smooth = nn.Conv2d(
+            dict_num, dict_num, kernel_size=3, padding=1, groups=dict_num, bias=False
+        )
+        self.spatial_smooth.weight.data.fill_(1.0 / 9.0)
+        self.spatial_smooth.weight.requires_grad = False
 
         self.out_proj = nn.Sequential(
             nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
@@ -81,37 +85,53 @@ class UnbalancedEntropicOTAttention(nn.Module):
         k = self.k_proj(dt)  # (B, N, D)
         v = self.v_proj(dt)  # (B, N, D)
 
-        # 1. Cost Matrix (L2 Normalized to guarantee bounded Cosine Distance [0, 2])
+        # 1. Cost Matrix (L2 Normalized)
         q_norm = F.normalize(q, p=2, dim=-1)
         k_norm = F.normalize(k, p=2, dim=-1)
         C_mat = 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))  # (B, HW, N)
+
+        # Apply Spatial Graph Regularization
+        C_spatial = C_mat.transpose(1, 2).view(B, self.dict_num, H, W)
+        C_spatial = self.spatial_smooth(C_spatial)
+        C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2)
 
         # 2. Semi-Unbalanced Sinkhorn Iterations
         u = torch.zeros_like(C_mat[:, :, 0])  # (B, HW)
         v_vec = torch.zeros_like(C_mat[:, 0, :])  # (B, N)
 
-        target_marginal = math.log((H * W) / self.dict_num)
+        # RESOLUTION INVARIANT: Target marginal must be an intensive property
+        target_marginal = math.log(1.0 / self.dict_num)
         tau_ratio = self.tau / (self.tau + self.epsilon)
 
         for _ in range(self.iters):
-            # Query update: Strict constraint (tau1 = infinity)
+            # Query
             u = self.epsilon * (
                 -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / self.epsilon, dim=2)
             )
 
-            # Key update: Soft constraint (tau2 = tau) with Momentum Acceleration
+            # Key
             v_unbalanced = self.epsilon * target_marginal + self.epsilon * (
                 -torch.logsumexp((-C_mat + u.unsqueeze(2)) / self.epsilon, dim=1)
             )
-            v_target = tau_ratio * v_unbalanced
-            v_vec = (1 - self.momentum) * v_vec + self.momentum * v_target
+            v_vec = tau_ratio * v_unbalanced
 
         # 3. Optimal Transport Plan
         P = torch.exp((-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / self.epsilon)
-        self.attn_probs = P.detach()
 
         # 4. Gather Dictionary Values & Project
-        out = torch.bmm(P, v)  # (B, HW, D)
-        out = out.transpose(1, 2).view(B, -1, H, W)
+        out_bmm = torch.bmm(P, v)  # (B, HW, D)
+        out = out_bmm.transpose(1, 2).view(B, -1, H, W)
 
-        return self.out_proj(out)
+        # 5. DISPERSION PENALIZATION (Calculated during training only)
+        # Prevents "drab" mixing by penalizing intra-cluster variance
+        if self.training:
+            out_detached = out_bmm.detach()
+            v_expanded = v.unsqueeze(1)  # (B, 1, N, D)
+            out_expanded = out_detached.unsqueeze(2)  # (B, HW, 1, D)
+
+            dist_sq = torch.sum((v_expanded - out_expanded) ** 2, dim=-1)  # (B, HW, N)
+            dispersion_loss = torch.mean(torch.sum(P * dist_sq, dim=2))
+        else:
+            dispersion_loss = torch.tensor(0.0, device=x.device)
+
+        return self.out_proj(out), dispersion_loss

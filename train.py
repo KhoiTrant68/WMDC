@@ -2,9 +2,11 @@ import argparse
 import logging
 import math
 import os
+import random
 import sys
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,6 +77,12 @@ class RateDistortionLoss(nn.Module):
             distortion = out["ms_ssim_loss"]
 
         out["loss"] = self.lmbda * distortion + out["bpp_loss"]
+
+        # OT Dispersion Penalization
+        if "dispersion_loss" in output:
+            out["dispersion_loss"] = output["dispersion_loss"]
+            out["loss"] += 0.1 * out["dispersion_loss"]
+
         return out
 
 
@@ -108,6 +116,7 @@ def train_one_epoch(
 ):
     model.train()
     rd_meter, aux_meter, bpp_meter = AverageMeter(), AverageMeter(), AverageMeter()
+    disp_meter = AverageMeter()
     pbar = tqdm(
         enumerate(train_dataloader),
         total=len(train_dataloader),
@@ -119,28 +128,34 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
+        # DDP: Single combined backward pass prevents hanging
         optimizer.zero_grad()
-        accelerator.backward(out_criterion["loss"])
+        aux_optimizer.zero_grad()
+
+        total_loss = out_criterion["loss"] + out_net["aux_loss"]
+        accelerator.backward(total_loss)
+
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
             ]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
-        optimizer.step()
 
-        aux_optimizer.zero_grad()
-        aux_loss = out_net["aux_loss"]
-        accelerator.backward(aux_loss)
+        optimizer.step()
         aux_optimizer.step()
 
         rd_meter.update(out_criterion["loss"].item())
-        aux_meter.update(aux_loss.item())
+        aux_meter.update(out_net["aux_loss"].item())
         bpp_meter.update(out_criterion["bpp_loss"].item())
+
+        if "dispersion_loss" in out_criterion:
+            disp_meter.update(out_criterion["dispersion_loss"].item())
 
         pbar.set_postfix(
             rd=f"{rd_meter.avg:.4f}",
             aux=f"{aux_meter.avg:.5f}",
             bpp=f"{bpp_meter.avg:.4f}",
+            disp=f"{disp_meter.avg:.4f}",
         )
 
         if accelerator.is_main_process and i % 100 == 0:
@@ -149,10 +164,12 @@ def train_one_epoch(
                 writer.add_scalar("Train/RD_Loss", rd_meter.avg, step)
                 writer.add_scalar("Train/Aux_Loss", aux_meter.avg, step)
                 writer.add_scalar("Train/Bpp", bpp_meter.avg, step)
+                writer.add_scalar("Train/Dispersion", disp_meter.avg, step)
             if logger:
                 logger.info(
-                    f"[Train] Epoch {epoch} [{i}/{len(train_dataloader)}] "
-                    f"RD Loss: {rd_meter.avg:.4f} | Aux Loss: {aux_meter.avg:.5f} | Bpp: {bpp_meter.avg:.4f}"
+                    f"[Train] Epoch {epoch}[{i}/{len(train_dataloader)}] "
+                    f"RD Loss: {rd_meter.avg:.4f} | Aux: {aux_meter.avg:.5f} | "
+                    f"Bpp: {bpp_meter.avg:.4f} | Disp: {disp_meter.avg:.4f}"
                 )
     return rd_meter.avg
 
@@ -228,7 +245,25 @@ def parse_args():
     p.add_argument("--checkpoint", type=str)
     p.add_argument("--metric", type=str, default="mse", choices=["mse", "ms-ssim"])
     p.add_argument("--seed", type=int, default=2026)
-    return p.parse_args()
+
+    args = p.parse_args()
+
+    # Check for MS-SSIM Lambda Catastrophe
+    if args.metric == "ms-ssim" and args.lmbda < 1.0:
+        scaled_lambda = args.lmbda * 65025  # Heuristic 255^2 scale
+        print(
+            f"WARNING: Scaling MS-SSIM lambda from {args.lmbda} to {scaled_lambda} to prevent blank collapse."
+        )
+        args.lmbda = scaled_lambda
+
+    return args
+
+
+def worker_init_fn(worker_id):
+    """Ensure unique noise sampling during EntropyBottleneck execution across workers."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def main():
@@ -281,6 +316,7 @@ def main():
         num_workers=4,
         pin_memory=True,
         drop_last=True,
+        worker_init_fn=worker_init_fn,  # Entropy noise fix
     )
     test_loader = DataLoader(
         test_dataset,

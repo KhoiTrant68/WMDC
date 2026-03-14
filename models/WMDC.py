@@ -8,7 +8,7 @@ from compressai.models import CompressionModel
 
 from modules.dictionary_blocks import (
     QueryDictionaryGenerator,
-    UnbalancedEntropicOTAttention,
+    SpatialDispersionEOTAttention,
 )
 from modules.utils import conv, deconv
 from modules.VSS_module import VSSBlock
@@ -80,13 +80,13 @@ class WMDC(CompressionModel):
         )
 
         self.eot_attention = nn.ModuleList(
-            UnbalancedEntropicOTAttention(
+            SpatialDispersionEOTAttention(
                 input_dim=2 * M + self.slice_ch * min(i, self.max_support_slices),
                 output_dim=M,
                 dict_num=self.dict_num,
                 dict_dim=self.dict_dim,
                 epsilon=0.05,
-                tau=0.5,  # Unbalanced soft constraint
+                tau=0.5,
                 iters=3,
             )
             for i in range(num_slices)
@@ -118,12 +118,10 @@ class WMDC(CompressionModel):
         self.cc_mean_transforms = nn.ModuleList(
             nn.Sequential(
                 nn.Conv2d(
-                    3 * M + self.slice_ch * min(i, self.max_support_slices),
-                    224,
-                    3,
-                    1,
-                    1,
+                    3 * M + self.slice_ch * min(i, self.max_support_slices), 128, 1
                 ),
+                nn.GELU(),
+                nn.Conv2d(128, 224, 3, 1, 1),
                 nn.GELU(),
                 nn.Conv2d(224, 128, 3, 1, 1),
                 nn.GELU(),
@@ -135,12 +133,10 @@ class WMDC(CompressionModel):
         self.cc_scale_transforms = nn.ModuleList(
             nn.Sequential(
                 nn.Conv2d(
-                    3 * M + self.slice_ch * min(i, self.max_support_slices),
-                    224,
-                    3,
-                    1,
-                    1,
+                    3 * M + self.slice_ch * min(i, self.max_support_slices), 128, 1
                 ),
+                nn.GELU(),
+                nn.Conv2d(128, 224, 3, 1, 1),
                 nn.GELU(),
                 nn.Conv2d(224, 128, 3, 1, 1),
                 nn.GELU(),
@@ -153,11 +149,11 @@ class WMDC(CompressionModel):
             nn.Sequential(
                 nn.Conv2d(
                     3 * M + self.slice_ch * min(i + 1, self.max_support_slices + 1),
-                    224,
-                    3,
-                    1,
+                    128,
                     1,
                 ),
+                nn.GELU(),
+                nn.Conv2d(128, 224, 3, 1, 1),
                 nn.GELU(),
                 nn.Conv2d(224, 128, 3, 1, 1),
                 nn.GELU(),
@@ -208,6 +204,8 @@ class WMDC(CompressionModel):
         y_hat_slices, y_likelihood = [], []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
+        total_dispersion = 0.0
+
         for i, y_slice in enumerate(y_slices):
             support_slices = (
                 y_hat_slices
@@ -221,7 +219,10 @@ class WMDC(CompressionModel):
             else:
                 query = hyper_prior
 
-            dict_info = self.eot_attention[i](query, dt)
+            # Unpack EOT tuple
+            dict_info, disp_loss = self.eot_attention[i](query, dt)
+            total_dispersion += disp_loss
+
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
@@ -245,6 +246,7 @@ class WMDC(CompressionModel):
             "x_hat": x_hat,
             "likelihoods": {"y": torch.cat(y_likelihood, dim=1), "z": z_likelihoods},
             "aux_loss": self.aux_loss(),
+            "dispersion_loss": total_dispersion / self.num_slices,
         }
 
     def compress(self, x):
@@ -277,7 +279,8 @@ class WMDC(CompressionModel):
             else:
                 query = hyper_prior
 
-            dict_info = self.eot_attention[i](query, dt)
+            # Tuple unpacking, discard dispersion loss during inference
+            dict_info, _ = self.eot_attention[i](query, dt)
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
@@ -327,7 +330,8 @@ class WMDC(CompressionModel):
             else:
                 query = hyper_prior
 
-            dict_info = self.eot_attention[i](query, dt)
+            # Tuple unpacking, discard dispersion loss during inference
+            dict_info, _ = self.eot_attention[i](query, dt)
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
