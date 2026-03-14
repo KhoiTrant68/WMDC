@@ -118,6 +118,8 @@ class SpatialDispersionEOTAttention(nn.Module):
         # 3. Optimal Transport Plan
         P = torch.exp((-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / self.epsilon)
 
+        self.attn_probs = P.detach()
+
         # 4. Gather Dictionary Values & Project
         out_bmm = torch.bmm(P, v)  # (B, HW, D)
         out = out_bmm.transpose(1, 2).view(B, -1, H, W)

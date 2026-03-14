@@ -329,7 +329,7 @@ def main():
     model = WMDC(N=192, M=320, num_slices=5)
     optimizer, aux_optimizer = configure_optimizers(model, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[80, 90], gamma=0.1
+        optimizer, milestones=[20, 40], gamma=0.1
     )
     criterion = RateDistortionLoss(lmbda=args.lmbda, metric=args.metric)
 
