@@ -74,15 +74,9 @@ def main():
     print(f"Processing image: {args.image}")
     img = Image.open(args.image).convert("RGB")
     x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-
-    # 3. Pad Image (must be divisible by 128 for Mamba/Attention blocks)
-    pad_h = (128 - x.size(2) % 128) % 128
-    pad_w = (128 - x.size(3) % 128) % 128
-    x_padded = F.pad(x, (0, pad_w, 0, pad_h))
-
     # 4. Forward Pass & Metrics
     with torch.no_grad():
-        out_net = model(x_padded)
+        out_net = model(x)
         # Crop back to original dimensions and clamp to [0, 1] valid range
         x_hat = out_net["x_hat"][:, :, : x.size(2), : x.size(3)].clamp(0, 1)
 

@@ -14,22 +14,6 @@ from torchvision.utils import save_image
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=64):
-    h, w = x.size(2), x.size(3)
-    new_h, new_w = (h + p - 1) // p * p, (w + p - 1) // p * p
-    pad_l, pad_t = (new_w - w) // 2, (new_h - h) // 2
-    padding = (pad_l, new_w - w - pad_l, pad_t, new_h - h - pad_t)
-    if sum(padding) == 0:
-        return x, padding
-    return F.pad(x, padding, mode="reflect"), padding
-
-
-def crop_image(x, padding):
-    if sum(padding) == 0:
-        return x
-    return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
-
-
 def compute_actual_bpp(strings, num_pixels):
     def get_size(obj):
         if isinstance(obj, bytes):
@@ -73,18 +57,17 @@ def main():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-            x_padded, padding = pad_image(x)
             num_pixels_original = x.size(2) * x.size(3)
 
             t0 = time.time()
-            out_enc = model.compress(x_padded)
+            out_enc = model.compress(x)
             enc_time = time.time() - t0
 
             t1 = time.time()
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
             dec_time = time.time() - t1
 
-            x_hat = crop_image(out_dec["x_hat"], padding).clamp_(0, 1)
+            x_hat = out_dec["x_hat"].clamp_(0, 1)
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)

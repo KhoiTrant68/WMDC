@@ -226,7 +226,9 @@ class WMDC(CompressionModel):
             mu = self.cc_mean_transforms[i](support)
             scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
-            y_hat_slice, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, means=mu)
+            y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
+                y_slice, scale, means=mu
+            )
             y_likelihood.append(y_slice_likelihood)
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)

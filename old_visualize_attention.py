@@ -13,16 +13,6 @@ from torchvision import transforms
 from models.WMDC import WMDC
 
 
-def pad_image(x, p=32):
-    """Padding fixed to exactly 32 to match the model's spatial downsampling"""
-    h, w = x.size(2), x.size(3)
-    pad_h = (p - h % p) % p
-    pad_w = (p - w % p) % p
-    if pad_w == 0 and pad_h == 0:
-        return x
-    return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize WMDC Dictionary Attention Maps"
@@ -118,18 +108,16 @@ def main():
 
         orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
 
-        x_pad = pad_image(x, p=32)
-
         # The downsampling factor in WMDC to the latent space is 32x (16x from g_a, 2x from DWT)
-        latent_h = x_pad.size(2) // 32
-        latent_w = x_pad.size(3) // 32
+        latent_h = x.size(2) // 32
+        latent_w = x.size(3) // 32
         max_dict_idx = (
             latent_h * latent_w
         ) - 1  # Maximum valid index in the dictionary
 
         extracted_probs.clear()
         with torch.no_grad():
-            _ = model(x_pad)
+            _ = model(x)
 
         # Grab the extracted attention tensor
         # Shape:[1, head_num, (latent_h * latent_w), dict_num]

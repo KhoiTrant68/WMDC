@@ -49,23 +49,6 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def pad_image(x, p=64):
-    h, w = x.size(2), x.size(3)
-    new_h, new_w = math.ceil(h / p) * p, math.ceil(w / p) * p
-    pad_l, pad_t = (new_w - w) // 2, (new_h - h) // 2
-    pad_r, pad_b = new_w - w - pad_l, new_h - h - pad_t
-    padding = (pad_l, pad_r, pad_t, pad_b)
-    if sum(padding) == 0:
-        return x, padding
-    return F.pad(x, padding, mode="reflect"), padding
-
-
-def crop_image(x, padding):
-    if sum(padding) == 0:
-        return x
-    return F.pad(x, (-padding[0], -padding[1], -padding[2], -padding[3]))
-
-
 def compute_bpp(out_net, num_pixels):
     return sum(
         torch.log(likelihoods.float()).sum() / (-math.log(2) * num_pixels)
@@ -191,10 +174,9 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             desc=f"Val Epoch {epoch}",
             disable=not accelerator.is_local_main_process,
         ):
-            d_padded, padding = pad_image(d)
-            out_net = model(d_padded)
+            out_net = model(d)
             out_net["x_hat"].clamp_(0, 1)
-            x_hat = crop_image(out_net["x_hat"], padding)
+            x_hat = out_net["x_hat"]
 
             num_pixels = d.size(0) * d.size(2) * d.size(3)
             bpp_val = compute_bpp(out_net, num_pixels)
