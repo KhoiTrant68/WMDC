@@ -29,7 +29,7 @@ def setup_logger(log_dir):
     )
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s[%(levelname)s] %(message)s",
         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
     )
     return logging.getLogger(__name__)
@@ -72,10 +72,7 @@ class RateDistortionLoss(nn.Module):
             distortion = 255**2 * out["mse_loss"]
         else:
             out["ms_ssim_loss"] = 1 - ms_ssim(output["x_hat"], target, data_range=1.0)
-            # Safe Lambda Scaling for MS-SSIM
-            distortion = (
-                out["ms_ssim_loss"] * 10000 if self.lmbda < 1.0 else out["ms_ssim_loss"]
-            )
+            distortion = out["ms_ssim_loss"]
 
         out["loss"] = self.lmbda * distortion + out["bpp_loss"]
         return out
@@ -122,7 +119,6 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
-        # 1. Main RD Optimization
         optimizer.zero_grad()
         accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
@@ -132,7 +128,6 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
         optimizer.step()
 
-        # 2. Aux Density Optimization (Strict separation prevents gradient pollution)
         aux_optimizer.zero_grad()
         aux_loss = out_net["aux_loss"]
         accelerator.backward(aux_loss)
@@ -159,7 +154,6 @@ def train_one_epoch(
                     f"[Train] Epoch {epoch} [{i}/{len(train_dataloader)}] "
                     f"RD Loss: {rd_meter.avg:.4f} | Aux Loss: {aux_meter.avg:.5f} | Bpp: {bpp_meter.avg:.4f}"
                 )
-
     return rd_meter.avg
 
 
@@ -175,8 +169,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             disable=not accelerator.is_local_main_process,
         ):
             out_net = model(d)
-            out_net["x_hat"].clamp_(0, 1)
-            x_hat = out_net["x_hat"]
+            x_hat = out_net["x_hat"].clamp_(0, 1)
 
             num_pixels = d.size(0) * d.size(2) * d.size(3)
             bpp_val = compute_bpp(out_net, num_pixels)
@@ -186,10 +179,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             loss_val = (
                 criterion.lmbda * 255**2 * mse_val + bpp_val
                 if criterion.metric == "mse"
-                else criterion.lmbda
-                * (1 - ms_ssim(x_hat, d, data_range=1.0))
-                * (10000 if criterion.lmbda < 1.0 else 1)
-                + bpp_val
+                else criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
             )
 
             metrics = (
@@ -201,6 +191,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
                 .view(-1, 3)
                 .mean(dim=0)
             )
+
             psnr_meter.update(metrics[0].item())
             bpp_meter.update(metrics[1].item())
             loss_meter.update(metrics[2].item())
@@ -242,9 +233,14 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Strictly enforce reproducibility
+    set_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
-    set_seed(args.seed)
 
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
     logger = setup_logger(save_dir) if accelerator.is_main_process else None
@@ -349,13 +345,12 @@ def main():
                 "args": vars(args),
             }
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
-
             if test_loss < best_loss:
                 best_loss = test_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
                 if logger:
                     logger.info(
-                        f"*** New best validation loss: {best_loss:.4f} saved to checkpoint_best.pth.tar ***"
+                        f"*** New best validation loss: {best_loss:.4f} saved ***"
                     )
 
 

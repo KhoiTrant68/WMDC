@@ -40,7 +40,7 @@ def main():
 
     model = WMDC(N=192, M=320, num_slices=5).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(checkpoint.get("state_dict", checkpoint))
     model.eval()
     model.update(force=True)
 
@@ -48,7 +48,7 @@ def main():
         [
             os.path.join(args.dataset, f)
             for f in os.listdir(args.dataset)
-            if f.endswith((".png", ".jpg", ".jpeg"))
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
         ]
     )
     results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
@@ -64,10 +64,14 @@ def main():
             enc_time = time.time() - t0
 
             t1 = time.time()
-            out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
+            out_dec = model.decompress(
+                out_enc["strings"],
+                out_enc["shape"],
+                original_shape=out_enc.get("original_shape"),
+            )
             dec_time = time.time() - t1
 
-            x_hat = out_dec["x_hat"].clamp_(0, 1)
+            x_hat = out_dec["x_hat"].clamp(0, 1)
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)
@@ -82,7 +86,8 @@ def main():
             results["dec_time"].append(dec_time)
 
             print(
-                f"Image: {os.path.basename(img_path)} | BPP: {bpp:.4f} | PSNR: {psnr:.2f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
+                f"Image: {os.path.basename(img_path)} | BPP: {bpp:.4f} | "
+                f"PSNR: {psnr:.2f} | Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
             )
 
     avg_results = {k: sum(v) / len(v) for k, v in results.items()}

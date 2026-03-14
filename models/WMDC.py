@@ -2,12 +2,13 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 
 from modules.dictionary_blocks import (
-    EntropicOptimalTransportAttention,
     QueryDictionaryGenerator,
+    UnbalancedEntropicOTAttention,
 )
 from modules.utils import conv, deconv
 from modules.VSS_module import VSSBlock
@@ -15,13 +16,6 @@ from modules.wavelet_blocks import FrequencyDisentangledMamba
 
 
 class WMDC(CompressionModel):
-    """
-    FD-EOT Model: Frequency-Disentangled Entropic Optimal Transport Compression.
-    1. FD-SSM: Mamba handles global structure (LL), CNN handles local texture (HF).
-    2. EOT-HDDA: DETR Queries + Sinkhorn Optimal Transport for balanced sparse context.
-    3. Spatial-Channel Autoregressive Transforms.
-    """
-
     def __init__(
         self,
         N=192,
@@ -38,11 +32,8 @@ class WMDC(CompressionModel):
         self.max_support_slices = max_support_slices
         self.slice_ch = M // num_slices
         self.dict_num = dict_num
-        self.dict_dim = 32 * dict_head_num  # 640
+        self.dict_dim = 32 * dict_head_num
 
-        # ==========================================
-        # 1. MAIN ENCODER & DECODER (FD-SSM)
-        # ==========================================
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
             FrequencyDisentangledMamba(N, drop_path=0.1),
@@ -63,9 +54,6 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
-        # ==========================================
-        # 2. HYPER-PRIOR AUTOENCODER
-        # ==========================================
         self.h_a = nn.Sequential(
             conv(M, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.0),
@@ -87,28 +75,23 @@ class WMDC(CompressionModel):
         self.entropy_bottleneck = EntropyBottleneck(192)
         self.gaussian_conditional = GaussianConditional(None)
 
-        # ==========================================
-        # 3. EOT-HDDA: OPTIMAL TRANSPORT DICTIONARY
-        # ==========================================
         self.hyper_to_dict = QueryDictionaryGenerator(
             in_dim=192, dict_num=self.dict_num, dict_dim=self.dict_dim, num_heads=4
         )
 
         self.eot_attention = nn.ModuleList(
-            EntropicOptimalTransportAttention(
+            UnbalancedEntropicOTAttention(
                 input_dim=2 * M + self.slice_ch * min(i, self.max_support_slices),
                 output_dim=M,
                 dict_num=self.dict_num,
                 dict_dim=self.dict_dim,
                 epsilon=0.05,
+                tau=0.5,  # Unbalanced soft constraint
                 iters=3,
             )
             for i in range(num_slices)
         )
 
-        # ==========================================
-        # 4. SPATIAL-CHANNEL AUTOREGRESSION (ChARM+)
-        # ==========================================
         self.spatial_context = nn.ModuleList(
             (
                 nn.Sequential(
@@ -183,6 +166,22 @@ class WMDC(CompressionModel):
             for i in range(num_slices)
         )
 
+    def _pad_for_model(self, x, p=64):
+        H, W = x.size(2), x.size(3)
+        pad_h = (p - H % p) % p
+        pad_w = (p - W % p) % p
+        if pad_h > 0 or pad_w > 0:
+            x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+        else:
+            x_padded = x
+        return x_padded, (H, W)
+
+    def _crop_to_original(self, x, original_shape):
+        H, W = original_shape
+        if x.size(2) > H or x.size(3) > W:
+            return x[:, :, :H, :W]
+        return x
+
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = torch.exp(torch.linspace(math.log(0.11), math.log(256), 64))
@@ -194,7 +193,9 @@ class WMDC(CompressionModel):
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
     def forward(self, x):
-        y = self.g_a(x)
+        x_padded, original_shape = self._pad_for_model(x, p=64)
+
+        y = self.g_a(x_padded)
         z = self.h_a(y)
 
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
@@ -238,6 +239,8 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
+        x_hat = self._crop_to_original(x_hat, original_shape)
+
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": torch.cat(y_likelihood, dim=1), "z": z_likelihoods},
@@ -245,7 +248,9 @@ class WMDC(CompressionModel):
         }
 
     def compress(self, x):
-        y = self.g_a(x)
+        x_padded, original_shape = self._pad_for_model(x, p=64)
+
+        y = self.g_a(x_padded)
         z = self.h_a(y)
 
         z_strings = self.entropy_bottleneck.compress(z)
@@ -291,9 +296,13 @@ class WMDC(CompressionModel):
             )
             y_hat_slices.append(y_hat_slice)
 
-        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
+        return {
+            "strings": [y_strings, z_strings],
+            "shape": z.size()[-2:],
+            "original_shape": original_shape,
+        }
 
-    def decompress(self, strings, shape):
+    def decompress(self, strings, shape, original_shape=None):
         y_strings, z_strings = strings[0], strings[1]
 
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
@@ -336,4 +345,9 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        return {"x_hat": self.g_s(y_hat).clamp_(0, 1)}
+        x_hat = self.g_s(y_hat).clamp_(0, 1)
+
+        if original_shape is not None:
+            x_hat = self._crop_to_original(x_hat, original_shape)
+
+        return {"x_hat": x_hat}
