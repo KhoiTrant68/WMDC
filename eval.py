@@ -25,6 +25,17 @@ def compute_actual_bpp(strings, num_pixels):
     return (get_size(strings) * 8) / num_pixels
 
 
+def pad_image(x, p=64):
+    H, W = x.size(2), x.size(3)
+    pad_h = (p - H % p) % p
+    pad_w = (p - W % p) % p
+    if pad_h > 0 or pad_w > 0:
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+    else:
+        x_padded = x
+    return x_padded, pad_h, pad_w
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True)
@@ -57,21 +68,29 @@ def main():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-            num_pixels_original = x.size(2) * x.size(3)
+            H, W = x.size(2), x.size(3)
+            num_pixels_original = H * W
+
+            x_padded, pad_h, pad_w = pad_image(x, p=64)
 
             t0 = time.time()
-            out_enc = model.compress(x)
+            out_enc = model.compress(x_padded)
             enc_time = time.time() - t0
 
             t1 = time.time()
             out_dec = model.decompress(
                 out_enc["strings"],
                 out_enc["shape"],
-                original_shape=out_enc.get("original_shape"),
             )
             dec_time = time.time() - t1
 
-            x_hat = out_dec["x_hat"].clamp(0, 1)
+            x_hat = out_dec["x_hat"]
+
+            if pad_h > 0 or pad_w > 0:
+                x_hat = x_hat[:, :, :H, :W]
+
+            x_hat = x_hat.clamp(0, 1)
+
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)

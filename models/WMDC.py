@@ -115,52 +115,51 @@ class WMDC(CompressionModel):
 
         shared_input_dim = 3 * M + self.slice_ch  # query + dict_info
 
-        # Single shared transforms for all slices!
-        self.cc_mean_transform = nn.Sequential(
-            nn.Conv2d(shared_input_dim, 128, 1),
-            nn.GELU(),
-            nn.Conv2d(128, 224, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(224, 128, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+        # Unshared transforms per slice
+        self.cc_mean_transforms = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(shared_input_dim, 128, 1),
+                    nn.GELU(),
+                    nn.Conv2d(128, 224, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(224, 128, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+                )
+                for _ in range(num_slices)
+            ]
         )
 
-        self.cc_scale_transform = nn.Sequential(
-            nn.Conv2d(shared_input_dim, 128, 1),
-            nn.GELU(),
-            nn.Conv2d(128, 224, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(224, 128, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+        self.cc_scale_transforms = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(shared_input_dim, 128, 1),
+                    nn.GELU(),
+                    nn.Conv2d(128, 224, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(224, 128, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+                )
+                for _ in range(num_slices)
+            ]
         )
 
-        self.lrp_transform = nn.Sequential(
-            nn.Conv2d(shared_input_dim + self.slice_ch, 128, 1),
-            nn.GELU(),
-            nn.Conv2d(128, 224, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(224, 128, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+        self.lrp_transforms = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(shared_input_dim + self.slice_ch, 128, 1),
+                    nn.GELU(),
+                    nn.Conv2d(128, 224, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(224, 128, 3, 1, 1),
+                    nn.GELU(),
+                    nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+                )
+                for _ in range(num_slices)
+            ]
         )
-
-    def _pad_for_model(self, x, p=64):
-        H, W = x.size(2), x.size(3)
-        pad_h = (p - H % p) % p
-        pad_w = (p - W % p) % p
-        if pad_h > 0 or pad_w > 0:
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-        else:
-            x_padded = x
-        return x_padded, (H, W)
-
-    def _crop_to_original(self, x, original_shape):
-        H, W = original_shape
-        if x.size(2) > H or x.size(3) > W:
-            return x[:, :, :H, :W]
-        return x
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
@@ -173,9 +172,12 @@ class WMDC(CompressionModel):
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
     def forward(self, x):
-        x_padded, original_shape = self._pad_for_model(x, p=64)
+        if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
+            raise ValueError(
+                f"Model expects input dimensions to be a multiple of 64. Got {x.shape}"
+            )
 
-        y = self.g_a(x_padded)
+        y = self.g_a(x)
         z = self.h_a(y)
 
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
@@ -211,8 +213,8 @@ class WMDC(CompressionModel):
 
             support = torch.cat([query, dict_info], dim=1)
 
-            mu = self.cc_mean_transform(support)
-            scale = torch.clamp(self.cc_scale_transform(support), min=0.11)
+            mu = self.cc_mean_transforms[i](support)
+            scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
                 y_slice, scale, means=mu
@@ -221,16 +223,14 @@ class WMDC(CompressionModel):
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transform(lrp_support)
+                self.lrp_transforms[i](lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
 
-            # Update Markovian Memory State
             state_input = torch.cat([memory_state, y_hat_slice], dim=1)
             memory_state = memory_state + self.memory_updater(state_input)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
-        x_hat = self._crop_to_original(x_hat, original_shape)
 
         return {
             "x_hat": x_hat,
@@ -240,9 +240,12 @@ class WMDC(CompressionModel):
         }
 
     def compress(self, x):
-        x_padded, original_shape = self._pad_for_model(x, p=64)
+        if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
+            raise ValueError(
+                f"Model expects input dimensions to be a multiple of 64. Got {x.shape}"
+            )
 
-        y = self.g_a(x_padded)
+        y = self.g_a(x)
         z = self.h_a(y)
 
         z_strings = self.entropy_bottleneck.compress(z)
@@ -258,7 +261,6 @@ class WMDC(CompressionModel):
 
         spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
 
-        # Bootstrap Memory State & Cache Dict Projections
         memory_state = self.init_memory(hyper_prior)
         k_dict = self.k_proj(dt)
         v_dict = self.v_proj(dt)
@@ -269,8 +271,8 @@ class WMDC(CompressionModel):
             dict_info, _ = self.eot_attention(query, k_dict, v_dict, spatial_epsilon)
             support = torch.cat([query, dict_info], dim=1)
 
-            mu = self.cc_mean_transform(support)
-            scale = torch.clamp(self.cc_scale_transform(support), min=0.11)
+            mu = self.cc_mean_transforms[i](support)
+            scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
             y_string = self.gaussian_conditional.compress(y_slice, index, means=mu)
@@ -282,7 +284,7 @@ class WMDC(CompressionModel):
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transform(lrp_support)
+                self.lrp_transforms[i](lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
 
@@ -292,10 +294,9 @@ class WMDC(CompressionModel):
         return {
             "strings": [y_strings, z_strings],
             "shape": z.size()[-2:],
-            "original_shape": original_shape,
         }
 
-    def decompress(self, strings, shape, original_shape=None):
+    def decompress(self, strings, shape):
         y_strings, z_strings = strings[0], strings[1]
 
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
@@ -320,8 +321,8 @@ class WMDC(CompressionModel):
             dict_info, _ = self.eot_attention(query, k_dict, v_dict, spatial_epsilon)
             support = torch.cat([query, dict_info], dim=1)
 
-            mu = self.cc_mean_transform(support)
-            scale = torch.clamp(self.cc_scale_transform(support), min=0.11)
+            mu = self.cc_mean_transforms[i](support)
+            scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
             y_hat_slice = self.gaussian_conditional.decompress(
@@ -330,7 +331,7 @@ class WMDC(CompressionModel):
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transform(lrp_support)
+                self.lrp_transforms[i](lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
 
@@ -339,8 +340,5 @@ class WMDC(CompressionModel):
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
-
-        if original_shape is not None:
-            x_hat = self._crop_to_original(x_hat, original_shape)
 
         return {"x_hat": x_hat}
