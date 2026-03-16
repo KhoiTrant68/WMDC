@@ -88,9 +88,15 @@ class WMDC(CompressionModel):
         )
 
         # =========================================================================
-        # SHARED Markovian Architecture (Eliminates O(K^2) Bloat)
+        # SHARED Markovian Architecture
         # =========================================================================
-        # Only 1 EOT Attention needed now!
+        #: Bootstrap memory state dynamically to prevent Slice 1 conditional blindness
+        self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=1)
+
+        #: Projections moved here to compute them ONCE globally instead of 5 times inside EOT
+        self.k_proj = nn.Linear(self.dict_dim, self.dict_dim)
+        self.v_proj = nn.Linear(self.dict_dim, self.dict_dim)
+
         self.eot_attention = SpatialDispersionEOTAttention(
             input_dim=2 * M
             + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
@@ -183,19 +189,24 @@ class WMDC(CompressionModel):
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
         total_dispersion = 0.0
-        B, _, H, W = y_slices[0].shape
 
-        #  Spatial Sinkhorn epsilon from hyperprior (perfect resolution match)
+        # Spatial Sinkhorn epsilon from hyperprior
         spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
 
-        # Initialize Markovian state as zeros
-        memory_state = torch.zeros(B, self.slice_ch, H, W, device=y.device)
+        # Bootstrap Memory State
+        memory_state = self.init_memory(hyper_prior)
+
+        # Compute Dictionary Projections ONCE
+        k_dict = self.k_proj(dt)
+        v_dict = self.v_proj(dt)
 
         for i, y_slice in enumerate(y_slices):
-            # Query memory state (O(1) footprint) instead of concatenating all slices
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, disp_loss = self.eot_attention(query, dt, spatial_epsilon)
+            # Updated signature passing cached k_dict and v_dict
+            dict_info, disp_loss = self.eot_attention(
+                query, k_dict, v_dict, spatial_epsilon
+            )
             total_dispersion += disp_loss
 
             support = torch.cat([query, dict_info], dim=1)
@@ -214,7 +225,7 @@ class WMDC(CompressionModel):
             )
             y_hat_slices.append(y_hat_slice)
 
-            # Update Markovian Memory State for the next slice
+            # Update Markovian Memory State
             state_input = torch.cat([memory_state, y_hat_slice], dim=1)
             memory_state = memory_state + self.memory_updater(state_input)
 
@@ -245,17 +256,17 @@ class WMDC(CompressionModel):
         y_hat_slices, y_strings = [], []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        B, _, H, W = y_slices[0].shape
-
-        # Predict from hyperprior
         spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
-        memory_state = torch.zeros(B, self.slice_ch, H, W, device=y.device)
+
+        # Bootstrap Memory State & Cache Dict Projections
+        memory_state = self.init_memory(hyper_prior)
+        k_dict = self.k_proj(dt)
+        v_dict = self.v_proj(dt)
 
         for i, y_slice in enumerate(y_slices):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            # Discard dispersion loss during inference
-            dict_info, _ = self.eot_attention(query, dt, spatial_epsilon)
+            dict_info, _ = self.eot_attention(query, k_dict, v_dict, spatial_epsilon)
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transform(support)
@@ -296,21 +307,17 @@ class WMDC(CompressionModel):
         y_hat_slices = []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        B = z_hat.size(0)
-
-        # In decompress, latent dims match the shape of z_hat (scaled up 4x via h_scale_s)
-        latent_H, latent_W = z_hat.size(2) * 4, z_hat.size(3) * 4
-
-        # Predict from hyperprior
         spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
-        memory_state = torch.zeros(
-            B, self.slice_ch, latent_H, latent_W, device=z_hat.device
-        )
+
+        # Bootstrap Memory State & Cache Dict Projections
+        memory_state = self.init_memory(hyper_prior)
+        k_dict = self.k_proj(dt)
+        v_dict = self.v_proj(dt)
 
         for i in range(self.num_slices):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attention(query, dt, spatial_epsilon)
+            dict_info, _ = self.eot_attention(query, k_dict, v_dict, spatial_epsilon)
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transform(support)

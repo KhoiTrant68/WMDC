@@ -78,7 +78,6 @@ class RateDistortionLoss(nn.Module):
 
         out["loss"] = self.lmbda * distortion + out["bpp_loss"]
 
-        # OT Dispersion Penalization
         if "dispersion_loss" in output:
             out["dispersion_loss"] = output["dispersion_loss"]
             out["loss"] += 0.1 * out["dispersion_loss"]
@@ -128,26 +127,28 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
-        # DDP: Single combined backward pass prevents hanging
+        # =====================================================================
+        # Decoupled Backward Passes to Prevent Quantile CDF Corruption
+        # =====================================================================
+        # Pass 1: Rate-Distortion Loss (Main Parameters)
         optimizer.zero_grad()
-        aux_optimizer.zero_grad()
-
-        total_loss = out_criterion["loss"] + out_net["aux_loss"]
-        accelerator.backward(total_loss)
-
+        accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
             ]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
-
         optimizer.step()
+
+        # Pass 2: Entropy Bottleneck CDF Approximation (Aux Parameters)
+        aux_optimizer.zero_grad()
+        accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
+        # =====================================================================
 
         rd_meter.update(out_criterion["loss"].item())
         aux_meter.update(out_net["aux_loss"].item())
         bpp_meter.update(out_criterion["bpp_loss"].item())
-
         if "dispersion_loss" in out_criterion:
             disp_meter.update(out_criterion["dispersion_loss"].item())
 
@@ -165,12 +166,7 @@ def train_one_epoch(
                 writer.add_scalar("Train/Aux_Loss", aux_meter.avg, step)
                 writer.add_scalar("Train/Bpp", bpp_meter.avg, step)
                 writer.add_scalar("Train/Dispersion", disp_meter.avg, step)
-            if logger:
-                logger.info(
-                    f"[Train] Epoch {epoch}[{i}/{len(train_dataloader)}] "
-                    f"RD Loss: {rd_meter.avg:.4f} | Aux: {aux_meter.avg:.5f} | "
-                    f"Bpp: {bpp_meter.avg:.4f} | Disp: {disp_meter.avg:.4f}"
-                )
+
     return rd_meter.avg
 
 
@@ -208,26 +204,14 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
                 .view(-1, 3)
                 .mean(dim=0)
             )
-
             psnr_meter.update(metrics[0].item())
             bpp_meter.update(metrics[1].item())
             loss_meter.update(metrics[2].item())
-
-            if i == 0 and accelerator.is_main_process and writer:
-                writer.add_image(
-                    "Val/Reconstruction",
-                    make_grid(torch.cat([d[:4], x_hat[:4]], dim=0), nrow=4),
-                    epoch,
-                )
 
     if accelerator.is_main_process:
         logger.info(
             f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
         )
-        if writer:
-            writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
-            writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
-            writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
     return loss_meter.avg
 
 
@@ -248,19 +232,20 @@ def parse_args():
 
     args = p.parse_args()
 
-    # Check for MS-SSIM Lambda Catastrophe
+    # Document MS-SSIM scaling clearly for reproducibility
     if args.metric == "ms-ssim" and args.lmbda < 1.0:
         scaled_lambda = args.lmbda * 65025  # Heuristic 255^2 scale
-        print(
-            f"WARNING: Scaling MS-SSIM lambda from {args.lmbda} to {scaled_lambda} to prevent blank collapse."
-        )
+        print(f"================================================================")
+        print(f"WARNING: MS-SSIM Metric selected with small lambda ({args.lmbda}).")
+        print(f"Scaling lambda to {scaled_lambda} to prevent blank collapse.")
+        print(f"Note: Be sure to mention this heuristic in your paper appendix!")
+        print(f"================================================================")
         args.lmbda = scaled_lambda
 
     return args
 
 
 def worker_init_fn(worker_id):
-    """Ensure unique noise sampling during EntropyBottleneck execution across workers."""
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -268,8 +253,6 @@ def worker_init_fn(worker_id):
 
 def main():
     args = parse_args()
-
-    # Strictly enforce reproducibility
     set_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -284,11 +267,6 @@ def main():
         if accelerator.is_main_process
         else None
     )
-
-    if accelerator.is_main_process and logger:
-        logger.info("=" * 50)
-        logger.info(f"Starting Training - Config: {vars(args)}")
-        logger.info("=" * 50)
 
     train_dataset = ImageFolder(
         args.dataset,
@@ -316,7 +294,7 @@ def main():
         num_workers=4,
         pin_memory=True,
         drop_last=True,
-        worker_init_fn=worker_init_fn,  # Entropy noise fix
+        worker_init_fn=worker_init_fn,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -347,10 +325,6 @@ def main():
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         start_epoch = ckpt["epoch"] + 1
-        if accelerator.is_main_process and logger:
-            logger.info(
-                f"Successfully resumed from checkpoint: {args.checkpoint} (Epoch {start_epoch})"
-            )
 
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(
@@ -377,17 +351,11 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "aux_optimizer": aux_optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
-                "loss": test_loss,
-                "args": vars(args),
             }
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
             if test_loss < best_loss:
                 best_loss = test_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
-                if logger:
-                    logger.info(
-                        f"*** New best validation loss: {best_loss:.4f} saved ***"
-                    )
 
 
 if __name__ == "__main__":

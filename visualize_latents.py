@@ -20,37 +20,34 @@ def main():
         torch.load(args.checkpoint, map_location=device)["state_dict"]
     )
     model.eval()
+    model.update(force=True)
 
     img = Image.open(args.image).convert("RGB")
     x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-    # Create a Hook to intercept the Gaussian Conditional outputs (the latents!)
-    latents = []
-
-    def hook_fn(module, input, output):
-        # output is (y_hat_slice, y_slice_likelihood)
-        y_hat_slice = output[0].detach().cpu()
-        # Average across channels to get a 2D spatial heatmap
-        spatial_heatmap = torch.mean(torch.abs(y_hat_slice), dim=1).squeeze(0)
-        latents.append(spatial_heatmap)
-
-    # Register hook on the Gaussian Conditional
-    hook_handle = model.gaussian_conditional.register_forward_hook(hook_fn)
-
     with torch.no_grad():
-        _ = model(x)  # Triggers the hook 5 times (once per slice)
+        out_enc = model.compress(x)
+        # We hook into `decompress` where GaussianConditional processes the bitstrings
+        latents = []
 
-    hook_handle.remove()
+        def hook_fn(module, input, output):
+            # output is the strictly quantized `y_hat_slice` reconstructed from bits
+            y_hat_slice = output.detach().cpu()
+            spatial_heatmap = torch.mean(torch.abs(y_hat_slice), dim=1).squeeze(0)
+            latents.append(spatial_heatmap)
 
-    # Plot Original Image and Latent Slices
+        hook_handle = model.gaussian_conditional.register_forward_hook(hook_fn)
+        _ = model.decompress(
+            out_enc["strings"], out_enc["shape"], out_enc["original_shape"]
+        )
+        hook_handle.remove()
+
     fig, axes = plt.subplots(1, 6, figsize=(18, 3))
-
     axes[0].imshow(img)
     axes[0].set_title("Original Image")
     axes[0].axis("off")
 
     for i in range(5):
-        # Normalize heatmap for visualization
         hm = latents[i].numpy()
         axes[i + 1].imshow(hm, cmap="magma", interpolation="nearest")
         axes[i + 1].set_title(f"Slice {i+1} Latent")
@@ -59,7 +56,7 @@ def main():
     plt.tight_layout()
     plt.savefig("latent_sparsity_visualization.pdf", bbox_inches="tight")
     print(
-        "Saved latent_sparsity_visualization.pdf. Notice how Slices 4 and 5 are mostly empty!"
+        "Saved authentic sparsity visualization using the quantized bitstream variables."
     )
 
 
