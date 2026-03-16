@@ -31,7 +31,7 @@ def setup_logger(log_dir):
     )
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s[%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
     )
     return logging.getLogger(__name__)
@@ -116,6 +116,7 @@ def train_one_epoch(
     model.train()
     rd_meter, aux_meter, bpp_meter = AverageMeter(), AverageMeter(), AverageMeter()
     disp_meter = AverageMeter()
+
     pbar = tqdm(
         enumerate(train_dataloader),
         total=len(train_dataloader),
@@ -124,6 +125,9 @@ def train_one_epoch(
     )
 
     for i, d in pbar:
+        optimizer.zero_grad()
+        aux_optimizer.zero_grad()
+
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
@@ -131,7 +135,6 @@ def train_one_epoch(
         # Decoupled Backward Passes to Prevent Quantile CDF Corruption
         # =====================================================================
         # Pass 1: Rate-Distortion Loss (Main Parameters)
-        optimizer.zero_grad()
         accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
             main_params = [
@@ -141,7 +144,6 @@ def train_one_epoch(
         optimizer.step()
 
         # Pass 2: Entropy Bottleneck CDF Approximation (Aux Parameters)
-        aux_optimizer.zero_grad()
         accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
         # =====================================================================
@@ -184,6 +186,16 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             out_net = model(d)
             x_hat = out_net["x_hat"].clamp_(0, 1)
 
+            # --- Tensorboard Image Grid Logging ---
+            if i == 0 and accelerator.is_main_process and writer is not None:
+                n = min(d.size(0), 4)  # Log up to 4 images
+                # Stack original and reconstructed images vertically
+                comparison = torch.cat([d[:n], x_hat[:n]])
+                grid = make_grid(comparison, nrow=n, normalize=True, value_range=(0, 1))
+                writer.add_image(
+                    "Val/Reconstruction (Top: Orig, Bot: Rec)", grid, epoch
+                )
+
             num_pixels = d.size(0) * d.size(2) * d.size(3)
             bpp_val = compute_bpp(out_net, num_pixels)
             mse_val = F.mse_loss(x_hat, d)
@@ -212,6 +224,11 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
         logger.info(
             f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
         )
+        if writer:
+            writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
+            writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
+            writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
+
     return loss_meter.avg
 
 
@@ -223,7 +240,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     p.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
-    p.add_argument("--lambda", dest="lmbda", type=float, default=0.0018)
+    p.add_argument("--lambda", dest="lmbda", type=float, default=None)
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--checkpoint", type=str)
@@ -231,17 +248,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=2026)
 
     args = p.parse_args()
-
-    # Document MS-SSIM scaling clearly for reproducibility
-    if args.metric == "ms-ssim" and args.lmbda < 1.0:
-        scaled_lambda = args.lmbda * 65025  # Heuristic 255^2 scale
-        print(f"================================================================")
-        print(f"WARNING: MS-SSIM Metric selected with small lambda ({args.lmbda}).")
-        print(f"Scaling lambda to {scaled_lambda} to prevent blank collapse.")
-        print(f"Note: Be sure to mention this heuristic in your paper appendix!")
-        print(f"================================================================")
-        args.lmbda = scaled_lambda
-
     return args
 
 
