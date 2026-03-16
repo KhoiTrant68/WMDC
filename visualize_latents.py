@@ -2,6 +2,7 @@ import argparse
 
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
@@ -16,17 +17,23 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = WMDC(N=192, M=320, num_slices=5).to(device)
-    model.load_state_dict(
-        torch.load(args.checkpoint, map_location=device)["state_dict"]
-    )
+
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
     model.update(force=True)
 
     img = Image.open(args.image).convert("RGB")
     x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
+    H, W = x.size(2), x.size(3)
+    pad_h = (64 - H % 64) % 64
+    pad_w = (64 - W % 64) % 64
+    x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
     with torch.no_grad():
-        out_enc = model.compress(x)
+        out_enc = model.compress(x_padded)
+
         # We hook into `decompress` where GaussianConditional processes the bitstrings
         latents = []
 
@@ -37,19 +44,26 @@ def main():
             latents.append(spatial_heatmap)
 
         hook_handle = model.gaussian_conditional.register_forward_hook(hook_fn)
-        _ = model.decompress(
-            out_enc["strings"], out_enc["shape"], out_enc["original_shape"]
-        )
+
+        _ = model.decompress(out_enc["strings"], out_enc["shape"])
         hook_handle.remove()
 
     fig, axes = plt.subplots(1, 6, figsize=(18, 3))
-    axes[0].imshow(img)
+
+    # Show original unpadded image
+    orig_np = x.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    axes[0].imshow(orig_np)
     axes[0].set_title("Original Image")
     axes[0].axis("off")
 
     for i in range(5):
         hm = latents[i].numpy()
-        axes[i + 1].imshow(hm, cmap="magma", interpolation="nearest")
+
+        # To make visuals clean, crop off the padding from the feature map representation
+        latent_h, latent_w = H // 16, W // 16
+        hm_cropped = hm[:latent_h, :latent_w]
+
+        axes[i + 1].imshow(hm_cropped, cmap="magma", interpolation="nearest")
         axes[i + 1].set_title(f"Slice {i+1} Latent")
         axes[i + 1].axis("off")
 

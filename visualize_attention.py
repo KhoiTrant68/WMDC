@@ -56,16 +56,27 @@ def main():
         img = Image.open(img_path).convert("RGB")
         x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            _ = model(x)
-
-        # 1. Grab attention
-        probs = model.eot_attention[args.slice].attn_probs.squeeze(0).cpu()
-
-        # 2. Extract internal padded shape from the model logic to reconstruct the feature map precisely
         H, W = x.size(2), x.size(3)
         pad_h = (64 - H % 64) % 64
         pad_w = (64 - W % 64) % 64
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+        attn_maps = []
+
+        def hook_fn(module, input, output):
+            attn_maps.append(module.attn_probs.detach().cpu())
+
+        hook = model.eot_attention.register_forward_hook(hook_fn)
+
+        with torch.no_grad():
+            _ = model(x_padded)
+
+        hook.remove()
+
+        # Grab attention for the requested autoregressive slice
+        probs = attn_maps[args.slice].squeeze(0)
+
+        # Extract internal padded shape from the model logic to reconstruct the feature map precisely
         padded_h, padded_w = H + pad_h, W + pad_w
         latent_h, latent_w = padded_h // 16, padded_w // 16
 

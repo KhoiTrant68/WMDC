@@ -108,16 +108,25 @@ class SpatialDispersionEOTAttention(nn.Module):
         P = torch.exp(logits.clamp(max=0.0))
         # Force strict sum-to-1 along the dictionary dimension to prevent unscaled features
         P = P / (P.sum(dim=-1, keepdim=True) + 1e-8)
-        self.attn_probs = P.detach()
+
+        # Save for visualization hooks
+        self.attn_probs = P
 
         out_bmm = torch.bmm(P, v)  # (B, HW, D)
         out = out_bmm.transpose(1, 2).view(B, -1, H, W)
 
         if self.training:
-            # Detach P here to avoid sending gradients through the unstable Sinkhorn loop
-            v_expanded = v.unsqueeze(1)
-            out_expanded = out_bmm.detach().unsqueeze(2)
-            dist_sq = torch.sum((v_expanded - out_expanded) ** 2, dim=-1)
+            # =====================================================================
+            # [CRITICAL FIX]: Pull dictionary vectors towards the input queries (q),
+            # not the output. This acts as a robust commitment/dispersion loss.
+            # =====================================================================
+            q_expanded = q.unsqueeze(2)  # (B, HW, 1, D)
+            v_expanded = v.unsqueeze(1)  # (B, 1, dict_num, D)
+
+            # Distance between query and dictionary vectors
+            dist_sq = torch.sum(
+                (q_expanded - v_expanded) ** 2, dim=-1
+            )  # (B, HW, dict_num)
             dispersion_loss = torch.mean(torch.sum(P.detach() * dist_sq, dim=2))
         else:
             dispersion_loss = torch.tensor(0.0, device=x.device)
