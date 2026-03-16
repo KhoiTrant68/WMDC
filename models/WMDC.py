@@ -16,7 +16,14 @@ from modules.wavelet_blocks import FrequencyDisentangledMamba
 
 
 class WMDC(CompressionModel):
-    def __init__(self, N=192, M=320, num_slices=5, dict_head_num=20, dict_num=128):
+    def __init__(
+        self,
+        N=192,
+        M=320,
+        num_slices=5,
+        dict_head_num=20,
+        dict_num=128,
+    ):
         super().__init__()
         self.N = N
         self.M = M
@@ -75,14 +82,15 @@ class WMDC(CompressionModel):
         # Spatially-Adaptive Sinkhorn Entropy Predictor
         # =========================================================================
         self.eps_predictor = nn.Sequential(
-            nn.Conv2d(192, 64, 1),
+            nn.Conv2d(2 * M, 64, 1),
             nn.GELU(),
             nn.Conv2d(64, 1, 1),  # Predicts 1 channel for spatial epsilon
         )
 
         # =========================================================================
-        # SHARED Markovian Architecture
+        # SHARED Markovian Architecture (Eliminates O(K^2) Bloat)
         # =========================================================================
+        # Only 1 EOT Attention needed now!
         self.eot_attention = SpatialDispersionEOTAttention(
             input_dim=2 * M
             + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
@@ -132,7 +140,6 @@ class WMDC(CompressionModel):
             nn.Conv2d(128, self.slice_ch, 3, 1, 1),
         )
 
-    # Padding and auxiliary methods remain identical
     def _pad_for_model(self, x, p=64):
         H, W = x.size(2), x.size(3)
         pad_h = (p - H % p) % p
@@ -178,8 +185,8 @@ class WMDC(CompressionModel):
         total_dispersion = 0.0
         B, _, H, W = y_slices[0].shape
 
-        # Predict spatial Sinkhorn epsilon from hyperprior (ensure strict positivity)
-        spatial_epsilon = F.softplus(self.eps_predictor(z_hat)) + 1e-4
+        #  Spatial Sinkhorn epsilon from hyperprior (perfect resolution match)
+        spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
 
         # Initialize Markovian state as zeros
         memory_state = torch.zeros(B, self.slice_ch, H, W, device=y.device)
@@ -239,7 +246,9 @@ class WMDC(CompressionModel):
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
         B, _, H, W = y_slices[0].shape
-        spatial_epsilon = F.softplus(self.eps_predictor(z_hat)) + 1e-4
+
+        # Predict from hyperprior
+        spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
         memory_state = torch.zeros(B, self.slice_ch, H, W, device=y.device)
 
         for i, y_slice in enumerate(y_slices):
@@ -288,14 +297,12 @@ class WMDC(CompressionModel):
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
         B = z_hat.size(0)
-        H, W = shape
-        # In decompress, latent dims match the shape of z_hat
-        latent_H, latent_W = (
-            z_hat.size(2) * 4,
-            z_hat.size(3) * 4,
-        )  # Because h_scale_s upsamples by 4x
 
-        spatial_epsilon = F.softplus(self.eps_predictor(z_hat)) + 1e-4
+        # In decompress, latent dims match the shape of z_hat (scaled up 4x via h_scale_s)
+        latent_H, latent_W = z_hat.size(2) * 4, z_hat.size(3) * 4
+
+        # Predict from hyperprior
+        spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
         memory_state = torch.zeros(
             B, self.slice_ch, latent_H, latent_W, device=z_hat.device
         )
