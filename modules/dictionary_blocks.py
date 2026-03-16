@@ -40,6 +40,10 @@ class QueryDictionaryGenerator(nn.Module):
 
 
 class SpatialDispersionEOTAttention(nn.Module):
+    """
+    Integrates Spatially-Adaptive Cost Regularization and Dispersion Penalization.
+    """
+
     def __init__(
         self,
         input_dim,
@@ -58,7 +62,7 @@ class SpatialDispersionEOTAttention(nn.Module):
         self.k_proj = nn.Linear(dict_dim, dict_dim)
         self.v_proj = nn.Linear(dict_dim, dict_dim)
 
-        # FIX 1: Boundary leakage solved by 'reflect' padding
+        # Boundary leakage solved by 'reflect' padding
         self.spatial_smooth = nn.Conv2d(
             dict_num,
             dict_num,
@@ -95,11 +99,9 @@ class SpatialDispersionEOTAttention(nn.Module):
         C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2)
 
         # 2. Format spatial epsilon for broadcasting
-        # To avoid division by zero
         eps_spatial = spatial_epsilon.view(B, H * W, 1).clamp(min=1e-4)  # (B, HW, 1)
-        eps_mean = (
-            spatial_epsilon.mean(dim=(2, 3)).unsqueeze(-1).clamp(min=1e-4)
-        )  # (B, 1)
+
+        eps_mean = spatial_epsilon.mean(dim=(2, 3)).clamp(min=1e-4)  # (B, 1)
 
         # 3. Semi-Unbalanced Sinkhorn Iterations
         u = torch.zeros_like(C_mat[:, :, 0])  # (B, HW)
@@ -108,13 +110,11 @@ class SpatialDispersionEOTAttention(nn.Module):
         # Sinkhorn Resolution Invariance via Log-Mean-Exp
         target_marginal = math.log(1.0 / self.dict_num)
         hw_log = math.log(H * W)
-        tau_ratio = self.tau / (
-            self.tau + eps_mean
-        )  # Ratio now considers mean spatial entropy
+        tau_ratio = self.tau / (self.tau + eps_mean)  # (B, 1)
 
         for _ in range(self.iters):
             # Query update: Pixel-specific soft-routing
-            u = eps_spatial.squeeze(2) * (
+            u = eps_spatial.squeeze(-1) * (
                 -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / eps_spatial, dim=2)
             )
 
