@@ -40,24 +40,17 @@ class QueryDictionaryGenerator(nn.Module):
 
 
 class SpatialDispersionEOTAttention(nn.Module):
-    """
-    Integrates Spatial Cost Regularization (prevents spatial bitrate leakage)
-    and Dispersion Penalization (prevents 'drab'/blurry latents).
-    """
-
     def __init__(
         self,
         input_dim,
         output_dim,
         dict_num=128,
         dict_dim=640,
-        epsilon=0.05,
         tau=0.5,
         iters=3,
     ):
         super().__init__()
         self.dict_num = dict_num
-        self.epsilon = epsilon
         self.tau = tau
         self.iters = iters
 
@@ -65,9 +58,15 @@ class SpatialDispersionEOTAttention(nn.Module):
         self.k_proj = nn.Linear(dict_dim, dict_dim)
         self.v_proj = nn.Linear(dict_dim, dict_dim)
 
-        # Enforces local spatial coherence in dictionary assignments, slashing BPP
+        # FIX 1: Boundary leakage solved by 'reflect' padding
         self.spatial_smooth = nn.Conv2d(
-            dict_num, dict_num, kernel_size=3, padding=1, groups=dict_num, bias=False
+            dict_num,
+            dict_num,
+            kernel_size=3,
+            padding=1,
+            groups=dict_num,
+            bias=False,
+            padding_mode="reflect",
         )
         self.spatial_smooth.weight.data.fill_(1.0 / 9.0)
         self.spatial_smooth.weight.requires_grad = False
@@ -78,7 +77,7 @@ class SpatialDispersionEOTAttention(nn.Module):
             nn.Conv2d(dict_dim, output_dim, 1),
         )
 
-    def forward(self, x, dt):
+    def forward(self, x, dt, spatial_epsilon):
         B, C, H, W = x.shape
 
         q = self.q_proj(x).view(B, -1, H * W).transpose(1, 2)  # (B, HW, D)
@@ -95,37 +94,49 @@ class SpatialDispersionEOTAttention(nn.Module):
         C_spatial = self.spatial_smooth(C_spatial)
         C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2)
 
-        # 2. Semi-Unbalanced Sinkhorn Iterations
+        # 2. Format spatial epsilon for broadcasting
+        # To avoid division by zero
+        eps_spatial = spatial_epsilon.view(B, H * W, 1).clamp(min=1e-4)  # (B, HW, 1)
+        eps_mean = (
+            spatial_epsilon.mean(dim=(2, 3)).unsqueeze(-1).clamp(min=1e-4)
+        )  # (B, 1)
+
+        # 3. Semi-Unbalanced Sinkhorn Iterations
         u = torch.zeros_like(C_mat[:, :, 0])  # (B, HW)
         v_vec = torch.zeros_like(C_mat[:, 0, :])  # (B, N)
 
-        # RESOLUTION INVARIANT: Target marginal must be an intensive property
+        # Sinkhorn Resolution Invariance via Log-Mean-Exp
         target_marginal = math.log(1.0 / self.dict_num)
-        tau_ratio = self.tau / (self.tau + self.epsilon)
+        hw_log = math.log(H * W)
+        tau_ratio = self.tau / (
+            self.tau + eps_mean
+        )  # Ratio now considers mean spatial entropy
 
         for _ in range(self.iters):
-            # Query
-            u = self.epsilon * (
-                -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / self.epsilon, dim=2)
+            # Query update: Pixel-specific soft-routing
+            u = eps_spatial.squeeze(2) * (
+                -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / eps_spatial, dim=2)
             )
 
-            # Key
-            v_unbalanced = self.epsilon * target_marginal + self.epsilon * (
-                -torch.logsumexp((-C_mat + u.unsqueeze(2)) / self.epsilon, dim=1)
+            # Key update: Unbalanced marginal alignment. Shift sum by hw_log to ensure
+            # the attention gradients don't crash when image resolution changes!
+            v_unbalanced = target_marginal * eps_mean + eps_mean * (
+                -(
+                    torch.logsumexp((-C_mat + u.unsqueeze(2)) / eps_spatial, dim=1)
+                    - hw_log
+                )
             )
             v_vec = tau_ratio * v_unbalanced
 
-        # 3. Optimal Transport Plan
-        P = torch.exp((-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / self.epsilon)
+        # 4. Optimal Transport Plan
+        P = torch.exp((-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps_spatial)
+        self.attn_probs = P.detach()  # Explicitly save for visualization
 
-        self.attn_probs = P.detach()
-
-        # 4. Gather Dictionary Values & Project
+        # 5. Gather Dictionary Values & Project
         out_bmm = torch.bmm(P, v)  # (B, HW, D)
         out = out_bmm.transpose(1, 2).view(B, -1, H, W)
 
-        # 5. DISPERSION PENALIZATION (Calculated during training only)
-        # Prevents "drab" mixing by penalizing intra-cluster variance
+        # 6. DISPERSION PENALIZATION
         if self.training:
             out_detached = out_bmm.detach()
             v_expanded = v.unsqueeze(1)  # (B, 1, N, D)

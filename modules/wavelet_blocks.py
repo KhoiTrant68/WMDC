@@ -66,7 +66,11 @@ class IDWT_2D(nn.Module):
 
 
 class FrequencyDisentangledMamba(nn.Module):
-    """FD-SSM: Routes Smooth LL to Mamba, and Periodic HF to local CNN."""
+    """
+    Cross-Frequency Mamba Modulation.
+    Routes Smooth LL to Mamba, while Periodic HF components dynamically shift
+    and scale the Mamba states (FiLM), achieving true frequency-disentangled fusion.
+    """
 
     def __init__(self, dim, drop_path=0.1):
         super().__init__()
@@ -75,10 +79,11 @@ class FrequencyDisentangledMamba(nn.Module):
 
         self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
 
+        # Predicts both Gamma and Beta for FiLM modulation
         self.hf_conv = nn.Sequential(
             nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, groups=dim * 3),
             nn.GELU(),
-            nn.Conv2d(dim * 3, dim * 3, kernel_size=1),
+            nn.Conv2d(dim * 3, dim * 2, kernel_size=1),
         )
 
         self.fusion = nn.Sequential(
@@ -90,12 +95,23 @@ class FrequencyDisentangledMamba(nn.Module):
 
     def forward(self, x):
         identity = self.skip(x)
+
+        # 1. Frequency Decomposition
         x_dwt = self.dwt(x)
 
+        # 2. Long-Range Global Structure Extraction
         x_ll_out = self.ll_mamba(x_dwt[:, : x.size(1)])
-        x_hf_out = self.hf_conv(x_dwt[:, x.size(1) :])
 
-        merged = torch.cat([x_ll_out, x_hf_out], dim=1)
+        # 3. Local High-Frequency Context Modulators
+        hf_gamma_beta = self.hf_conv(x_dwt[:, x.size(1) :])
+        gamma, beta = hf_gamma_beta.chunk(2, dim=1)
+
+        # 4. Cross-Frequency Spatial Modulation (FiLM)
+        # Allows edges (HF) to govern how flat regions (LL) are represented
+        x_ll_modulated = x_ll_out * (1 + gamma) + beta
+
+        # 5. Fusion and Inverse Wavelet Transform
+        merged = torch.cat([x_ll_modulated, x_dwt[:, x.size(1) :]], dim=1)
         fused = self.fusion(merged) + merged
 
         out = self.idwt(fused)

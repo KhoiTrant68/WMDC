@@ -16,24 +16,16 @@ from modules.wavelet_blocks import FrequencyDisentangledMamba
 
 
 class WMDC(CompressionModel):
-    def __init__(
-        self,
-        N=192,
-        M=320,
-        num_slices=5,
-        max_support_slices=5,
-        dict_head_num=20,
-        dict_num=128,
-    ):
+    def __init__(self, N=192, M=320, num_slices=5, dict_head_num=20, dict_num=128):
         super().__init__()
         self.N = N
         self.M = M
         self.num_slices = num_slices
-        self.max_support_slices = max_support_slices
         self.slice_ch = M // num_slices
         self.dict_num = dict_num
         self.dict_dim = 32 * dict_head_num
 
+        # --- Encoders / Decoders ---
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
             FrequencyDisentangledMamba(N, drop_path=0.1),
@@ -79,89 +71,68 @@ class WMDC(CompressionModel):
             in_dim=192, dict_num=self.dict_num, dict_dim=self.dict_dim, num_heads=4
         )
 
-        self.eot_attention = nn.ModuleList(
-            SpatialDispersionEOTAttention(
-                input_dim=2 * M + self.slice_ch * min(i, self.max_support_slices),
-                output_dim=M,
-                dict_num=self.dict_num,
-                dict_dim=self.dict_dim,
-                epsilon=0.05,
-                tau=0.5,
-                iters=3,
-            )
-            for i in range(num_slices)
+        # =========================================================================
+        # Spatially-Adaptive Sinkhorn Entropy Predictor
+        # =========================================================================
+        self.eps_predictor = nn.Sequential(
+            nn.Conv2d(192, 64, 1),
+            nn.GELU(),
+            nn.Conv2d(64, 1, 1),  # Predicts 1 channel for spatial epsilon
         )
 
-        self.spatial_context = nn.ModuleList(
-            (
-                nn.Sequential(
-                    nn.Conv2d(
-                        self.slice_ch * min(i, self.max_support_slices),
-                        self.slice_ch * min(i, self.max_support_slices),
-                        kernel_size=5,
-                        padding=2,
-                        groups=self.slice_ch * min(i, self.max_support_slices),
-                    ),
-                    nn.GELU(),
-                    nn.Conv2d(
-                        self.slice_ch * min(i, self.max_support_slices),
-                        self.slice_ch * min(i, self.max_support_slices),
-                        kernel_size=1,
-                    ),
-                )
-                if i > 0
-                else nn.Identity()
-            )
-            for i in range(num_slices)
+        # =========================================================================
+        # SHARED Markovian Architecture
+        # =========================================================================
+        self.eot_attention = SpatialDispersionEOTAttention(
+            input_dim=2 * M
+            + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
+            output_dim=M,
+            dict_num=self.dict_num,
+            dict_dim=self.dict_dim,
+            tau=0.5,
+            iters=3,
         )
 
-        self.cc_mean_transforms = nn.ModuleList(
-            nn.Sequential(
-                nn.Conv2d(
-                    3 * M + self.slice_ch * min(i, self.max_support_slices), 128, 1
-                ),
-                nn.GELU(),
-                nn.Conv2d(128, 224, 3, 1, 1),
-                nn.GELU(),
-                nn.Conv2d(224, 128, 3, 1, 1),
-                nn.GELU(),
-                nn.Conv2d(128, self.slice_ch, 3, 1, 1),
-            )
-            for i in range(num_slices)
+        self.memory_updater = nn.Sequential(
+            nn.Conv2d(self.slice_ch * 2, self.slice_ch, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(self.slice_ch, self.slice_ch, kernel_size=3, padding=1),
         )
 
-        self.cc_scale_transforms = nn.ModuleList(
-            nn.Sequential(
-                nn.Conv2d(
-                    3 * M + self.slice_ch * min(i, self.max_support_slices), 128, 1
-                ),
-                nn.GELU(),
-                nn.Conv2d(128, 224, 3, 1, 1),
-                nn.GELU(),
-                nn.Conv2d(224, 128, 3, 1, 1),
-                nn.GELU(),
-                nn.Conv2d(128, self.slice_ch, 3, 1, 1),
-            )
-            for i in range(num_slices)
+        shared_input_dim = 3 * M + self.slice_ch  # query + dict_info
+
+        # Single shared transforms for all slices!
+        self.cc_mean_transform = nn.Sequential(
+            nn.Conv2d(shared_input_dim, 128, 1),
+            nn.GELU(),
+            nn.Conv2d(128, 224, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(224, 128, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(128, self.slice_ch, 3, 1, 1),
         )
 
-        self.lrp_transforms = nn.ModuleList(
-            nn.Sequential(
-                nn.Conv2d(
-                    3 * M + self.slice_ch * min(i + 1, self.max_support_slices + 1),
-                    128,
-                    1,
-                ),
-                nn.GELU(),
-                nn.Conv2d(128, 224, 3, 1, 1),
-                nn.GELU(),
-                nn.Conv2d(224, 128, 3, 1, 1),
-                nn.GELU(),
-                nn.Conv2d(128, self.slice_ch, 3, 1, 1),
-            )
-            for i in range(num_slices)
+        self.cc_scale_transform = nn.Sequential(
+            nn.Conv2d(shared_input_dim, 128, 1),
+            nn.GELU(),
+            nn.Conv2d(128, 224, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(224, 128, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(128, self.slice_ch, 3, 1, 1),
         )
 
+        self.lrp_transform = nn.Sequential(
+            nn.Conv2d(shared_input_dim + self.slice_ch, 128, 1),
+            nn.GELU(),
+            nn.Conv2d(128, 224, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(224, 128, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(128, self.slice_ch, 3, 1, 1),
+        )
+
+    # Padding and auxiliary methods remain identical
     def _pad_for_model(self, x, p=64):
         H, W = x.size(2), x.size(3)
         pad_h = (p - H % p) % p
@@ -205,28 +176,25 @@ class WMDC(CompressionModel):
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
         total_dispersion = 0.0
+        B, _, H, W = y_slices[0].shape
+
+        # Predict spatial Sinkhorn epsilon from hyperprior (ensure strict positivity)
+        spatial_epsilon = F.softplus(self.eps_predictor(z_hat)) + 1e-4
+
+        # Initialize Markovian state as zeros
+        memory_state = torch.zeros(B, self.slice_ch, H, W, device=y.device)
 
         for i, y_slice in enumerate(y_slices):
-            support_slices = (
-                y_hat_slices
-                if self.max_support_slices < 0
-                else y_hat_slices[-self.max_support_slices :]
-            )
+            # Query memory state (O(1) footprint) instead of concatenating all slices
+            query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            if len(support_slices) > 0:
-                spatial_ctx = self.spatial_context[i](torch.cat(support_slices, dim=1))
-                query = torch.cat([hyper_prior, spatial_ctx], dim=1)
-            else:
-                query = hyper_prior
-
-            # Unpack EOT tuple
-            dict_info, disp_loss = self.eot_attention[i](query, dt)
+            dict_info, disp_loss = self.eot_attention(query, dt, spatial_epsilon)
             total_dispersion += disp_loss
 
             support = torch.cat([query, dict_info], dim=1)
 
-            mu = self.cc_mean_transforms[i](support)
-            scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
+            mu = self.cc_mean_transform(support)
+            scale = torch.clamp(self.cc_scale_transform(support), min=0.11)
 
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
                 y_slice, scale, means=mu
@@ -235,9 +203,13 @@ class WMDC(CompressionModel):
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transforms[i](lrp_support)
+                self.lrp_transform(lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
+
+            # Update Markovian Memory State for the next slice
+            state_input = torch.cat([memory_state, y_hat_slice], dim=1)
+            memory_state = memory_state + self.memory_updater(state_input)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
         x_hat = self._crop_to_original(x_hat, original_shape)
@@ -266,25 +238,19 @@ class WMDC(CompressionModel):
         y_hat_slices, y_strings = [], []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
+        B, _, H, W = y_slices[0].shape
+        spatial_epsilon = F.softplus(self.eps_predictor(z_hat)) + 1e-4
+        memory_state = torch.zeros(B, self.slice_ch, H, W, device=y.device)
+
         for i, y_slice in enumerate(y_slices):
-            support_slices = (
-                y_hat_slices
-                if self.max_support_slices < 0
-                else y_hat_slices[-self.max_support_slices :]
-            )
+            query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            if len(support_slices) > 0:
-                spatial_ctx = self.spatial_context[i](torch.cat(support_slices, dim=1))
-                query = torch.cat([hyper_prior, spatial_ctx], dim=1)
-            else:
-                query = hyper_prior
-
-            # Tuple unpacking, discard dispersion loss during inference
-            dict_info, _ = self.eot_attention[i](query, dt)
+            # Discard dispersion loss during inference
+            dict_info, _ = self.eot_attention(query, dt, spatial_epsilon)
             support = torch.cat([query, dict_info], dim=1)
 
-            mu = self.cc_mean_transforms[i](support)
-            scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
+            mu = self.cc_mean_transform(support)
+            scale = torch.clamp(self.cc_scale_transform(support), min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
             y_string = self.gaussian_conditional.compress(y_slice, index, means=mu)
@@ -293,11 +259,15 @@ class WMDC(CompressionModel):
             y_hat_slice = self.gaussian_conditional.decompress(
                 y_string, index, means=mu
             )
+
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transforms[i](lrp_support)
+                self.lrp_transform(lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
+
+            state_input = torch.cat([memory_state, y_hat_slice], dim=1)
+            memory_state = memory_state + self.memory_updater(state_input)
 
         return {
             "strings": [y_strings, z_strings],
@@ -317,25 +287,27 @@ class WMDC(CompressionModel):
         y_hat_slices = []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
+        B = z_hat.size(0)
+        H, W = shape
+        # In decompress, latent dims match the shape of z_hat
+        latent_H, latent_W = (
+            z_hat.size(2) * 4,
+            z_hat.size(3) * 4,
+        )  # Because h_scale_s upsamples by 4x
+
+        spatial_epsilon = F.softplus(self.eps_predictor(z_hat)) + 1e-4
+        memory_state = torch.zeros(
+            B, self.slice_ch, latent_H, latent_W, device=z_hat.device
+        )
+
         for i in range(self.num_slices):
-            support_slices = (
-                y_hat_slices
-                if self.max_support_slices < 0
-                else y_hat_slices[-self.max_support_slices :]
-            )
+            query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            if len(support_slices) > 0:
-                spatial_ctx = self.spatial_context[i](torch.cat(support_slices, dim=1))
-                query = torch.cat([hyper_prior, spatial_ctx], dim=1)
-            else:
-                query = hyper_prior
-
-            # Tuple unpacking, discard dispersion loss during inference
-            dict_info, _ = self.eot_attention[i](query, dt)
+            dict_info, _ = self.eot_attention(query, dt, spatial_epsilon)
             support = torch.cat([query, dict_info], dim=1)
 
-            mu = self.cc_mean_transforms[i](support)
-            scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
+            mu = self.cc_mean_transform(support)
+            scale = torch.clamp(self.cc_scale_transform(support), min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
             y_hat_slice = self.gaussian_conditional.decompress(
@@ -344,9 +316,12 @@ class WMDC(CompressionModel):
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transforms[i](lrp_support)
+                self.lrp_transform(lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
+
+            state_input = torch.cat([memory_state, y_hat_slice], dim=1)
+            memory_state = memory_state + self.memory_updater(state_input)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
