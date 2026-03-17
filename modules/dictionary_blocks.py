@@ -63,7 +63,7 @@ class SpatialDispersionEOTAttention(nn.Module):
             nn.Conv2d(dict_dim, output_dim, 1),
         )
 
-    def forward(self, x, k, v, spatial_epsilon):
+    def forward(self, x, k, v, spatial_epsilon, calc_disp=False):
         """
         Accepts precomputed `k` and `v` to save redundant linear projections during slice iteration.
         """
@@ -79,22 +79,24 @@ class SpatialDispersionEOTAttention(nn.Module):
         C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2)
 
         eps_spatial = spatial_epsilon.view(B, H * W, 1).clamp(min=1e-4)
-        eps_mean = spatial_epsilon.mean(dim=(2, 3)).clamp(min=1e-4)
+        eps_global = spatial_epsilon.mean(dim=(2, 3)).view(B, 1, 1).clamp(min=1e-4)
 
         u = torch.zeros_like(C_mat[:, :, 0])
         v_vec = torch.zeros_like(C_mat[:, 0, :])
 
         target_marginal = math.log(1.0 / self.dict_num)
         hw_log = math.log(H * W)
-        tau_ratio = self.tau / (self.tau + eps_mean)
+        tau_ratio = self.tau / (self.tau + eps_global.squeeze(-1))  # [B, 1]
 
         for _ in range(self.iters):
-            u = eps_spatial.squeeze(-1) * (
-                -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / eps_spatial, dim=2)
+            u = eps_global.squeeze(-1) * (
+                -torch.logsumexp((-C_mat + v_vec.unsqueeze(1)) / eps_global, dim=2)
             )
-            v_unbalanced = target_marginal * eps_mean + eps_mean * (
+            v_unbalanced = target_marginal * eps_global.squeeze(
+                -1
+            ) + eps_global.squeeze(-1) * (
                 -(
-                    torch.logsumexp((-C_mat + u.unsqueeze(2)) / eps_spatial, dim=1)
+                    torch.logsumexp((-C_mat + u.unsqueeze(2)) / eps_global, dim=1)
                     - hw_log
                 )
             )
@@ -104,29 +106,21 @@ class SpatialDispersionEOTAttention(nn.Module):
         # Sinkhorn Marginal Normalization and Safe Exp
         # =====================================================================
         logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps_spatial
-        # Clamp guards against float16/float32 explosion
-        P = torch.exp(logits.clamp(max=0.0))
-        # Force strict sum-to-1 along the dictionary dimension to prevent unscaled features
-        P = P / (P.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Save for visualization hooks
+        # Epsilon-Relaxed Normalization preserves Unbalanced Mass
+        P = torch.exp(logits.clamp(max=0.0))
+        P = P / (P.sum(dim=-1, keepdim=True) + eps_spatial)
+
         self.attn_probs = P
 
         out_bmm = torch.bmm(P, v)  # (B, HW, D)
         out = out_bmm.transpose(1, 2).view(B, -1, H, W)
 
-        if self.training:
-            # =====================================================================
-            # [CRITICAL FIX]: Pull dictionary vectors towards the input queries (q),
-            # not the output. This acts as a robust commitment/dispersion loss.
-            # =====================================================================
+        if self.training and calc_disp:
             q_expanded = q.unsqueeze(2)  # (B, HW, 1, D)
             v_expanded = v.unsqueeze(1)  # (B, 1, dict_num, D)
-
             # Distance between query and dictionary vectors
-            dist_sq = torch.sum(
-                (q_expanded - v_expanded) ** 2, dim=-1
-            )  # (B, HW, dict_num)
+            dist_sq = torch.sum((q_expanded - v_expanded) ** 2, dim=-1)
             dispersion_loss = torch.mean(torch.sum(P.detach() * dist_sq, dim=2))
         else:
             dispersion_loss = torch.tensor(0.0, device=x.device)

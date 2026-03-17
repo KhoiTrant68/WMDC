@@ -107,10 +107,19 @@ class WMDC(CompressionModel):
             iters=3,
         )
 
-        self.memory_updater = nn.Sequential(
-            nn.Conv2d(self.slice_ch * 2, self.slice_ch, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(self.slice_ch, self.slice_ch, kernel_size=3, padding=1),
+        # Use separate memory updaters per slice to increase capacity
+        # and allow tracking unique residual evolutions across the 5 steps.
+        self.memory_updaters = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        self.slice_ch * 2, self.slice_ch, kernel_size=3, padding=1
+                    ),
+                    nn.GELU(),
+                    nn.Conv2d(self.slice_ch, self.slice_ch, kernel_size=3, padding=1),
+                )
+                for _ in range(num_slices)
+            ]
         )
 
         shared_input_dim = 3 * M + self.slice_ch  # query + dict_info
@@ -205,11 +214,14 @@ class WMDC(CompressionModel):
         for i, y_slice in enumerate(y_slices):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            # Updated signature passing cached k_dict and v_dict
+            # Only calculate dispersion loss on Slice 0 (base structural slice)
+            # This prevents opposing gradients from high-frequency slices washing out the dictionary.
             dict_info, disp_loss = self.eot_attention(
-                query, k_dict, v_dict, spatial_epsilon
+                query, k_dict, v_dict, spatial_epsilon, calc_disp=(i == 0)
             )
-            total_dispersion += disp_loss
+
+            if i == 0:
+                total_dispersion = disp_loss
 
             support = torch.cat([query, dict_info], dim=1)
 
@@ -228,7 +240,8 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
             state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-            memory_state = memory_state + self.memory_updater(state_input)
+            # Use the slice-specific memory updater
+            memory_state = memory_state + self.memory_updaters[i](state_input)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
 
@@ -236,7 +249,7 @@ class WMDC(CompressionModel):
             "x_hat": x_hat,
             "likelihoods": {"y": torch.cat(y_likelihood, dim=1), "z": z_likelihoods},
             "aux_loss": self.aux_loss(),
-            "dispersion_loss": total_dispersion / self.num_slices,
+            "dispersion_loss": total_dispersion,
         }
 
     def compress(self, x):
@@ -268,7 +281,10 @@ class WMDC(CompressionModel):
         for i, y_slice in enumerate(y_slices):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attention(query, k_dict, v_dict, spatial_epsilon)
+            # Explicitly disable dispersion loss computation during compression
+            dict_info, _ = self.eot_attention(
+                query, k_dict, v_dict, spatial_epsilon, calc_disp=False
+            )
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
@@ -289,7 +305,7 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
             state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-            memory_state = memory_state + self.memory_updater(state_input)
+            memory_state = memory_state + self.memory_updaters[i](state_input)
 
         return {
             "strings": [y_strings, z_strings],
@@ -318,7 +334,9 @@ class WMDC(CompressionModel):
         for i in range(self.num_slices):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attention(query, k_dict, v_dict, spatial_epsilon)
+            dict_info, _ = self.eot_attention(
+                query, k_dict, v_dict, spatial_epsilon, calc_disp=False
+            )
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
@@ -336,7 +354,7 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
             state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-            memory_state = memory_state + self.memory_updater(state_input)
+            memory_state = memory_state + self.memory_updaters[i](state_input)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
