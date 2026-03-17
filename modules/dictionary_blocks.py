@@ -26,7 +26,7 @@ class QueryDictionaryGenerator(nn.Module):
     def forward(self, z_hat):
         B, C, H, W = z_hat.shape
         context = z_hat + self.pos_enc(z_hat)
-        context = context.view(B, C, H * W).transpose(1, 2)
+        context = context.view(B, C, H * W).transpose(1, 2).contiguous()
         queries = self.dict_queries.expand(B, -1, -1)
 
         attn_out, _ = self.cross_attn(query=queries, key=context, value=context)
@@ -68,15 +68,17 @@ class SpatialDispersionEOTAttention(nn.Module):
         Accepts precomputed `k` and `v` to save redundant linear projections during slice iteration.
         """
         B, C, H, W = x.shape
-        q = self.q_proj(x).view(B, -1, H * W).transpose(1, 2)  # (B, HW, D)
+        q = self.q_proj(x).view(B, -1, H * W).transpose(1, 2).contiguous()  # (B, HW, D)
 
         q_norm = F.normalize(q, p=2, dim=-1)
         k_norm = F.normalize(k, p=2, dim=-1)
-        C_mat = 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))  # (B, HW, N)
 
-        C_spatial = C_mat.transpose(1, 2).view(B, self.dict_num, H, W)
+        k_norm_t = k_norm.transpose(1, 2).contiguous()
+        C_mat = 1.0 - torch.bmm(q_norm, k_norm_t)  # (B, HW, N)
+
+        C_spatial = C_mat.transpose(1, 2).contiguous().view(B, self.dict_num, H, W)
         C_spatial = self.spatial_smooth(C_spatial)
-        C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2)
+        C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2).contiguous()
 
         eps_spatial = spatial_epsilon.view(B, H * W, 1).clamp(min=1e-4)
         eps_global = spatial_epsilon.mean(dim=(2, 3)).view(B, 1, 1).clamp(min=1e-4)
@@ -114,7 +116,8 @@ class SpatialDispersionEOTAttention(nn.Module):
         self.attn_probs = P
 
         out_bmm = torch.bmm(P, v)  # (B, HW, D)
-        out = out_bmm.transpose(1, 2).view(B, -1, H, W)
+
+        out = out_bmm.transpose(1, 2).contiguous().view(B, -1, H, W)
 
         if self.training and calc_disp:
             q_expanded = q.unsqueeze(2)  # (B, HW, 1, D)

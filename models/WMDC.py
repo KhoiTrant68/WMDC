@@ -108,7 +108,9 @@ class WMDC(CompressionModel):
         )
 
         # Use separate memory updaters per slice to increase capacity
-        # and allow tracking unique residual evolutions across the 5 steps.
+        # and allow tracking unique residual evolutions across steps.
+        # We only need (num_slices - 1) updaters.
+        # The final slice does not have a subsequent slice to pass memory to!
         self.memory_updaters = nn.ModuleList(
             [
                 nn.Sequential(
@@ -118,7 +120,7 @@ class WMDC(CompressionModel):
                     nn.GELU(),
                     nn.Conv2d(self.slice_ch, self.slice_ch, kernel_size=3, padding=1),
                 )
-                for _ in range(num_slices)
+                for _ in range(num_slices - 1)
             ]
         )
 
@@ -239,9 +241,11 @@ class WMDC(CompressionModel):
             )
             y_hat_slices.append(y_hat_slice)
 
-            state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-            # Use the slice-specific memory updater
-            memory_state = memory_state + self.memory_updaters[i](state_input)
+            # Do not update memory on the final slice
+            if i < self.num_slices - 1:
+                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
+                # Use the slice-specific memory updater
+                memory_state = memory_state + self.memory_updaters[i](state_input)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
 
@@ -304,8 +308,9 @@ class WMDC(CompressionModel):
             )
             y_hat_slices.append(y_hat_slice)
 
-            state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-            memory_state = memory_state + self.memory_updaters[i](state_input)
+            if i < self.num_slices - 1:
+                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
+                memory_state = memory_state + self.memory_updaters[i](state_input)
 
         return {
             "strings": [y_strings, z_strings],
@@ -326,7 +331,6 @@ class WMDC(CompressionModel):
 
         spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
 
-        # Bootstrap Memory State & Cache Dict Projections
         memory_state = self.init_memory(hyper_prior)
         k_dict = self.k_proj(dt)
         v_dict = self.v_proj(dt)
@@ -353,8 +357,9 @@ class WMDC(CompressionModel):
             )
             y_hat_slices.append(y_hat_slice)
 
-            state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-            memory_state = memory_state + self.memory_updaters[i](state_input)
+            if i < self.num_slices - 1:
+                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
+                memory_state = memory_state + self.memory_updaters[i](state_input)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
