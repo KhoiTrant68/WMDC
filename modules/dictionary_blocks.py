@@ -80,7 +80,6 @@ class SpatialDispersionEOTAttention(nn.Module):
         C_spatial = self.spatial_smooth(C_spatial)
         C_mat = C_spatial.view(B, self.dict_num, H * W).transpose(1, 2).contiguous()
 
-        eps_spatial = spatial_epsilon.view(B, H * W, 1).clamp(min=1e-4)
         eps_global = spatial_epsilon.mean(dim=(2, 3)).view(B, 1, 1).clamp(min=1e-4)
 
         u = torch.zeros_like(C_mat[:, :, 0])
@@ -107,11 +106,13 @@ class SpatialDispersionEOTAttention(nn.Module):
         # =====================================================================
         # Sinkhorn Marginal Normalization and Safe Exp
         # =====================================================================
-        logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps_spatial
+        # Use eps_global consistently for KKT optimality.
+        logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps_global
 
-        # Epsilon-Relaxed Normalization preserves Unbalanced Mass
-        P = torch.exp(logits.clamp(max=0.0))
-        P = P / (P.sum(dim=-1, keepdim=True) + eps_spatial)
+        # Ensure the attention probabilities sum to 1 to preserve feature magnitudes correctly.
+        logits_max = logits.max(dim=-1, keepdim=True)[0]
+        P = torch.exp(logits - logits_max)
+        P = P / (P.sum(dim=-1, keepdim=True) + 1e-6)
 
         self.attn_probs = P
 
@@ -121,9 +122,10 @@ class SpatialDispersionEOTAttention(nn.Module):
 
         if self.training and calc_disp:
             q_expanded = q.unsqueeze(2)  # (B, HW, 1, D)
-            v_expanded = v.unsqueeze(1)  # (B, 1, dict_num, D)
-            # Distance between query and dictionary vectors
-            dist_sq = torch.sum((q_expanded - v_expanded) ** 2, dim=-1)
+            # Penalize distance to the KEY space, not VALUE space.
+            k_expanded = k.unsqueeze(1)  # (B, 1, dict_num, D)
+            # Distance between query and dictionary Key vectors
+            dist_sq = torch.sum((q_expanded - k_expanded) ** 2, dim=-1)
             dispersion_loss = torch.mean(torch.sum(P.detach() * dist_sq, dim=2))
         else:
             dispersion_loss = torch.tensor(0.0, device=x.device)

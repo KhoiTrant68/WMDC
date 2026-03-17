@@ -34,19 +34,20 @@ def main():
     with torch.no_grad():
         out_enc = model.compress(x_padded)
 
-        # We hook into `decompress` where GaussianConditional processes the bitstrings
         latents = []
+        original_decompress = model.gaussian_conditional.decompress
 
-        def hook_fn(module, input, output):
-            # output is the strictly quantized `y_hat_slice` reconstructed from bits
-            y_hat_slice = output.detach().cpu()
-            spatial_heatmap = torch.mean(torch.abs(y_hat_slice), dim=1).squeeze(0)
+        def patched_decompress(*args, **kwargs):
+            y_hat_slice = original_decompress(*args, **kwargs)
+            spatial_heatmap = torch.mean(
+                torch.abs(y_hat_slice.detach().cpu()), dim=1
+            ).squeeze(0)
             latents.append(spatial_heatmap)
+            return y_hat_slice
 
-        hook_handle = model.gaussian_conditional.register_forward_hook(hook_fn)
-
+        model.gaussian_conditional.decompress = patched_decompress
         _ = model.decompress(out_enc["strings"], out_enc["shape"])
-        hook_handle.remove()
+        model.gaussian_conditional.decompress = original_decompress  # Restore original
 
     fig, axes = plt.subplots(1, 6, figsize=(18, 3))
 
