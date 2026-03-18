@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 
 import matplotlib
 import torch
@@ -42,14 +43,23 @@ def main():
     img = Image.open(args.image).convert("RGB")
     x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
+    H, W = x.size(2), x.size(3)
+    pad_h = (64 - H % 64) % 64
+    pad_w = (64 - W % 64) % 64
+    x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
     with torch.no_grad():
-        out_net = model(x)
-        x_hat = out_net["x_hat"].clamp(0, 1)
+        out_net = model(x_padded)
+        x_hat_padded = out_net["x_hat"].clamp(0, 1)
+
+        # Crop back to original dimensions
+        x_hat = x_hat_padded[:, :, :H, :W]
 
         mse = F.mse_loss(x, x_hat)
         psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100
 
-        num_pixels = x.size(2) * x.size(3)
+        # Calculate BPP against original unpadded pixels
+        num_pixels = H * W
         bpp = sum(torch.log(lh).sum() for lh in out_net["likelihoods"].values()) / (
             -math.log(2) * num_pixels
         )

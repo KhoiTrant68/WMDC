@@ -4,6 +4,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
@@ -25,7 +26,7 @@ def main():
 
     # Load Model
     model = WMDC(N=192, M=320, num_slices=5).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint.get("state_dict", checkpoint))
     model.eval()
     model.update(force=True)
@@ -33,10 +34,16 @@ def main():
     # Process Image
     img = Image.open(args.image).convert("RGB")
     x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-    num_pixels = x.size(2) * x.size(3)
+
+    H, W = x.size(2), x.size(3)
+    num_pixels = H * W
+
+    pad_h = (64 - H % 64) % 64
+    pad_w = (64 - W % 64) % 64
+    x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
 
     with torch.no_grad():
-        out_enc = model.compress(x)
+        out_enc = model.compress(x_padded)
 
     y_strings = out_enc["strings"][0]  # List of 5 slice strings
     z_strings = out_enc["strings"][1]  # Hyperprior string

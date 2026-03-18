@@ -1,4 +1,5 @@
 import argparse
+import math
 
 import matplotlib.pyplot as plt
 import torch
@@ -37,6 +38,7 @@ def main():
         latents = []
         original_decompress = model.gaussian_conditional.decompress
 
+        # Monkey-patch to capture heatmap
         def patched_decompress(*args, **kwargs):
             y_hat_slice = original_decompress(*args, **kwargs)
             spatial_heatmap = torch.mean(
@@ -57,11 +59,11 @@ def main():
     axes[0].set_title("Original Image")
     axes[0].axis("off")
 
+    # Use math.ceil to prevent truncation of fractional patches on the edge
+    latent_h, latent_w = math.ceil(H / 16.0), math.ceil(W / 16.0)
+
     for i in range(5):
         hm = latents[i].numpy()
-
-        # To make visuals clean, crop off the padding from the feature map representation
-        latent_h, latent_w = H // 16, W // 16
         hm_cropped = hm[:latent_h, :latent_w]
 
         axes[i + 1].imshow(hm_cropped, cmap="magma", interpolation="nearest")
