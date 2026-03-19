@@ -18,7 +18,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate Visual Comparison Patches for WMDC"
     )
-    parse_args.add_argument(
+    parser.add_argument(
         "--routing_mode",
         type=str,
         default="unbalanced_eot",
