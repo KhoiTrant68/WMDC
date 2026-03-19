@@ -1,5 +1,5 @@
 import torch
-from torch import Tensor, nn
+from torch import nn
 
 
 def conv1x1(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
