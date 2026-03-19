@@ -118,7 +118,9 @@ class UnifiedDictionaryAttention(nn.Module):
         # ---------------------------------------------------------------
         if self.routing_mode == "softmax":
             # BASELINE: standard softmax — spatial_epsilon is unused here.
-            P = F.softmax(-C_mat / self.tau, dim=-1)
+            dummy_eps = 0.0 * spatial_epsilon.sum()
+            logits = -C_mat / self.tau + dummy_eps
+            P = F.softmax(logits, dim=-1)
 
         elif self.routing_mode == "balanced_eot":
             # STRICT SINKHORN: balanced optimal transport.
