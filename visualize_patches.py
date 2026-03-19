@@ -18,6 +18,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate Visual Comparison Patches for WMDC"
     )
+    parse_args.add_argument(
+        "--routing_mode",
+        type=str,
+        default="unbalanced_eot",
+        choices=["softmax", "balanced_eot", "unbalanced_eot"],
+    )
     parser.add_argument("-i", "--image", type=str, required=True)
     parser.add_argument("-c", "--checkpoint", type=str, required=True)
     parser.add_argument("-o", "--output", type=str, default="visual_comparison")
@@ -34,7 +40,7 @@ def main():
     args = parse_args()
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    model = WMDC(N=args.N, M=args.M).to(device)
+    model = WMDC(N=args.N, M=args.M, routing_mode=args.routing_mode).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()

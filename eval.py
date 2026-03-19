@@ -38,6 +38,12 @@ def pad_image(x, p=64):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--routing_mode",
+        type=str,
+        default="unbalanced_eot",
+        choices=["softmax", "balanced_eot", "unbalanced_eot"],
+    )
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, default="output")
@@ -49,7 +55,7 @@ def main():
     img_dir = os.path.join(args.output, "images")
     os.makedirs(img_dir, exist_ok=True)
 
-    model = WMDC(N=192, M=320, num_slices=5).to(device)
+    model = WMDC(N=192, M=320, num_slices=5, routing_mode=args.routing_mode).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint.get("state_dict", checkpoint))
     model.eval()

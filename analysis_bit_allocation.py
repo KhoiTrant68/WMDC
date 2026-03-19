@@ -13,6 +13,12 @@ from models.WMDC import WMDC
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--routing_mode",
+        type=str,
+        default="unbalanced_eot",
+        choices=["softmax", "balanced_eot", "unbalanced_eot"],
+    )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument(
         "--image",
@@ -25,7 +31,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load Model
-    model = WMDC(N=192, M=320, num_slices=5).to(device)
+    model = WMDC(N=192, M=320, num_slices=5, routing_mode=args.routing_mode).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint.get("state_dict", checkpoint))
     model.eval()
