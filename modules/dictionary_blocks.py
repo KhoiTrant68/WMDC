@@ -106,7 +106,8 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.routing_mode == "softmax":
             # BASELINE: Standard Softmax (Unconstrained)
             # P = Softmax(-C / tau)
-            logits = -C_mat / self.tau
+            dummy_eps = 0.0 * spatial_epsilon.sum()
+            logits = -C_mat / self.tau + dummy_eps
             P = F.softmax(logits, dim=-1)
 
         elif self.routing_mode == "balanced_eot":
