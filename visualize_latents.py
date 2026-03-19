@@ -20,6 +20,8 @@ def main():
     )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--image", type=str, required=True)
+    parser.add_argument("--output", type=str, default='latent_sparsity_visualization.pdf')
+
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,7 +79,7 @@ def main():
         axes[i + 1].axis("off")
 
     plt.tight_layout()
-    plt.savefig("latent_sparsity_visualization.pdf", bbox_inches="tight")
+    plt.savefig(args.output, bbox_inches="tight")
     print(
         "Saved authentic sparsity visualization using the quantized bitstream variables."
     )
