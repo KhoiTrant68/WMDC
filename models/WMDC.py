@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 
-from modules.dictionary_blocks import (  # SpatialDispersionEOTAttention,
+from modules.dictionary_blocks import (
     QueryDictionaryGenerator,
     UnifiedDictionaryAttention,
 )
@@ -98,15 +98,6 @@ class WMDC(CompressionModel):
         self.k_proj = nn.Linear(self.dict_dim, self.dict_dim)
         self.v_proj = nn.Linear(self.dict_dim, self.dict_dim)
 
-        # self.eot_attention = SpatialDispersionEOTAttention(
-        #     input_dim=2 * M
-        #     + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
-        #     output_dim=M,
-        #     dict_num=self.dict_num,
-        #     dict_dim=self.dict_dim,
-        #     tau=0.5,
-        #     iters=3,
-        # )
         self.eot_attention = UnifiedDictionaryAttention(
             input_dim=2 * M
             + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
@@ -185,7 +176,11 @@ class WMDC(CompressionModel):
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
-            scale_table = torch.exp(torch.linspace(math.log(0.11), math.log(256), 64))
+            # Explicitly use float32 to avoid dtype mismatch when the model
+            # is evaluated in a different default dtype context.
+            scale_table = torch.exp(
+                torch.linspace(math.log(0.11), math.log(256), 64, dtype=torch.float32)
+            )
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
         return updated
@@ -212,7 +207,10 @@ class WMDC(CompressionModel):
         y_hat_slices, y_likelihood = [], []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        total_dispersion = 0.0
+        # Initialise as a zero tensor (not float) so the type is consistent
+        # if num_slices > 0 is ever not satisfied, and to avoid returning a raw
+        # Python float from forward() which would break downstream .item() calls.
+        total_dispersion = torch.zeros(1, device=x.device)
 
         # Spatial Sinkhorn epsilon from hyperprior
         spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4

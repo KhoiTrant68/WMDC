@@ -80,7 +80,7 @@ class RateDistortionLoss(nn.Module):
 
         if "dispersion_loss" in output:
             out["dispersion_loss"] = output["dispersion_loss"]
-            out["loss"] += 0.1 * out["dispersion_loss"]
+            out["loss"] = out["loss"] + 0.1 * out["dispersion_loss"]
 
         return out
 
@@ -188,8 +188,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
 
             # --- Tensorboard Image Grid Logging ---
             if i == 0 and accelerator.is_main_process and writer is not None:
-                n = min(d.size(0), 4)  # Log up to 4 images
-                # Stack original and reconstructed images vertically
+                n = min(d.size(0), 4)
                 comparison = torch.cat([d[:n], x_hat[:n]])
                 grid = make_grid(comparison, nrow=n, normalize=True, value_range=(0, 1))
                 writer.add_image(
@@ -222,7 +221,8 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
 
     if accelerator.is_main_process:
         logger.info(
-            f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
+            f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | "
+            f"PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
         )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
@@ -246,7 +246,14 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     p.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
-    p.add_argument("--lambda", dest="lmbda", type=float, default=None)
+    p.add_argument(
+        "--lambda",
+        dest="lmbda",
+        type=float,
+        required=True,
+        help="Rate-distortion tradeoff lambda (e.g. 0.0018, 0.0035, "
+        "0.0067, 0.013, 0.025, 0.05)",
+    )
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--checkpoint", type=str)
@@ -337,6 +344,8 @@ def main():
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         start_epoch = ckpt["epoch"] + 1
+        # Restore best_loss if it was saved; fall back to inf for old checkpoints
+        best_loss = ckpt.get("best_loss", float("inf"))
 
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(
@@ -359,6 +368,7 @@ def main():
         if accelerator.is_main_process:
             state = {
                 "epoch": epoch,
+                "best_loss": best_loss,
                 "state_dict": accelerator.unwrap_model(model).state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "aux_optimizer": aux_optimizer.state_dict(),
@@ -367,6 +377,7 @@ def main():
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
             if test_loss < best_loss:
                 best_loss = test_loss
+                state["best_loss"] = best_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
 
 
