@@ -234,6 +234,12 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument(
+        "--routing_mode",
+        type=str,
+        default="unbalanced_eot",
+        choices=["softmax", "balanced_eot", "unbalanced_eot"],
+    )
     p.add_argument("-d", "--dataset", type=str, required=True)
     p.add_argument("--save_path", type=str, default="checkpoints")
     p.add_argument("-e", "--epochs", type=int, default=100)
@@ -310,7 +316,7 @@ def main():
         pin_memory=True,
     )
 
-    model = WMDC(N=192, M=320, num_slices=5)
+    model = WMDC(N=192, M=320, num_slices=5, routing_mode=args.routing_mode)
     optimizer, aux_optimizer = configure_optimizers(model, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[20, 40], gamma=0.1

@@ -6,9 +6,9 @@ import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 
-from modules.dictionary_blocks import (
+from modules.dictionary_blocks import (  # SpatialDispersionEOTAttention,
     QueryDictionaryGenerator,
-    SpatialDispersionEOTAttention,
+    UnifiedDictionaryAttention,
 )
 from modules.utils import conv, deconv
 from modules.VSS_module import VSSBlock
@@ -23,6 +23,7 @@ class WMDC(CompressionModel):
         num_slices=5,
         dict_head_num=20,
         dict_num=128,
+        routing_mode="unbalanced_eot",
     ):
         super().__init__()
         self.N = N
@@ -97,7 +98,16 @@ class WMDC(CompressionModel):
         self.k_proj = nn.Linear(self.dict_dim, self.dict_dim)
         self.v_proj = nn.Linear(self.dict_dim, self.dict_dim)
 
-        self.eot_attention = SpatialDispersionEOTAttention(
+        # self.eot_attention = SpatialDispersionEOTAttention(
+        #     input_dim=2 * M
+        #     + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
+        #     output_dim=M,
+        #     dict_num=self.dict_num,
+        #     dict_dim=self.dict_dim,
+        #     tau=0.5,
+        #     iters=3,
+        # )
+        self.eot_attention = UnifiedDictionaryAttention(
             input_dim=2 * M
             + self.slice_ch,  # hyper_prior (2M) + memory_state (slice_ch)
             output_dim=M,
@@ -105,6 +115,7 @@ class WMDC(CompressionModel):
             dict_dim=self.dict_dim,
             tau=0.5,
             iters=3,
+            routing_mode=routing_mode,
         )
 
         # Use separate memory updaters per slice to increase capacity
