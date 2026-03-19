@@ -20,7 +20,9 @@ def main():
     )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--image", type=str, required=True)
-    parser.add_argument("--output", type=str, default='latent_sparsity_visualization.pdf')
+    parser.add_argument(
+        "--output", type=str, default="latent_sparsity_visualization.pdf"
+    )
 
     args = parser.parse_args()
 
