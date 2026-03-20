@@ -36,17 +36,22 @@ class QueryDictionaryGenerator(nn.Module):
 
 class UnifiedDictionaryAttention(nn.Module):
     """
-    Unified Dictionary Attention for Ablation Studies.
-    Supports: 'softmax', 'balanced_eot', 'unbalanced_eot'
+    Unified Dictionary Attention supporting three routing modes:
+      'softmax'        — standard softmax baseline
+      'balanced_eot'   — strict balanced optimal transport (Sinkhorn)
+      'unbalanced_eot' — KL-regularised unbalanced OT (WFR / Séjourné et al. 2023)
 
-    Corrections over original implementation:
-    - balanced_eot / unbalanced_eot: added log source mass (log α) to the u
-      update so row marginals converge to the intended target (uniform 1/HW).
-    - unbalanced_eot: KL Aprox shrinkage (tau_ratio) now applied to BOTH u and
-      v, matching the symmetric KL penalty in Table 1 of Séjourné et al. 2023.
-    - Removed clamp(max=0) on logits; replaced with clamp(max=20) to avoid
-      systematic downward bias on high-weight transport plan entries.
-    - softmax branch: removed dummy_eps gradient path through spatial_epsilon.
+    Sinkhorn convention (Cuturi / Peyré log-domain formulation):
+      Rows  = HW spatial query positions   (source measure α, uniform 1/HW)
+      Cols  = N  dictionary tokens         (target measure β, uniform 1/N )
+
+      Row update (u / f):  f_i = ε·log(a_i) - ε·LSE_j[(g_j - C_ij)/ε]
+                                = -ε·log(HW) - ε·LSE_cols((-C + v)/ε)
+      Col update (v / g):  g_j = ε·log(b_j) - ε·LSE_i[(f_i - C_ij)/ε]
+                                = -ε·log(N)  - ε·LSE_rows((-C + u)/ε)
+
+      For unbalanced OT: both potentials are additionally shrunk by τ/(τ+ε)
+      (KL Aprox from Table 1, Séjourné et al. 2023).
     """
 
     def __init__(
@@ -72,7 +77,7 @@ class UnifiedDictionaryAttention(nn.Module):
 
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
 
-        # Spatial smoothing for the cost matrix — frozen depthwise conv
+        # Frozen depthwise conv for spatial smoothing of the cost matrix
         self.spatial_smooth = nn.Conv2d(
             dict_num,
             dict_num,
@@ -85,7 +90,7 @@ class UnifiedDictionaryAttention(nn.Module):
         self.spatial_smooth.weight.data.fill_(1.0 / 9.0)
         self.spatial_smooth.weight.requires_grad = False
 
-        # GroupNorm stabilises magnitudes from the unnormalized WFR routing plan
+        # GroupNorm stabilises magnitudes from the unnormalised WFR routing plan
         self.out_proj = nn.Sequential(
             nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
             nn.GroupNorm(1, dict_dim),
@@ -98,139 +103,118 @@ class UnifiedDictionaryAttention(nn.Module):
         HW = H * W
 
         # ---------------------------------------------------------------
-        # Project and L2-normalise queries and keys
+        # 1. Project and L2-normalise queries and keys
         # ---------------------------------------------------------------
         q = self.q_proj(x).view(B, -1, HW).transpose(1, 2).contiguous()  # (B, HW, D)
         q_norm = F.normalize(q, p=2, dim=-1)
         k_norm = F.normalize(k, p=2, dim=-1)
         k_norm_t = k_norm.transpose(1, 2).contiguous()  # (B, D, N)
 
-        # Cost matrix: C = 1 - cosine similarity,  shape (B, HW, N)
+        # Cost matrix C = 1 − cosine_similarity, shape (B, HW, N)
         C_mat = 1.0 - torch.bmm(q_norm, k_norm_t)
 
-        # Spatial smoothing — applied in (B, N, H, W) space then flattened back
+        # Apply spatial smoothing in (B, N, H, W) space then flatten back
         C_spatial = C_mat.transpose(1, 2).contiguous().view(B, self.dict_num, H, W)
         C_spatial = self.spatial_smooth(C_spatial)
         C_mat = C_spatial.view(B, self.dict_num, HW).transpose(1, 2).contiguous()
 
         # ---------------------------------------------------------------
-        # Routing mechanism
+        # 2. Routing
         # ---------------------------------------------------------------
+
+        # Log-masses for source (row) and target (col) measures.
+        # Source: HW spatial positions, uniform mass 1/HW → log(a_i) = -log(HW)
+        # Target: N  dictionary tokens, uniform mass 1/N  → log(b_j) = -log(N)
+        log_a = -math.log(HW)  # scalar
+        log_b = -math.log(self.dict_num)  # scalar
+
         if self.routing_mode == "softmax":
-            # BASELINE: standard softmax — spatial_epsilon is unused here.
+            # BASELINE: standard softmax (spatial_epsilon not used here)
             dummy_eps = 0.0 * spatial_epsilon.sum()
             logits = -C_mat / self.tau + dummy_eps
             P = F.softmax(logits, dim=-1)
 
         elif self.routing_mode == "balanced_eot":
-            # STRICT SINKHORN: balanced optimal transport.
-            # Row marginal  = uniform 1/HW  → log α = -log(HW)
-            # Column marginal = HW/N per column  → log b = log(HW/N)
-            #
-            # Log-domain Sinkhorn (Séjourné et al. 2023, Algorithm 1,
-            # balanced case where Aprox = identity):
-            #   u_i ← -ε · logsumexp_j ( (v_j - C_ij) / ε + log α_i )
-            #   v_j ← log(b_j) · ε - ε · logsumexp_i ( (u_i - C_ij) / ε + log α_i )
-            # With uniform α_i = 1/HW:  log α = -log(HW)
-
+            # STRICT SINKHORN — balanced OT.
+            # Log-domain updates (Algorithm 1):
+            #   f_i ← ε·log(a_i) - ε·LSE_j[(g_j - C_ij)/ε]
+            #        = -ε·log(HW) - ε·LSE_cols((-C + v)/ε)
+            #   g_j ← ε·log(b_j) - ε·LSE_i[(f_i - C_ij)/ε]
+            #        = -ε·log(N)  - ε·LSE_rows((-C + u)/ε)
             eps = spatial_epsilon.mean(dim=(2, 3)).view(B, 1).clamp(min=1e-3)  # (B, 1)
-
-            log_alpha = -math.log(HW)  # scalar: log of uniform source mass
-            log_b_target = math.log(HW / self.dict_num)  # target column log-mass
-
-            u = torch.zeros(B, HW, device=x.device, dtype=x.dtype)  # (B, HW)
-            v_vec = torch.zeros(B, self.dict_num, device=x.device, dtype=x.dtype)
-
-            for _ in range(self.iters):
-                # u update: row normalisation (marginal = 1/HW)
-                # logsumexp over N (dict tokens), shape → (B, HW)
-                u = -eps * torch.logsumexp(
-                    (-C_mat + v_vec.unsqueeze(1)) / eps.unsqueeze(2) + log_alpha,
-                    dim=2,
-                )
-
-                # v update: column normalisation (marginal = HW/N)
-                # logsumexp over HW (spatial positions), shape → (B, N)
-                v_vec = eps * log_b_target - eps * torch.logsumexp(
-                    (-C_mat + u.unsqueeze(2)) / eps.unsqueeze(2) + log_alpha,
-                    dim=1,
-                )
-
-            logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps.unsqueeze(2)
-            # No clamping: balanced Sinkhorn plan entries are non-negative by
-            # construction in log-domain.  A large-value guard is sufficient.
-            P = torch.exp(torch.clamp(logits, max=20.0))
-
-        elif self.routing_mode == "unbalanced_eot":
-            # OURS: Unbalanced EOT with KL marginal penalty
-            # (Wasserstein-Fisher-Rao / KL-regularised unbalanced OT).
-            #
-            # From Table 1, Séjourné et al. 2023, symmetric KL with parameter ρ:
-            #   Aprox_ε(p) = ρ/(ρ+ε) · p
-            # Both dual potentials u and v are shrunk by tau_ratio = τ/(τ+ε).
-            #
-            # Log-domain updates (both rows and columns use KL Aprox):
-            #   raw_u ← ε · (log α - logsumexp_j( (v_j - C_ij)/ε ))
-            #   u     ← tau_ratio · raw_u
-            #   raw_v ← ε · (log b - logsumexp_i( (u_i - C_ij)/ε ))
-            #   v     ← tau_ratio · raw_v
-            # With uniform α = 1/HW and target column log-mass log(1/N) + log(HW):
-
-            eps = spatial_epsilon.mean(dim=(2, 3)).view(B, 1).clamp(min=1e-3)  # (B, 1)
-
-            tau_ratio = self.tau / (self.tau + eps)  # (B, 1)  KL Aprox factor
-
-            log_alpha = -math.log(HW)  # log(1/HW)
-            log_b_target = math.log(1.0 / self.dict_num) + math.log(HW)
-            # = log(HW/N): uniform column target mass in the unbalanced sense
 
             u = torch.zeros(B, HW, device=x.device, dtype=x.dtype)
             v_vec = torch.zeros(B, self.dict_num, device=x.device, dtype=x.dtype)
 
             for _ in range(self.iters):
-                # u update — KL Aprox applied (row marginal side)
-                raw_u = eps * (
-                    log_alpha
-                    - torch.logsumexp(
-                        (-C_mat + v_vec.unsqueeze(1)) / eps.unsqueeze(2),
-                        dim=2,
-                    )
-                )
-                u = tau_ratio * raw_u  # (B, HW)
+                # Row update: uses log(a_i) = log_a = -log(HW)
+                u = log_a * eps - eps * torch.logsumexp(
+                    (-C_mat + v_vec.unsqueeze(1)) / eps.unsqueeze(2),
+                    dim=2,
+                )  # (B, HW)
 
-                # v update — KL Aprox applied (column marginal side)
-                raw_v = eps * (
-                    log_b_target
-                    - torch.logsumexp(
-                        (-C_mat + u.unsqueeze(2)) / eps.unsqueeze(2),
-                        dim=1,
-                    )
-                )
-                v_vec = tau_ratio * raw_v  # (B, N)
+                # Col update: uses log(b_j) = log_b = -log(N)
+                v_vec = log_b * eps - eps * torch.logsumexp(
+                    (-C_mat + u.unsqueeze(2)) / eps.unsqueeze(2),
+                    dim=1,
+                )  # (B, N)
 
             logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps.unsqueeze(2)
-            # clamp(max=20) prevents exp overflow while allowing plan entries > 1,
-            # which is correct for unbalanced OT (total mass need not equal 1).
             P = torch.exp(torch.clamp(logits, max=20.0))
 
-        # Save for visualisation / analysis hooks
+        elif self.routing_mode == "unbalanced_eot":
+            # KL-REGULARISED UNBALANCED OT (Séjourné et al. 2023, Table 1).
+            # KL Aprox: Aprox_ε(p) = τ/(τ+ε)·p  applied to BOTH potentials.
+            #
+            # Updates:
+            #   raw_u = ε·log(a_i) - ε·LSE_j[(v_j - C_ij)/ε]
+            #   u     = τ/(τ+ε) · raw_u
+            #   raw_v = ε·log(b_j) - ε·LSE_i[(u_i - C_ij)/ε]
+            #   v     = τ/(τ+ε) · raw_v
+            eps = spatial_epsilon.mean(dim=(2, 3)).view(B, 1).clamp(min=1e-3)  # (B, 1)
+
+            tau_ratio = self.tau / (self.tau + eps)  # (B, 1)
+
+            u = torch.zeros(B, HW, device=x.device, dtype=x.dtype)
+            v_vec = torch.zeros(B, self.dict_num, device=x.device, dtype=x.dtype)
+
+            for _ in range(self.iters):
+                # Row update — KL Aprox on source side
+                raw_u = log_a * eps - eps * torch.logsumexp(
+                    (-C_mat + v_vec.unsqueeze(1)) / eps.unsqueeze(2),
+                    dim=2,
+                )  # (B, HW)
+                u = tau_ratio * raw_u
+
+                # Col update — KL Aprox on target side
+                raw_v = log_b * eps - eps * torch.logsumexp(
+                    (-C_mat + u.unsqueeze(2)) / eps.unsqueeze(2),
+                    dim=1,
+                )  # (B, N)
+                v_vec = tau_ratio * raw_v
+
+            logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps.unsqueeze(2)
+            # clamp(max=20) prevents exp overflow while allowing plan entries > 1
+            # (correct for unbalanced OT where total mass need not equal 1)
+            P = torch.exp(torch.clamp(logits, max=20.0))
+
+        # Store for visualisation / analysis hooks
         self.attn_probs = P
 
         # ---------------------------------------------------------------
-        # Aggregate values
+        # 3. Aggregate values
         # ---------------------------------------------------------------
         out_bmm = torch.bmm(P, v)  # (B, HW, D)
         out = out_bmm.transpose(1, 2).contiguous().view(B, -1, H, W)
 
         # ---------------------------------------------------------------
-        # Dispersion loss (training only, Slice 0 only)
+        # 4. Dispersion loss (training, Slice 0 only)
         # ---------------------------------------------------------------
         if self.training and calc_disp:
-            q_expanded = q.unsqueeze(2)  # (B, HW, 1, D)
-            # Penalize distance to the KEY space, not VALUE space.
-            k_expanded = k.unsqueeze(1)  # (B, 1, N, D)
-            # Distance between query and dictionary Key vectors
-            dist_sq = torch.sum((q_expanded - k_expanded) ** 2, dim=-1)
+            # Use torch.cdist to avoid allocating the (B, HW, N, D) intermediate
+            # that the naive (q_expanded - k_expanded)**2 broadcast would create.
+            # For B=8, HW=256, N=128, D=640 that intermediate is ~2.1 GB.
+            dist_sq = torch.cdist(q, k, p=2).pow(2)  # (B, HW, N)
             dispersion_loss = torch.mean(torch.sum(P.detach() * dist_sq, dim=2))
         else:
             dispersion_loss = torch.tensor(0.0, device=x.device)

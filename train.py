@@ -58,6 +58,16 @@ def compute_bpp(out_net, num_pixels):
     )
 
 
+def pad_to_multiple(x, p=64):
+    """Pad tensor to make H and W multiples of p using reflect padding."""
+    H, W = x.size(2), x.size(3)
+    pad_h = (p - H % p) % p
+    pad_w = (p - W % p) % p
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+    return x, H, W
+
+
 class RateDistortionLoss(nn.Module):
     def __init__(self, lmbda=1e-2, metric="mse"):
         super().__init__()
@@ -173,6 +183,19 @@ def train_one_epoch(
 
 
 def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
+    """
+    Validation loop.
+
+    Images are padded to the nearest multiple of 64 (required by WMDC),
+    then cropped back to original size before metric computation.  This
+    matches the eval.py protocol exactly so that checkpoint selection and
+    final benchmark numbers are consistent.
+
+    Previously the validation dataset used CenterCrop(patch_size=256),
+    which caused best-checkpoint selection to be based on 256×256 patches
+    while eval.py reports metrics on full images — a reproducibility
+    violation corrected here.
+    """
     model.eval()
     psnr_meter, bpp_meter, loss_meter = AverageMeter(), AverageMeter(), AverageMeter()
 
@@ -183,27 +206,39 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             desc=f"Val Epoch {epoch}",
             disable=not accelerator.is_local_main_process,
         ):
-            out_net = model(d)
-            x_hat = out_net["x_hat"].clamp_(0, 1)
+            # Pad to multiple of 64, run model, crop back
+            d_padded, H_orig, W_orig = pad_to_multiple(d, p=64)
+            out_net = model(d_padded)
+            x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
+
+            # Reconstruct a trimmed output dict so compute_bpp uses
+            # likelihoods from the full (padded) forward pass, but metrics
+            # are computed on the unpadded region — matching eval.py.
+            d_orig = d[:, :, :H_orig, :W_orig]
 
             # --- Tensorboard Image Grid Logging ---
             if i == 0 and accelerator.is_main_process and writer is not None:
-                n = min(d.size(0), 4)
-                comparison = torch.cat([d[:n], x_hat[:n]])
+                n = min(d_orig.size(0), 4)
+                comparison = torch.cat([d_orig[:n], x_hat[:n]])
                 grid = make_grid(comparison, nrow=n, normalize=True, value_range=(0, 1))
                 writer.add_image(
                     "Val/Reconstruction (Top: Orig, Bot: Rec)", grid, epoch
                 )
 
-            num_pixels = d.size(0) * d.size(2) * d.size(3)
-            bpp_val = compute_bpp(out_net, num_pixels)
-            mse_val = F.mse_loss(x_hat, d)
+            # BPP uses padded pixel count (bitstream encodes padded image)
+            num_pixels_padded = d_padded.size(0) * d_padded.size(2) * d_padded.size(3)
+            # Metrics use original pixel count
+            num_pixels_orig = d_orig.size(0) * H_orig * W_orig
+
+            bpp_val = compute_bpp(out_net, num_pixels_padded)
+            mse_val = F.mse_loss(x_hat, d_orig)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
 
             loss_val = (
                 criterion.lmbda * 255**2 * mse_val + bpp_val
                 if criterion.metric == "mse"
-                else criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
+                else criterion.lmbda * (1 - ms_ssim(x_hat, d_orig, data_range=1.0))
+                + bpp_val
             )
 
             metrics = (
@@ -246,6 +281,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     p.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
+    # Required: no default=None to prevent silent TypeError at first training step
     p.add_argument(
         "--lambda",
         dest="lmbda",
@@ -298,12 +334,14 @@ def main():
             ]
         ),
     )
+
+    # Validation: NO crop — use full images (pad in test_epoch to meet model
+    # alignment requirement).  This ensures best-checkpoint selection is based
+    # on full-image quality, matching the eval.py benchmark protocol.
     test_dataset = ImageFolder(
         args.dataset,
         split="valid",
-        transform=transforms.Compose(
-            [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
-        ),
+        transform=transforms.ToTensor(),
     )
 
     train_loader = DataLoader(
@@ -315,9 +353,11 @@ def main():
         drop_last=True,
         worker_init_fn=worker_init_fn,
     )
+    # Validation batch size = 1 because full images may have different sizes
+    # and cannot be trivially collated into a batch.
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -336,6 +376,8 @@ def main():
         )
     )
 
+    # Restore best_loss from checkpoint so the best model is not overwritten
+    # spuriously on the first validation epoch after resume.
     start_epoch, best_loss = 0, float("inf")
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -344,7 +386,6 @@ def main():
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         start_epoch = ckpt["epoch"] + 1
-        # Restore best_loss if it was saved; fall back to inf for old checkpoints
         best_loss = ckpt.get("best_loss", float("inf"))
 
     for epoch in range(start_epoch, args.epochs):

@@ -80,7 +80,7 @@ class WMDC(CompressionModel):
         )
 
         # =========================================================================
-        # Spatially-Adaptive Sinkhorn Entropy Predictor
+        # Spatially-Adaptive Sinkhorn Epsilon Predictor
         # =========================================================================
         self.eps_predictor = nn.Sequential(
             nn.Conv2d(2 * M, 64, 1),
@@ -94,7 +94,7 @@ class WMDC(CompressionModel):
         #: Bootstrap memory state dynamically to prevent Slice 1 conditional blindness
         self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=1)
 
-        #: Projections moved here to compute them ONCE globally instead of 5 times inside EOT
+        #: Projections moved here to compute them ONCE globally
         self.k_proj = nn.Linear(self.dict_dim, self.dict_dim)
         self.v_proj = nn.Linear(self.dict_dim, self.dict_dim)
 
@@ -176,8 +176,8 @@ class WMDC(CompressionModel):
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
-            # Explicitly use float32 to avoid dtype mismatch when the model
-            # is evaluated in a different default dtype context.
+            # Explicit float32 prevents dtype mismatch if the default dtype
+            # has been changed externally (e.g. torch.set_default_dtype(float64)).
             scale_table = torch.exp(
                 torch.linspace(math.log(0.11), math.log(256), 64, dtype=torch.float32)
             )
@@ -188,10 +188,20 @@ class WMDC(CompressionModel):
     def aux_loss(self):
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
+    def _compute_spatial_epsilon(self, hyper_prior):
+        """
+        Compute spatially-adaptive Sinkhorn regularisation strength.
+
+        clamp(min=0.01) prevents near-zero ε that makes Sinkhorn numerically
+        degenerate (effectively zero-temperature hard assignment in 3 iterations).
+        The +1e-4 offset guarantees strict positivity after the clamp.
+        """
+        return F.softplus(self.eps_predictor(hyper_prior)).clamp(min=0.01) + 1e-4
+
     def forward(self, x):
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
             raise ValueError(
-                f"Model expects input dimensions to be a multiple of 64. Got {x.shape}"
+                f"Model expects input dimensions divisible by 64. Got {x.shape}"
             )
 
         y = self.g_a(x)
@@ -207,26 +217,24 @@ class WMDC(CompressionModel):
         y_hat_slices, y_likelihood = [], []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        # Initialise as a zero tensor (not float) so the type is consistent
-        # if num_slices > 0 is ever not satisfied, and to avoid returning a raw
-        # Python float from forward() which would break downstream .item() calls.
+        # Initialise as a zero tensor (not a Python float) so the returned
+        # value is always a Tensor regardless of which branch executes.
         total_dispersion = torch.zeros(1, device=x.device)
 
-        # Spatial Sinkhorn epsilon from hyperprior
-        spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
+        # Shared epsilon across slices (spatially adaptive, image-level).
+        # clamp(min=0.01) added to prevent degenerate near-zero temperature.
+        spatial_epsilon = self._compute_spatial_epsilon(hyper_prior)
 
-        # Bootstrap Memory State
         memory_state = self.init_memory(hyper_prior)
 
-        # Compute Dictionary Projections ONCE
         k_dict = self.k_proj(dt)
         v_dict = self.v_proj(dt)
 
         for i, y_slice in enumerate(y_slices):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            # Only calculate dispersion loss on Slice 0 (base structural slice)
-            # This prevents opposing gradients from high-frequency slices washing out the dictionary.
+            # Dispersion loss computed on Slice 0 only to avoid opposing
+            # gradients from high-frequency slices diluting the dictionary.
             dict_info, disp_loss = self.eot_attention(
                 query, k_dict, v_dict, spatial_epsilon, calc_disp=(i == 0)
             )
@@ -268,7 +276,7 @@ class WMDC(CompressionModel):
     def compress(self, x):
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
             raise ValueError(
-                f"Model expects input dimensions to be a multiple of 64. Got {x.shape}"
+                f"Model expects input dimensions divisible by 64. Got {x.shape}"
             )
 
         y = self.g_a(x)
@@ -285,7 +293,7 @@ class WMDC(CompressionModel):
         y_hat_slices, y_strings = [], []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
+        spatial_epsilon = self._compute_spatial_epsilon(hyper_prior)
 
         memory_state = self.init_memory(hyper_prior)
         k_dict = self.k_proj(dt)
@@ -338,7 +346,7 @@ class WMDC(CompressionModel):
         y_hat_slices = []
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        spatial_epsilon = F.softplus(self.eps_predictor(hyper_prior)) + 1e-4
+        spatial_epsilon = self._compute_spatial_epsilon(hyper_prior)
 
         memory_state = self.init_memory(hyper_prior)
         k_dict = self.k_proj(dt)
