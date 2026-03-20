@@ -96,7 +96,6 @@ def main():
 
     plt.tight_layout()
     plt.savefig(f"{args.output}.pdf", format="pdf", dpi=300, bbox_inches="tight")
-    plt.savefig(f"{args.output}.jpg", format="jpg", dpi=300, bbox_inches="tight")
     plt.close(fig)
     print("Success!")
 

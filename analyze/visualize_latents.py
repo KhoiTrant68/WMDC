@@ -86,7 +86,7 @@ def main():
         axes[i + 1].axis("off")
 
     plt.tight_layout()
-    plt.savefig(args.output, bbox_inches="tight")
+    plt.savefig(args.output, format="pdf", dpi=300, bbox_inches="tight")
     print(
         "Saved authentic sparsity visualization using the quantized bitstream variables."
     )
