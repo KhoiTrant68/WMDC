@@ -1,11 +1,11 @@
 import argparse
-import math
 import os
 import sys
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, parent_dir)
+
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -16,7 +16,9 @@ from models.WMDC import WMDC
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Visualise per-slice latent activation heatmaps"
+    )
     parser.add_argument(
         "--routing_mode",
         type=str,
@@ -26,14 +28,17 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--image", type=str, required=True)
     parser.add_argument(
-        "--output", type=str, default="latent_sparsity_visualization.pdf"
+        "-o",
+        "--output",
+        type=str,
+        default="latent_sparsity_visualization.pdf",
+        help="Output path.  Extension controls format (pdf recommended).",
     )
-
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = WMDC(N=192, M=320, num_slices=5, routing_mode=args.routing_mode).to(device)
 
+    model = WMDC(N=192, M=320, num_slices=5, routing_mode=args.routing_mode).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
@@ -53,42 +58,71 @@ def main():
         latents = []
         original_decompress = model.gaussian_conditional.decompress
 
-        # Monkey-patch to capture heatmap
         def patched_decompress(*args, **kwargs):
+            """
+            Intercepts each gaussian_conditional.decompress() call inside
+            model.decompress() to capture the mean-abs activation heatmap.
+
+            y_hat_slice shape: (B, slice_ch, latent_H, latent_W)
+            = (1, 64, padded_H//16, padded_W//16)
+
+            We take channel-mean of |y_hat_slice| to get a single spatial
+            heatmap per slice, then move it to CPU immediately to free VRAM.
+            """
             y_hat_slice = original_decompress(*args, **kwargs)
-            spatial_heatmap = torch.mean(
-                torch.abs(y_hat_slice.detach().cpu()), dim=1
-            ).squeeze(0)
+            spatial_heatmap = (
+                torch.mean(torch.abs(y_hat_slice), dim=1)  # (1, lH, lW)
+                .squeeze(0)  # (lH, lW)
+                .detach()
+                .cpu()
+            )
             latents.append(spatial_heatmap)
             return y_hat_slice
 
         model.gaussian_conditional.decompress = patched_decompress
-        _ = model.decompress(out_enc["strings"], out_enc["shape"])
-        model.gaussian_conditional.decompress = original_decompress  # Restore original
+        try:
+            _ = model.decompress(out_enc["strings"], out_enc["shape"])
+        finally:
+            model.gaussian_conditional.decompress = original_decompress
+
+    assert (
+        len(latents) == 5
+    ), f"Expected 5 latent heatmaps (one per slice), got {len(latents)}"
 
     fig, axes = plt.subplots(1, 6, figsize=(18, 3))
 
-    # Show original unpadded image
+    # Column 0: original unpadded image
     orig_np = x.squeeze(0).permute(1, 2, 0).cpu().numpy()
     axes[0].imshow(orig_np)
     axes[0].set_title("Original Image")
     axes[0].axis("off")
 
-    # Use math.ceil to prevent truncation of fractional patches on the edge
-    latent_h, latent_w = math.ceil(H / 16.0), math.ceil(W / 16.0)
+    # The latent heatmap spatial size is (padded_H//16, padded_W//16).
+    # We crop it to (H//16, W//16) to remove padding artefacts.
+    # Since H % 64 == 0 (enforced by WMDC), H//16 == ceil(H/16). ✓
+    latent_h = H // 16
+    latent_w = W // 16
 
     for i in range(5):
-        hm = latents[i].numpy()
-        hm_cropped = hm[:latent_h, :latent_w]
+        hm = latents[i].numpy()  # (padded_H//16, padded_W//16)
+        hm_cropped = hm[:latent_h, :latent_w]  # (H//16, W//16) — remove pad
 
         axes[i + 1].imshow(hm_cropped, cmap="magma", interpolation="nearest")
-        axes[i + 1].set_title(f"Slice {i+1} Latent")
+        axes[i + 1].set_title(f"Slice {i + 1} Latent")
         axes[i + 1].axis("off")
 
-    plt.tight_layout()
-    plt.savefig(args.output, format="pdf", dpi=300, bbox_inches="tight")
+    fig.tight_layout()
+
+    # Infer format from extension; always call plt.close to free memory.
+    ext = os.path.splitext(args.output)[1].lstrip(".").lower()
+    fmt = "pdf" if ext == "pdf" else ext if ext else "pdf"
+    fig.savefig(args.output, format=fmt, bbox_inches="tight")
+    plt.close(fig)
+
     print(
-        "Saved authentic sparsity visualization using the quantized bitstream variables."
+        "Saved latent sparsity visualisation "
+        "(quantised decoder-side reconstructions) to "
+        f"{args.output}"
     )
 
 
