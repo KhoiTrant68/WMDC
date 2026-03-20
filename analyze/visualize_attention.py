@@ -2,7 +2,9 @@ import argparse
 import os
 import sys
 
-sys.path.append(os.path.abspath("../"))
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
+sys.path.insert(0, parent_dir)
 import matplotlib
 import torch
 import torch.nn.functional as F
