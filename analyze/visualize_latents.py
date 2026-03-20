@@ -1,6 +1,8 @@
 import argparse
 import math
+import sys
 
+sys.path.append(os.path.abspath("../"))
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
