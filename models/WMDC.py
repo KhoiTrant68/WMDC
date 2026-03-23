@@ -251,7 +251,7 @@ class WMDC(CompressionModel):
 
         memory_state = self.init_memory(hyper_prior)
 
-        total_dispersion = torch.zeros(0, device=x.device, dtype=x.dtype)
+        total_dispersion = torch.zeros(0.0, device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
             k_dict = self.k_projs[i](dt)
