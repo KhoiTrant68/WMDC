@@ -441,9 +441,9 @@ def main():
     )
     optimizer, aux_optimizer = configure_optimizers(model, args)
 
-    # MultiStepLR: decay at epoch 20 and 40
+    # MultiStepLR
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[3, 8], gamma=0.1
+        optimizer, milestones=[3, 12], gamma=0.1
     )
     criterion = RateDistortionLoss(
         lmbda=args.lmbda,
