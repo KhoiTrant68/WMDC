@@ -264,6 +264,6 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.training and calc_disp:
             disp_loss = self._dispersion_loss(P)
         else:
-            disp_loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+            disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         return self.out_proj(out), disp_loss
