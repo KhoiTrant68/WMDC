@@ -23,8 +23,12 @@ from tqdm import tqdm
 
 from models.WMDC import WMDC
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-def setup_logger(log_dir):
+
+def setup_logger(log_dir: str) -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(
         log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -32,9 +36,17 @@ def setup_logger(log_dir):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ],
     )
     return logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 
 class AverageMeter:
@@ -44,21 +56,22 @@ class AverageMeter:
     def reset(self):
         self.val = self.avg = self.sum = self.count = 0
 
-    def update(self, val, n=1):
+    def update(self, val: float, n: int = 1):
         self.val = val
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
 
 
-def compute_bpp(out_net, num_pixels):
+def compute_bpp(out_net: dict, num_pixels: int) -> torch.Tensor:
+    """Differentiable training-time BPP estimate from likelihood tensors."""
     return sum(
-        torch.log(likelihoods.float()).sum() / (-math.log(2) * num_pixels)
-        for likelihoods in out_net["likelihoods"].values()
+        torch.log(lh.float()).sum() / (-math.log(2) * num_pixels)
+        for lh in out_net["likelihoods"].values()
     )
 
 
-def pad_to_multiple(x, p=64):
+def pad_to_multiple(x: torch.Tensor, p: int = 64):
     """Pad tensor to make H and W multiples of p using reflect padding."""
     H, W = x.size(2), x.size(3)
     pad_h = (p - H % p) % p
@@ -68,47 +81,90 @@ def pad_to_multiple(x, p=64):
     return x, H, W
 
 
+# ---------------------------------------------------------------------------
+# Rate-Distortion Loss
+# ---------------------------------------------------------------------------
+
+
 class RateDistortionLoss(nn.Module):
-    def __init__(self, lmbda=1e-2, metric="mse"):
+    """
+    Rate-distortion loss with optional dispersion regularisation.
+
+    L = λ · distortion + bpp + w_disp · dispersion
+
+    The dispersion coefficient w_disp is adaptively scaled to keep the
+    dispersion term commensurate with the BPP term.  A clamp [0.01, 10]
+    prevents it from either vanishing or dominating.
+
+    Args:
+        lmbda        : RD tradeoff (MSE: 0.0018–0.05; MS-SSIM: 2.4–115)
+        metric       : 'mse' or 'ms-ssim'
+        disp_weight  : base weight for dispersion loss (default 0.1)
+    """
+
+    def __init__(
+        self, lmbda: float = 1e-2, metric: str = "mse", disp_weight: float = 0.1
+    ):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.metric = metric
+        self.disp_weight = disp_weight
 
-    def forward(self, output, target):
+    def forward(self, output: dict, target: torch.Tensor) -> dict:
         num_pixels = target.size(0) * target.size(2) * target.size(3)
-        out = {"bpp_loss": compute_bpp(output, num_pixels)}
+        bpp_loss = compute_bpp(output, num_pixels)
+
+        out = {"bpp_loss": bpp_loss}
 
         if self.metric == "mse":
             out["mse_loss"] = self.mse(output["x_hat"], target)
-            distortion = 255**2 * out["mse_loss"]
+            distortion = 255.0**2 * out["mse_loss"]
         else:
             out["ms_ssim_loss"] = 1 - ms_ssim(output["x_hat"], target, data_range=1.0)
             distortion = out["ms_ssim_loss"]
 
-        out["loss"] = self.lmbda * distortion + out["bpp_loss"]
+        out["loss"] = self.lmbda * distortion + bpp_loss
 
         if "dispersion_loss" in output:
-            out["dispersion_loss"] = output["dispersion_loss"]
-            out["loss"] = out["loss"] + 0.1 * out["dispersion_loss"]
+            disp = output["dispersion_loss"]
+            out["dispersion_loss"] = disp
+
+            # Adaptive scale: keep dispersion commensurate with BPP.
+            # Detach both to avoid second-order gradients through the scale.
+            with torch.no_grad():
+                scale = (bpp_loss.abs() / (disp.abs() + 1e-8)).clamp(0.01, 10.0)
+
+            out["loss"] = out["loss"] + self.disp_weight * scale * disp
 
         return out
 
 
-def configure_optimizers(net, args):
-    main_params = {
-        n: p
+# ---------------------------------------------------------------------------
+# Optimiser configuration
+# ---------------------------------------------------------------------------
+
+
+def configure_optimizers(net: nn.Module, args):
+    """Separate main params from entropy-bottleneck quantile params."""
+    main_params = [
+        p
         for n, p in net.named_parameters()
         if not n.endswith(".quantiles") and p.requires_grad
-    }
-    aux_params = {
-        n: p
+    ]
+    aux_params = [
+        p
         for n, p in net.named_parameters()
         if n.endswith(".quantiles") and p.requires_grad
-    }
-    return optim.Adam(main_params.values(), lr=args.learning_rate), optim.Adam(
-        aux_params.values(), lr=args.aux_learning_rate
-    )
+    ]
+    optimizer = optim.Adam(main_params, lr=args.learning_rate)
+    aux_optimizer = optim.Adam(aux_params, lr=args.aux_learning_rate)
+    return optimizer, aux_optimizer
+
+
+# ---------------------------------------------------------------------------
+# Training epoch
+# ---------------------------------------------------------------------------
 
 
 def train_one_epoch(
@@ -124,7 +180,9 @@ def train_one_epoch(
     accelerator,
 ):
     model.train()
-    rd_meter, aux_meter, bpp_meter = AverageMeter(), AverageMeter(), AverageMeter()
+    rd_meter = AverageMeter()
+    aux_meter = AverageMeter()
+    bpp_meter = AverageMeter()
     disp_meter = AverageMeter()
 
     pbar = tqdm(
@@ -141,10 +199,7 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
-        # =====================================================================
-        # Decoupled Backward Passes to Prevent Quantile CDF Corruption
-        # =====================================================================
-        # Pass 1: Rate-Distortion Loss (Main Parameters)
+        # ── Pass 1: RD loss (main parameters) ────────────────────────────
         accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
             main_params = [
@@ -153,10 +208,9 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
         optimizer.step()
 
-        # Pass 2: Entropy Bottleneck CDF Approximation (Aux Parameters)
+        # ── Pass 2: aux loss (entropy bottleneck CDF approximation) ──────
         accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
-        # =====================================================================
 
         rd_meter.update(out_criterion["loss"].item())
         aux_meter.update(out_net["aux_loss"].item())
@@ -182,9 +236,19 @@ def train_one_epoch(
     return rd_meter.avg
 
 
+# ---------------------------------------------------------------------------
+# Validation epoch
+# ---------------------------------------------------------------------------
+
+
 def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
+    """
+    Validation with corrected BPP accounting.
+    """
     model.eval()
-    psnr_meter, bpp_meter, loss_meter = AverageMeter(), AverageMeter(), AverageMeter()
+    psnr_meter = AverageMeter()
+    bpp_meter = AverageMeter()
+    loss_meter = AverageMeter()
 
     with torch.no_grad():
         for i, d in tqdm(
@@ -193,38 +257,42 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             desc=f"Val Epoch {epoch}",
             disable=not accelerator.is_local_main_process,
         ):
-            # Pad to multiple of 64, run model, crop back
             d_padded, H_orig, W_orig = pad_to_multiple(d, p=64)
             out_net = model(d_padded)
-            x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
 
-            # Reconstruct a trimmed output dict so compute_bpp uses
-            # likelihoods from the full (padded) forward pass, but metrics
-            # are computed on the unpadded region — matching eval.py.
+            # Crop reconstruction to original dimensions
+            x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
             d_orig = d[:, :, :H_orig, :W_orig]
 
-            # --- Tensorboard Image Grid Logging ---
+            # ── Image logging ─────────────────────────────────────────────
             if i == 0 and accelerator.is_main_process and writer is not None:
                 n = min(d_orig.size(0), 4)
-                comparison = torch.cat([d_orig[:n], x_hat[:n]])
-                grid = make_grid(comparison, nrow=n, normalize=True, value_range=(0, 1))
-                writer.add_image(
-                    "Val/Reconstruction (Top: Orig, Bot: Rec)", grid, epoch
-                )
+                cmp = torch.cat([d_orig[:n], x_hat[:n]])
+                grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
+                writer.add_image("Val/Reconstruction (Top:Orig, Bot:Rec)", grid, epoch)
 
-            # Compute BPP using the original, unpadded pixel count to match eval.py
-            num_pixels_orig = d_orig.size(0) * H_orig * W_orig
+            # ── BPP: divide by PADDED pixel count (consistent denominator) ─
+            # The likelihood tensor covers the entire padded spatial extent.
+            B = d_padded.size(0)
+            H_pad = d_padded.size(2)
+            W_pad = d_padded.size(3)
+            num_pixels_pad = B * H_pad * W_pad
+            num_pixels_orig = B * H_orig * W_orig
 
-            bpp_val = compute_bpp(out_net, num_pixels_orig)
+            bpp_val = compute_bpp(out_net, num_pixels_pad)
+
+            # ── Distortion on original (unpadded) region ───────────────────
             mse_val = F.mse_loss(x_hat, d_orig)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
 
-            loss_val = (
-                criterion.lmbda * 255**2 * mse_val + bpp_val
-                if criterion.metric == "mse"
-                else criterion.lmbda * (1 - ms_ssim(x_hat, d_orig, data_range=1.0))
-                + bpp_val
-            )
+            # ── Loss for checkpoint selection ──────────────────────────────
+            if criterion.metric == "mse":
+                loss_val = criterion.lmbda * 255.0**2 * mse_val + bpp_val
+            else:
+                loss_val = (
+                    criterion.lmbda * (1 - ms_ssim(x_hat, d_orig, data_range=1.0))
+                    + bpp_val
+                )
 
             metrics = (
                 accelerator.gather(
@@ -240,16 +308,24 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             loss_meter.update(metrics[2].item())
 
     if accelerator.is_main_process:
-        logger.info(
-            f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | "
-            f"PSNR: {psnr_meter.avg:.2f}dB | Bpp: {bpp_meter.avg:.4f}"
-        )
+        if logger:
+            logger.info(
+                f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | "
+                f"PSNR: {psnr_meter.avg:.2f} dB | "
+                f"BPP (pad-based): {bpp_meter.avg:.4f} "
+                f"[NOTE: report eval.py BPP in paper]"
+            )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
             writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
-            writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
+            writer.add_scalar("Val/Bpp_pad", bpp_meter.avg, epoch)
 
     return loss_meter.avg
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
 
 
 def parse_args():
@@ -271,23 +347,38 @@ def parse_args():
         dest="lmbda",
         type=float,
         required=True,
-        help="RD tradeoff lambda. For MSE use (e.g. 0.0018, 0.0035, 0.013, 0.05). "
-        "For MS-SSIM use (e.g. 2.4, 4.58, 8.73, 16.64, 31.73, 115.37).",
+        help="RD tradeoff λ. MSE: 0.0018,0.0035,0.013,0.05. "
+        "MS-SSIM: 2.4,4.58,8.73,16.64,31.73,115.37",
     )
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
-    p.add_argument("--checkpoint", type=str)
+    p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--metric", type=str, default="mse", choices=["mse", "ms-ssim"])
+    p.add_argument(
+        "--disp-weight",
+        type=float,
+        default=0.1,
+        help="Base weight for dispersion loss (adaptive scaling applied)",
+    )
+    p.add_argument(
+        "--ot-eps",
+        type=float,
+        default=0.1,
+        help="Fixed Sinkhorn entropic regularisation ε",
+    )
     p.add_argument("--seed", type=int, default=2026)
-
-    args = p.parse_args()
-    return args
+    return p.parse_args()
 
 
-def worker_init_fn(worker_id):
+def worker_init_fn(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -318,7 +409,6 @@ def main():
             ]
         ),
     )
-
     test_dataset = ImageFolder(
         args.dataset,
         split="valid",
@@ -342,20 +432,34 @@ def main():
         pin_memory=True,
     )
 
-    model = WMDC(N=192, M=320, num_slices=5, routing_mode=args.routing_mode)
-    optimizer, aux_optimizer = configure_optimizers(model, args)
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[20, 40], gamma=0.1
+    model = WMDC(
+        N=192,
+        M=320,
+        num_slices=5,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
     )
-    criterion = RateDistortionLoss(lmbda=args.lmbda, metric=args.metric)
+    optimizer, aux_optimizer = configure_optimizers(model, args)
 
-    model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler = (
+    # MultiStepLR: decay at epoch 20 and 40
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=[3, 8], gamma=0.1
+    )
+    criterion = RateDistortionLoss(
+        lmbda=args.lmbda,
+        metric=args.metric,
+        disp_weight=args.disp_weight,
+    )
+
+    (model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler) = (
         accelerator.prepare(
             model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
         )
     )
 
-    start_epoch, best_loss = 0, float("inf")
+    start_epoch = 0
+    best_loss = float("inf")
+
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
         accelerator.unwrap_model(model).load_state_dict(ckpt["state_dict"])
@@ -379,7 +483,13 @@ def main():
             accelerator,
         )
         test_loss = test_epoch(
-            epoch, test_loader, model, criterion, logger, writer, accelerator
+            epoch,
+            test_loader,
+            model,
+            criterion,
+            logger,
+            writer,
+            accelerator,
         )
         lr_scheduler.step()
 
