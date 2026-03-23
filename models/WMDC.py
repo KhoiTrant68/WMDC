@@ -258,6 +258,10 @@ class WMDC(CompressionModel):
     # -----------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> dict:
+        assert x.dtype == torch.float32, (
+            f"WMDC requires FP32 input, got {x.dtype}. "
+            "Sinkhorn OT logsumexp overflows in FP16/BF16."
+        )
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
             raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
 
@@ -303,6 +307,9 @@ class WMDC(CompressionModel):
             mu = self.cc_mean_transforms[i](support)
             scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
+            # Single call: uniform noise relaxation for rate (likelihood),
+            # STE rounding for the network path (y_hat_slice).
+            # Gradients flow through the STE identity branch — no detach.
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
                 y_slice, scale, means=mu
             )
@@ -323,7 +330,8 @@ class WMDC(CompressionModel):
             # direct gaussian_conditional output + same LRP — so their memory
             # trajectories diverged during training vs. inference.
             if i < self.num_slices - 1:
-                state_input = torch.cat([memory_state, y_hat_slice.detach()], dim=1)
+                # No detach: STE carries gradients, rounding matches inference.
+                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
                 memory_state = memory_state + self.memory_updaters[i](state_input)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
@@ -343,6 +351,10 @@ class WMDC(CompressionModel):
     # -----------------------------------------------------------------------
 
     def compress(self, x: torch.Tensor) -> dict:
+        assert x.dtype == torch.float32, (
+            f"WMDC requires FP32 input, got {x.dtype}. "
+            "Sinkhorn OT logsumexp overflows in FP16/BF16."
+        )
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
             raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
 

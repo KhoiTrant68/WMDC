@@ -110,6 +110,11 @@ class RateDistortionLoss(nn.Module):
         self.lmbda = lmbda
         self.metric = metric
         self.disp_weight = disp_weight
+        # EMA buffers for stable dispersion scaling.
+        # register_buffer ensures correct save/restore via state_dict
+        # and prevents updates during validation (guarded by self.training).
+        self.register_buffer("ema_bpp", torch.tensor(1.0))
+        self.register_buffer("ema_disp", torch.tensor(1.0))
 
     def forward(self, output: dict, target: torch.Tensor) -> dict:
         num_pixels = target.size(0) * target.size(2) * target.size(3)
@@ -130,11 +135,12 @@ class RateDistortionLoss(nn.Module):
             disp = output["dispersion_loss"]
             out["dispersion_loss"] = disp
 
-            # Adaptive scale: keep dispersion commensurate with BPP.
-            # Detach both to avoid second-order gradients through the scale.
-            with torch.no_grad():
-                scale = (bpp_loss.abs() / (disp.abs() + 1e-8)).clamp(0.01, 10.0)
+            if self.training:
+                with torch.no_grad():
+                    self.ema_bpp.mul_(0.99).add_(bpp_loss.abs(), alpha=0.01)
+                    self.ema_disp.mul_(0.99).add_(disp.abs(), alpha=0.01)
 
+            scale = (self.ema_bpp / (self.ema_disp + 1e-8)).clamp(0.01, 10.0)
             out["loss"] = out["loss"] + self.disp_weight * scale * disp
 
         return out
@@ -468,6 +474,8 @@ def main():
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("best_loss", float("inf"))
+        if "criterion" in ckpt:
+            criterion.load_state_dict(ckpt["criterion"])
 
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(
@@ -501,6 +509,7 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "aux_optimizer": aux_optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
+                "criterion": criterion.state_dict(),
             }
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
             if test_loss < best_loss:
