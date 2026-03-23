@@ -88,13 +88,14 @@ def pad_to_multiple(x: torch.Tensor, p: int = 64):
 
 class RateDistortionLoss(nn.Module):
     """
-    Rate-distortion loss with optional dispersion regularisation.
+    Rate-distortion loss with adaptive dispersion regularisation.
 
-    L = λ · distortion + bpp + w_disp · dispersion
+    L = λ · distortion + bpp + w_disp · scale · dispersion
 
     The dispersion coefficient w_disp is adaptively scaled to keep the
-    dispersion term commensurate with the BPP term.  A clamp [0.01, 10]
-    prevents it from either vanishing or dominating.
+    dispersion term commensurate with the BPP term.  EMA buffers track
+    running magnitudes; scale is clamped to [0.01, 10].
+
 
     Args:
         lmbda        : RD tradeoff (MSE: 0.0018–0.05; MS-SSIM: 2.4–115)
@@ -103,18 +104,20 @@ class RateDistortionLoss(nn.Module):
     """
 
     def __init__(
-        self, lmbda: float = 1e-2, metric: str = "mse", disp_weight: float = 0.1
+        self,
+        lmbda: float = 1e-2,
+        metric: str = "mse",
+        disp_weight: float = 0.1,
     ):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.metric = metric
         self.disp_weight = disp_weight
-        # EMA buffers for stable dispersion scaling.
-        # register_buffer ensures correct save/restore via state_dict
-        # and prevents updates during validation (guarded by self.training).
         self.register_buffer("ema_bpp", torch.tensor(1.0))
         self.register_buffer("ema_disp", torch.tensor(1.0))
+        # Track effective coefficient for logging.
+        self.effective_disp_coeff: float = disp_weight
 
     def forward(self, output: dict, target: torch.Tensor) -> dict:
         num_pixels = target.size(0) * target.size(2) * target.size(3)
@@ -141,7 +144,9 @@ class RateDistortionLoss(nn.Module):
                     self.ema_disp.mul_(0.99).add_(disp.abs(), alpha=0.01)
 
             scale = (self.ema_bpp / (self.ema_disp + 1e-8)).clamp(0.01, 10.0)
-            out["loss"] = out["loss"] + self.disp_weight * scale * disp
+            effective = float(self.disp_weight * scale.item())
+            self.effective_disp_coeff = effective
+            out["loss"] = out["loss"] + effective * disp
 
         return out
 
@@ -237,9 +242,54 @@ def train_one_epoch(
                 writer.add_scalar("Train/RD_Loss", rd_meter.avg, step)
                 writer.add_scalar("Train/Aux_Loss", aux_meter.avg, step)
                 writer.add_scalar("Train/Bpp", bpp_meter.avg, step)
-                writer.add_scalar("Train/Dispersion", disp_meter.avg, step)
+                writer.add_scalar("Train/Dispersion_raw", disp_meter.avg, step)
+                writer.add_scalar(
+                    "Train/Dispersion_eff_coeff",
+                    criterion.effective_disp_coeff,
+                    step,
+                )
 
     return rd_meter.avg
+
+
+# ---------------------------------------------------------------------------
+# Train/inference gap measurement
+# ---------------------------------------------------------------------------
+
+
+def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> float:
+    """
+    Measure PSNR gap between forward() (noise relaxation) and
+    compress/decompress() (true quantisation) on the same batch.
+
+    A gap > 0.5 dB indicates a meaningful train/inference distribution
+    mismatch that will hurt deployment performance.
+
+    Returns:
+        delta_psnr : PSNR(forward) − PSNR(compress/decompress)  [dB]
+    """
+    model.eval()
+
+    # Pad to multiple of 64.
+    d_padded, H_orig, W_orig = pad_to_multiple(batch.to(device), p=64)
+
+    with torch.no_grad():
+        # Path A: differentiable forward (noise relaxation).
+        out_fwd = model(d_padded)
+        x_hat_fwd = out_fwd["x_hat"][:, :, :H_orig, :W_orig].clamp(0, 1)
+
+        mse_fwd = F.mse_loss(batch.to(device), x_hat_fwd)
+        psnr_fwd = -10 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
+
+        # Path B: true compress → decompress.
+        out_enc = model.compress(d_padded)
+        out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
+        x_hat_dec = out_dec["x_hat"][:, :, :H_orig, :W_orig].clamp(0, 1)
+
+        mse_dec = F.mse_loss(batch.to(device), x_hat_dec)
+        psnr_dec = -10 * math.log10(mse_dec.item()) if mse_dec.item() > 0 else 100.0
+
+    return psnr_fwd - psnr_dec
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +297,35 @@ def train_one_epoch(
 # ---------------------------------------------------------------------------
 
 
-def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
+def test_epoch(
+    epoch,
+    test_dataloader,
+    model,
+    criterion,
+    logger,
+    writer,
+    accelerator,
+    gap_check: bool = False,
+):
     """
-    Validation with corrected BPP accounting.
+    Validation with correct BPP denominator.
+
+    BPP is now normalised to *original* (unpadded) pixel count to match
+    eval.py exactly.
+    Correct formula:
+        bpp_padded   = likelihood_bits / num_pixels_pad
+        bpp_original = bpp_padded * (num_pixels_pad / num_pixels_orig)
+
+    This is equivalent to:
+        bpp_original = likelihood_bits / num_pixels_orig
+    which is the standard definition used in compression literature.
     """
     model.eval()
     psnr_meter = AverageMeter()
     bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
+    gap_psnr: float = 0.0
+    gap_measured: bool = False
 
     with torch.no_grad():
         for i, d in tqdm(
@@ -266,32 +337,33 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             d_padded, H_orig, W_orig = pad_to_multiple(d, p=64)
             out_net = model(d_padded)
 
-            # Crop reconstruction to original dimensions
+            # Crop reconstruction to original dimensions.
             x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
             d_orig = d[:, :, :H_orig, :W_orig]
 
-            # ── Image logging ─────────────────────────────────────────────
+            # Image logging.
             if i == 0 and accelerator.is_main_process and writer is not None:
                 n = min(d_orig.size(0), 4)
                 cmp = torch.cat([d_orig[:n], x_hat[:n]])
                 grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
-                writer.add_image("Val/Reconstruction (Top:Orig, Bot:Rec)", grid, epoch)
+                writer.add_image("Val/Reconstruction", grid, epoch)
 
-            # ── BPP: divide by PADDED pixel count (consistent denominator) ─
-            # The likelihood tensor covers the entire padded spatial extent.
+            # ── BPP normalised to original pixel count ────────────────
             B = d_padded.size(0)
             H_pad = d_padded.size(2)
             W_pad = d_padded.size(3)
             num_pixels_pad = B * H_pad * W_pad
             num_pixels_orig = B * H_orig * W_orig
 
-            bpp_val = compute_bpp(out_net, num_pixels_pad)
+            # Likelihood tensor covers padded area; rescale to original.
+            bpp_padded = compute_bpp(out_net, num_pixels_pad)
+            bpp_val = bpp_padded * (num_pixels_pad / num_pixels_orig)
 
-            # ── Distortion on original (unpadded) region ───────────────────
+            # Distortion on original (unpadded) region.
             mse_val = F.mse_loss(x_hat, d_orig)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
 
-            # ── Loss for checkpoint selection ──────────────────────────────
+            # Loss for checkpoint selection — uses original-pixel BPP.
             if criterion.metric == "mse":
                 loss_val = criterion.lmbda * 255.0**2 * mse_val + bpp_val
             else:
@@ -303,7 +375,8 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             metrics = (
                 accelerator.gather(
                     torch.tensor(
-                        [psnr_val, bpp_val, loss_val], device=accelerator.device
+                        [psnr_val, bpp_val.item(), loss_val.item()],
+                        device=accelerator.device,
                     )
                 )
                 .view(-1, 3)
@@ -313,18 +386,35 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
             bpp_meter.update(metrics[1].item())
             loss_meter.update(metrics[2].item())
 
+            # Train/inference gap on first batch only (expensive: runs compress).
+            if gap_check and not gap_measured and accelerator.is_main_process:
+                try:
+                    gap_psnr = measure_train_inference_gap(
+                        accelerator.unwrap_model(model),
+                        d[:1],  # single image to keep it fast
+                        device=str(accelerator.device),
+                    )
+                    gap_measured = True
+                except Exception as e:
+                    gap_psnr = float("nan")
+                    if logger:
+                        logger.warning(f"Gap check failed: {e}")
+                    gap_measured = True
+
     if accelerator.is_main_process:
         if logger:
             logger.info(
                 f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | "
                 f"PSNR: {psnr_meter.avg:.2f} dB | "
-                f"BPP (pad-based): {bpp_meter.avg:.4f} "
-                f"[NOTE: report eval.py BPP in paper]"
+                f"BPP (original pixels): {bpp_meter.avg:.4f}"
+                + (f" | Train/Infer ΔPSNR: {gap_psnr:+.3f} dB" if gap_measured else "")
             )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
             writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
-            writer.add_scalar("Val/Bpp_pad", bpp_meter.avg, epoch)
+            writer.add_scalar("Val/Bpp_orig", bpp_meter.avg, epoch)
+            if gap_measured and not math.isnan(gap_psnr):
+                writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
 
     return loss_meter.avg
 
@@ -360,17 +450,27 @@ def parse_args():
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--metric", type=str, default="mse", choices=["mse", "ms-ssim"])
+    p.add_argument("--disp-weight", type=float, default=0.1)
+    p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument(
-        "--disp-weight",
-        type=float,
-        default=0.1,
-        help="Base weight for dispersion loss (adaptive scaling applied)",
+        "--sinkhorn-iters",
+        type=int,
+        default=20,
+        help="Sinkhorn iterations. ≥20 recommended for ot_eps=0.1 (C_max/eps = 20).",
     )
     p.add_argument(
-        "--ot-eps",
-        type=float,
-        default=0.1,
-        help="Fixed Sinkhorn entropic regularisation ε",
+        "--lr-milestones",
+        type=int,
+        nargs="+",
+        default=[60, 85],
+        help="Epoch milestones for MultiStepLR. Default: [60, 85] (was [3, 12]).",
+    )
+    p.add_argument("--lr-gamma", type=float, default=0.1)
+    p.add_argument(
+        "--gap-check-interval",
+        type=int,
+        default=10,
+        help="Measure train/inference PSNR gap every N epochs. 0=never.",
     )
     p.add_argument("--seed", type=int, default=2026)
     return p.parse_args()
@@ -444,12 +544,14 @@ def main():
         num_slices=5,
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
     )
     optimizer, aux_optimizer = configure_optimizers(model, args)
 
-    # MultiStepLR
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=[3, 12], gamma=0.1
+        optimizer,
+        milestones=args.lr_milestones,
+        gamma=args.lr_gamma,
     )
     criterion = RateDistortionLoss(
         lmbda=args.lmbda,
@@ -457,10 +559,20 @@ def main():
         disp_weight=args.disp_weight,
     )
 
-    (model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler) = (
-        accelerator.prepare(
-            model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
-        )
+    (
+        model,
+        optimizer,
+        aux_optimizer,
+        train_loader,
+        test_loader,
+        lr_scheduler,
+    ) = accelerator.prepare(
+        model,
+        optimizer,
+        aux_optimizer,
+        train_loader,
+        test_loader,
+        lr_scheduler,
     )
 
     start_epoch = 0
@@ -490,6 +602,11 @@ def main():
             writer,
             accelerator,
         )
+
+        run_gap = (
+            args.gap_check_interval > 0 and (epoch + 1) % args.gap_check_interval == 0
+        )
+
         test_loss = test_epoch(
             epoch,
             test_loader,
@@ -498,6 +615,7 @@ def main():
             logger,
             writer,
             accelerator,
+            gap_check=run_gap,
         )
         lr_scheduler.step()
 
@@ -510,12 +628,17 @@ def main():
                 "aux_optimizer": aux_optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
                 "criterion": criterion.state_dict(),
+                "args": vars(args),
             }
             torch.save(state, os.path.join(save_dir, "checkpoint_latest.pth.tar"))
             if test_loss < best_loss:
                 best_loss = test_loss
                 state["best_loss"] = best_loss
                 torch.save(state, os.path.join(save_dir, "checkpoint_best.pth.tar"))
+                if logger:
+                    logger.info(
+                        f"New best checkpoint at epoch {epoch}: loss={best_loss:.4f}"
+                    )
 
 
 if __name__ == "__main__":

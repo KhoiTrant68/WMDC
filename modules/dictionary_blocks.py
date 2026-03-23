@@ -79,8 +79,7 @@ class QueryDictionaryGenerator(nn.Module):
 
 class UnifiedDictionaryAttention(nn.Module):
     """
-    Unified Dictionary Attention with three routing modes, derived from
-    the authors' reference implementation.
+    Unified Dictionary Attention with three routing modes.
 
     Routing modes
     -------------
@@ -113,13 +112,13 @@ class UnifiedDictionaryAttention(nn.Module):
         log pi_{ij} = (f_i + g_j - C_{ij}) / eps + log_alpha + log_beta
 
     Args:
-        input_dim   : input channel count
+        input_dim   : input channel count for query projection
         output_dim  : output channels after out_proj
         dict_num    : N (number of dictionary tokens)
         dict_dim    : D (token embedding dimension)
-        tau         : softmax temperature (only for 'softmax' mode)
-        ot_eps      : fixed Sinkhorn blur eps (scalar). Fixed for convergence.
-        iters       : Sinkhorn iterations
+        tau         : softmax temperature (softmax mode only)
+        ot_eps      : Sinkhorn entropic regularisation ε (scalar).
+        iters       : Sinkhorn iterations (≥20 recommended for eps=0.1)
         routing_mode: {'softmax', 'balanced_eot', 'unbalanced_eot'}
     """
 
@@ -131,7 +130,7 @@ class UnifiedDictionaryAttention(nn.Module):
         dict_dim: int = 640,
         tau: float = 0.5,
         ot_eps: float = 0.1,
-        iters: int = 3,
+        iters: int = 20,
         routing_mode: str = "unbalanced_eot",
     ):
         super().__init__()
@@ -149,9 +148,8 @@ class UnifiedDictionaryAttention(nn.Module):
         # Query projection
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
 
-        # Frozen depthwise spatial smoothing of cost matrix.
-        # Kept frozen: learned smoothing can degenerate to identity or sharpen
-        # excessively, both of which hurt routing stability.
+        # Learnable depthwise spatial smoothing, identity-initialised.
+        # Frozen uniform average has no compression-theoretic justification.
         self.spatial_smooth = nn.Conv2d(
             dict_num,
             dict_num,
@@ -161,11 +159,13 @@ class UnifiedDictionaryAttention(nn.Module):
             bias=False,
             padding_mode="reflect",
         )
-        nn.init.constant_(self.spatial_smooth.weight, 1.0 / 9.0)
-        self.spatial_smooth.weight.requires_grad_(False)
+        # Initialise to identity: centre pixel only, zero bias.
+        nn.init.zeros_(self.spatial_smooth.weight)
+        self.spatial_smooth.weight.data[:, 0, 1, 1] = 1.0  # centre pixel
+        nn.init.zeros_(self.spatial_smooth.bias)
+        # Now learnable — will deviate from identity as training proceeds.
 
-        # Output projection.  GroupNorm(1, dict_dim) stabilises magnitudes from
-        # the unnormalised unbalanced OT plan (entries need not sum to 1).
+        # Output projection with GroupNorm to stabilise unnormalised OT plan.
         self.out_proj = nn.Sequential(
             nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
             nn.GroupNorm(1, dict_dim),
@@ -173,7 +173,7 @@ class UnifiedDictionaryAttention(nn.Module):
             nn.Conv2d(dict_dim, output_dim, 1),
         )
 
-        # Set externally by forward hook for visualisation
+        # Set externally by forward hook for visualisation.
         self.attn_probs: torch.Tensor = None
 
     # -----------------------------------------------------------------------
@@ -184,13 +184,12 @@ class UnifiedDictionaryAttention(nn.Module):
         self, x: torch.Tensor, k: torch.Tensor, H: int, W: int
     ) -> torch.Tensor:
         """
-        Compute the smoothed cosine-distance cost matrix C ∈ [0, 2].
-
-        C_{ij} = 1 − cos(q_i, k_j)
+        Smoothed cosine-distance cost matrix C ∈ [0, 2].
+            C_{ij} = 1 − cos(q_i, k_j)
 
         Args:
             x : (B, input_dim, H, W)
-            k : (B, N, D) dictionary keys
+            k : (B, N, D) dictionary keys (pre-projected, per-slice)
             H, W : spatial dimensions
 
         Returns:
@@ -205,69 +204,121 @@ class UnifiedDictionaryAttention(nn.Module):
 
         C_mat = 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))  # (B, HW, N)
 
-        # Spatial smoothing in (B, N, H, W) space
+        # Learnable spatial smoothing in (B, N, H, W) space.
         C_sp = C_mat.transpose(1, 2).contiguous().view(B, self.dict_num, H, W)
         C_sp = self.spatial_smooth(C_sp)
         C_mat = C_sp.view(B, self.dict_num, HW).transpose(1, 2).contiguous()
         return C_mat
 
     # -----------------------------------------------------------------------
-    # Softmin operators
+    # Log-domain Sinkhorn: balanced
     # -----------------------------------------------------------------------
 
-    @staticmethod
-    def _softmin_x(
-        f: torch.Tensor, log_alpha: float, C_mat: torch.Tensor, eps: float
-    ) -> torch.Tensor:
+    def _route_balanced_eot(self, C_mat: torch.Tensor) -> torch.Tensor:
         """
-        Softmin over source positions i (HW dim → becomes col output N).
+        Balanced Sinkhorn OT in log-domain.
 
-        Matches authors' softmin_x from utils.py:
-            softmin_x(f_i, ep)_j = -ep * LSE_i[ (f_i/ep + log(a_i)) - C_{ij}/ep ]
-                                  = -ep * LSE_i[ (f_i + ep*log(a_i) - C_{ij}) / ep ]
+        Log-domain updates (Peyré & Cuturi 2019, Alg. 2):
+            log g_j = log β_j − LSE_i[ log α_i + log f_i − C_{ij}/ε ]
+            log f_i = log α_i − LSE_j[ log β_j + log g_j − C_{ij}/ε ]
 
-        Args:
-            f        : (B, HW)  source dual potential
-            log_alpha: scalar = log(1/HW)
-            C_mat    : (B, HW, N)
-            eps      : scalar
+        Uniform marginals: α_i = 1/HW, β_j = 1/N.
+        Transport plan:
+            log π_{ij} = (log f_i + log g_j − C_{ij}/ε) + log α_i + log β_j
 
         Returns:
-            (B, N)  target dual potential update (positive for typical C > 0)
+            P : (B, HW, N) transport plan (not row-stochastic; mass ~1)
         """
-        # (f/eps + log_alpha): (B, HW)
-        # Expand to (B, 1, HW) then broadcast with (B, N, HW) from C.T / eps
-        # logsumexp over the HW dimension (dim=2 in B×N×HW)
-        inner = (f / eps + log_alpha).unsqueeze(1) - C_mat.transpose(
-            1, 2
-        ) / eps  # (B, N, HW)
-        return -eps * torch.logsumexp(inner, dim=2)  # (B, N)
+        B, HW, N = C_mat.shape
+        eps = self.ot_eps
+        log_alpha = -math.log(HW)  # scalar log(1/HW)
+        log_beta = -math.log(N)  # scalar log(1/N)
 
-    @staticmethod
-    def _softmin_y(
-        g: torch.Tensor, log_beta: float, C_mat: torch.Tensor, eps: float
+        # Scaled cost for numerical stability.
+        M = C_mat / eps  # (B, HW, N)
+
+        log_f = torch.zeros(B, HW, device=C_mat.device, dtype=C_mat.dtype)
+        log_g = torch.zeros(B, N, device=C_mat.device, dtype=C_mat.dtype)
+
+        for _ in range(self.iters):
+            # log g_j = log_beta − LSE_i[ log_alpha + log_f_i − M_{ij} ]
+            #         = log_beta − LSE_i[ (log_f_i + log_alpha) − M_{ij} ]
+            inner_g = (log_f + log_alpha).unsqueeze(2) - M  # (B, HW, N)
+            log_g = log_beta - torch.logsumexp(inner_g, dim=1)  # (B, N)
+
+            # log f_i = log_alpha − LSE_j[ log_beta + log_g_j − M_{ij} ]
+            inner_f = (log_g + log_beta).unsqueeze(1) - M  # (B, HW, N)
+            log_f = log_alpha - torch.logsumexp(inner_f, dim=2)  # (B, HW)
+
+        # log π_{ij} = log_f_i + log_g_j − M_{ij} + log_alpha + log_beta
+        log_P = (
+            log_f.unsqueeze(2) + log_g.unsqueeze(1) - M + log_alpha + log_beta
+        )  # (B, HW, N)
+        return torch.exp(log_P)  # safe: log_P is properly bounded by log-domain ops
+
+    # -----------------------------------------------------------------------
+    # Log-domain Sinkhorn: KL-unbalanced (spatially-varying rho)
+    # -----------------------------------------------------------------------
+
+    def _route_unbalanced_eot(
+        self, C_mat: torch.Tensor, rho_flat: torch.Tensor
     ) -> torch.Tensor:
         """
-        Softmin over target positions j (N dim → becomes row output HW).
+        KL-unbalanced Sinkhorn OT in log-domain with spatially-varying ρ(x).
 
-        Matches authors' softmin_y from utils.py:
-            softmin_y(g_j, ep)_i = -ep * LSE_j[ (g_j/ep + log(b_j)) - C_{ij}/ep ]
-                                  = -ep * LSE_j[ (g_j + ep*log(b_j) - C_{ij}) / ep ]
+        KL aprox (Séjourné et al. 2022, KullbackLeibler.aprox):
+            aprox_ρ(p) = ρ/(ρ+ε) · p          (scalar p)
+
+        Log-domain unbalanced updates:
+            log g_j = shrink_col · (log β_j − LSE_i[ log α_i + log f_i − M_{ij} ])
+            log f_i = shrink_row_i · (log α_i − LSE_j[ log β_j + log g_j − M_{ij} ])
+
+        where:
+            shrink_row_i = ρ(x_i) / (ρ(x_i) + ε)    per source position (B, HW)
+            shrink_col   = ρ_mean / (ρ_mean + ε)      global mean for target (B, 1)
+
+        rho_flat is fully differentiable — gradients flow to rho_predictor
+        through every Sinkhorn iteration.
 
         Args:
-            g        : (B, N)   target dual potential
-            log_beta : scalar = log(1/N)
             C_mat    : (B, HW, N)
-            eps      : scalar
+            rho_flat : (B, HW) spatially-varying KL reach, strictly > 0
 
         Returns:
-            (B, HW)  source dual potential update
+            P : (B, HW, N) transport plan
         """
-        # (g/eps + log_beta): (B, N)
-        # Expand to (B, 1, N) then broadcast with (B, HW, N) / eps
-        # logsumexp over the N dimension (dim=2 in B×HW×N)
-        inner = (g / eps + log_beta).unsqueeze(1) - C_mat / eps  # (B, HW, N)
-        return -eps * torch.logsumexp(inner, dim=2)  # (B, HW)
+        B, HW, N = C_mat.shape
+        eps = self.ot_eps
+        log_alpha = -math.log(HW)
+        log_beta = -math.log(N)
+
+        M = C_mat / eps  # (B, HW, N)
+
+        # Per-source shrinkage: (B, HW) — differentiable w.r.t. rho_flat.
+        shrink_row = rho_flat / (rho_flat + eps)  # (B, HW)
+
+        # Global shrinkage for target (dictionary) side.
+        rho_mean = rho_flat.mean(dim=1, keepdim=True)  # (B, 1)
+        shrink_col = rho_mean / (rho_mean + eps)  # (B, 1)
+
+        log_f = torch.zeros(B, HW, device=C_mat.device, dtype=C_mat.dtype)
+        log_g = torch.zeros(B, N, device=C_mat.device, dtype=C_mat.dtype)
+
+        for _ in range(self.iters):
+            # Unbalanced target update
+            inner_g = (log_f + log_alpha).unsqueeze(2) - M  # (B, HW, N)
+            raw_g = log_beta - torch.logsumexp(inner_g, dim=1)  # (B, N)
+            log_g = shrink_col * raw_g  # (B, N); shrink_col is (B, 1) — broadcasts
+
+            # Unbalanced source update (spatially-varying shrinkage)
+            inner_f = (log_g + log_beta).unsqueeze(1) - M  # (B, HW, N)
+            raw_f = log_alpha - torch.logsumexp(inner_f, dim=2)  # (B, HW)
+            log_f = shrink_row * raw_f  # (B, HW); element-wise
+
+        log_P = (
+            log_f.unsqueeze(2) + log_g.unsqueeze(1) - M + log_alpha + log_beta
+        )  # (B, HW, N)
+        return torch.exp(log_P)
 
     # -----------------------------------------------------------------------
     # Routing: softmax
@@ -277,116 +328,38 @@ class UnifiedDictionaryAttention(nn.Module):
         return F.softmax(-C_mat / self.tau, dim=-1)  # (B, HW, N)
 
     # -----------------------------------------------------------------------
-    # Routing: balanced EOT
-    # -----------------------------------------------------------------------
-
-    def _route_balanced_eot(self, C_mat: torch.Tensor) -> torch.Tensor:
-        """
-        Balanced Sinkhorn OT using authors' update rule:
-            g_j = -aprox(-softmin_x(f_i))  with aprox = identity
-                = softmin_x(f_i)
-            f_i = softmin_y(g_j)
-
-        Plan: pi_{ij} = exp((f_i+g_j-C_{ij})/eps) * alpha_i * beta_j
-        """
-        B, HW, N = C_mat.shape
-        eps = self.ot_eps
-        log_alpha = math.log(1.0 / HW)  # log(alpha_i), scalar
-        log_beta = math.log(1.0 / N)  # log(beta_j),  scalar
-
-        f = C_mat.new_zeros(B, HW)
-        g = C_mat.new_zeros(B, N)
-
-        for _ in range(self.iters):
-            # g_j = softmin_x(f_i)  [authors: g = -aprox(-softmin_x(f)) = softmin_x(f)]
-            g = self._softmin_x(f, log_alpha, C_mat, eps)  # (B, N)
-            # f_i = softmin_y(g_j)
-            f = self._softmin_y(g, log_beta, C_mat, eps)  # (B, HW)
-
-        # pi_{ij} = exp((f_i+g_j-C_{ij})/eps + log_alpha + log_beta)
-        logits = (f.unsqueeze(2) + g.unsqueeze(1) - C_mat) / eps + log_alpha + log_beta
-        return torch.exp(torch.clamp(logits, max=20.0))  # (B, HW, N)
-
-    # -----------------------------------------------------------------------
-    # Routing: KL-unbalanced EOT (KL penalty, spatially-varying rho)
-    # -----------------------------------------------------------------------
-
-    def _route_unbalanced_eot(
-        self, C_mat: torch.Tensor, rho_flat: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        KL-unbalanced Sinkhorn OT using authors' update rule:
-            g_j = -aprox(-softmin_x(f_i))
-                = shrink_col * softmin_x(f_i)   [KL: -aprox(-p) = shrink*p]
-            f_i = shrink_row * softmin_y(g_j)
-
-        KL aprox from authors' entropy.py (KullbackLeibler.aprox):
-            aprox(x) = (1/(1 + eps/rho)) * x = rho/(rho+eps) * x
-            -aprox(-p) = rho/(rho+eps) * p = shrink * p
-
-        Spatially-varying rho(x_i) per §4.7.2 of Séjourné et al.:
-            shrink_row_i = rho(x_i) / (rho(x_i) + eps)   per source position
-            shrink_col   = rho_mean / (rho_mean + eps)    global mean for target
-
-        Args:
-            C_mat    : (B, HW, N)
-            rho_flat : (B, HW) spatially-varying KL reach, clamped > 0
-        """
-        B, HW, N = C_mat.shape
-        eps = self.ot_eps
-        log_alpha = math.log(1.0 / HW)
-        log_beta = math.log(1.0 / N)
-
-        # Per-source shrinkage: rho(x_i)/(rho(x_i)+eps), shape (B, HW)
-        shrink_row = rho_flat / (rho_flat + eps)
-
-        # Global shrinkage for target (dictionary) side
-        rho_mean = rho_flat.mean(dim=1, keepdim=True)  # (B, 1)
-        shrink_col = rho_mean / (rho_mean + eps)  # (B, 1)
-
-        f = C_mat.new_zeros(B, HW)
-        g = C_mat.new_zeros(B, N)
-
-        for _ in range(self.iters):
-            # g_j = shrink_col * softmin_x(f_i)
-            g = shrink_col * self._softmin_x(f, log_alpha, C_mat, eps)  # (B, N)
-            # f_i = shrink_row * softmin_y(g_j)   (spatially-varying shrinkage)
-            f = shrink_row * self._softmin_y(g, log_beta, C_mat, eps)  # (B, HW)
-
-        # pi_{ij} = exp((f_i+g_j-C_{ij})/eps + log_alpha + log_beta)
-        logits = (f.unsqueeze(2) + g.unsqueeze(1) - C_mat) / eps + log_alpha + log_beta
-        return torch.exp(torch.clamp(logits, max=20.0))  # (B, HW, N)
-
-    # -----------------------------------------------------------------------
-    # Dispersion loss: token utilisation entropy maximisation
+    # Dispersion loss
     # -----------------------------------------------------------------------
 
     @staticmethod
     def _dispersion_loss(P: torch.Tensor) -> torch.Tensor:
         """
-        Maximise Shannon entropy of the token utilisation marginal.
+        Maximise Shannon entropy of the *true* OT target marginal.
 
-        Prevents dictionary collapse by encouraging all N tokens to be used
-        roughly equally across the image.
+        Original bug: the code row-normalised P (making it row-stochastic),
+        then averaged rows to get a "marginal".  This is NOT the OT marginal
+        and discards the spatial mass variation produced by rho_spatial.
 
-        Steps:
-          1. Row-normalise P → proper conditional routing over tokens.
-          2. Average over HW positions → token utilisation marginal ∈ Delta^{N-1}.
-          3. Return -H(marginal) as loss (minimising → maximising diversity).
+        Correct target marginal:
+            marginal_j = Σ_i P_{ij}    (total mass routed to token j)
+
+        This is the quantity that should be uniform for a well-used dictionary.
 
         Args:
-            P : (B, HW, N) routing plan
+            P : (B, HW, N) routing plan (NOT necessarily row-stochastic)
 
         Returns:
-            scalar ≥ 0  (0 when all tokens used uniformly)
+            scalar ≥ 0  (0 when all tokens receive equal total mass)
         """
-        # Row-normalise: conditional distribution over tokens for each spatial pos
-        P_row = P / (P.sum(dim=2, keepdim=True) + 1e-8)  # (B, HW, N)
-        # Marginal: average over spatial positions
-        marg = P_row.mean(dim=1)  # (B, N)
-        # Entropy
-        H = -(marg * (marg + 1e-8).log()).sum(dim=1).mean()  # scalar
-        return -H  # minimise → maximise diversity
+        # True target marginal: sum over source positions.
+        target_marginal = P.sum(dim=1)  # (B, N) — mass at each dictionary token
+        # Normalise to a probability vector for entropy computation.
+        target_marginal = target_marginal / (
+            target_marginal.sum(dim=1, keepdim=True) + 1e-8
+        )  # (B, N) in simplex
+        # Entropy H = -Σ p log p; we return -H so minimising → maximising diversity.
+        H = -(target_marginal * (target_marginal + 1e-8).log()).sum(dim=1).mean()
+        return -H  # scalar ≥ 0
 
     # -----------------------------------------------------------------------
     # Forward
@@ -403,9 +376,9 @@ class UnifiedDictionaryAttention(nn.Module):
         """
         Args:
             x           : (B, input_dim, H, W)  spatial query features
-            k           : (B, N, D)              pre-projected dict keys  (from WMDC)
-            v           : (B, N, D)              pre-projected dict values (from WMDC)
-            rho_spatial : (B, H, W)              spatially-varying KL mass penalty ρ(x)
+            k           : (B, N, D)  pre-projected dict keys  (per-slice from WMDC)
+            v           : (B, N, D)  pre-projected dict values (per-slice from WMDC)
+            rho_spatial : (B, H, W)  spatially-varying KL mass penalty ρ(x)
                           Ignored for 'softmax' and 'balanced_eot' modes.
             calc_disp   : if True, compute and return dispersion loss
 
@@ -422,6 +395,7 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.routing_mode == "softmax":
             P = self._route_softmax(C_mat)
             if self.training:
+                # Keep rho in the compute graph to avoid DDP unused-param error.
                 P = P + 0.0 * rho_spatial.sum()
 
         elif self.routing_mode == "balanced_eot":
@@ -430,14 +404,13 @@ class UnifiedDictionaryAttention(nn.Module):
                 P = P + 0.0 * rho_spatial.sum()
 
         elif self.routing_mode == "unbalanced_eot":
-            # Flatten and clamp rho: (B, H, W) → (B, HW), strictly positive
             rho_flat = rho_spatial.view(B, HW).clamp(min=0.01)
             P = self._route_unbalanced_eot(C_mat, rho_flat)
 
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode}")
 
-        # Store for external analysis / visualisation hooks
+        # Store for external analysis / visualisation hooks.
         self.attn_probs = P.detach()
 
         # ── Value aggregation ─────────────────────────────────────────────────

@@ -54,7 +54,13 @@ def main():
         "--ot-eps",
         type=float,
         default=0.1,
-        help="Must match the value used during training",
+        help="Must match the value used during training.",
+    )
+    parser.add_argument(
+        "--sinkhorn-iters",
+        type=int,
+        default=20,
+        help="Must match the value used during training.",
     )
     parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
@@ -70,6 +76,7 @@ def main():
         num_slices=5,
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
     ).to(device)
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -86,6 +93,7 @@ def main():
     )
 
     results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
+    per_image = []
 
     with torch.no_grad():
         for img_path in image_paths:
@@ -111,6 +119,7 @@ def main():
 
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
+            # BPP always over original (unpadded) pixel count.
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)
             mse = F.mse_loss(x, x_hat)
             psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100.0
@@ -122,17 +131,33 @@ def main():
             results["enc_time"].append(enc_time)
             results["dec_time"].append(dec_time)
 
+            per_image.append(
+                {
+                    "file": os.path.basename(img_path),
+                    "bpp": round(bpp, 4),
+                    "psnr": round(psnr, 2),
+                    "ms_ssim": round(msssim, 4),
+                    "enc_time": round(enc_time, 3),
+                    "dec_time": round(dec_time, 3),
+                }
+            )
+
             print(
-                f"Image: {os.path.basename(img_path)} | "
+                f"{os.path.basename(img_path)} | "
                 f"BPP: {bpp:.4f} | PSNR: {psnr:.2f} dB | "
                 f"MS-SSIM: {msssim:.4f} | "
                 f"Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
             )
 
     avg_results = {k: sum(v) / len(v) for k, v in results.items()}
+    report = {
+        "average": avg_results,
+        "per_image": per_image,
+        "args": vars(args),
+    }
     report_path = os.path.join(args.output, "RD_report.json")
     with open(report_path, "w") as f:
-        json.dump(avg_results, f, indent=4)
+        json.dump(report, f, indent=4)
 
     print(f"\nAverage results saved to {report_path}")
     print(f"  BPP:     {avg_results['bpp']:.4f}")

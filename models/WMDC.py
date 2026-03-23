@@ -12,7 +12,7 @@ from modules.dictionary_blocks import (
 )
 from modules.utils import conv, deconv
 from modules.VSS_module import VSSBlock
-from modules.wavelet_blocks import FrequencyDisentangledMamba
+from modules.wavelet_blocks import FrequencyDisentangledMamba, GatedMemoryUpdater
 
 
 def ste_round(x: torch.Tensor) -> torch.Tensor:
@@ -29,17 +29,18 @@ class WMDC(CompressionModel):
     Encoder  g_a : image → latent y  (4× stride via FrequencyDisentangledMamba)
     Hyper    h_a : y → z             (2× stride via VSSBlock)
     Hyper-dec:    z_hat → scales, means, dictionary dt
-    Slice loop:   5 autoregressive slices with shared EOT dictionary attention
+    Slice loop:   5 autoregressive slices with per-slice EOT dictionary attention
     Decoder  g_s : y_hat → image reconstruction
 
     Args:
-        N           : number of channels in hyper-encoder/decoder
-        M           : number of latent channels (split into num_slices slices)
-        num_slices  : number of autoregressive channel slices
+        N            : channels in hyper-encoder/decoder
+        M            : latent channels (split into num_slices slices)
+        num_slices   : number of autoregressive channel slices
         dict_head_num: used to set dict_dim = 32 * dict_head_num
-        dict_num    : number of dictionary tokens N
-        routing_mode: {'softmax', 'balanced_eot', 'unbalanced_eot'}
-        ot_eps      : fixed Sinkhorn entropic regularisation ε (scalar)
+        dict_num     : number of dictionary tokens N
+        routing_mode : {'softmax', 'balanced_eot', 'unbalanced_eot'}
+        ot_eps       : fixed Sinkhorn entropic regularisation ε
+        sinkhorn_iters: Sinkhorn iterations (≥20 recommended for eps=0.1)
     """
 
     def __init__(
@@ -51,6 +52,7 @@ class WMDC(CompressionModel):
         dict_num: int = 128,
         routing_mode: str = "unbalanced_eot",
         ot_eps: float = 0.1,
+        sinkhorn_iters: int = 20,
     ):
         super().__init__()
         self.N = N
@@ -123,21 +125,23 @@ class WMDC(CompressionModel):
             nn.GELU(),
             nn.Conv2d(64, 1, 1),  # outputs 1-channel spatial rho map
         )
-        # Zero-init final conv bias so rho starts at softplus(0)=log(2)≈0.69
         nn.init.zeros_(self.rho_predictor[-1].weight)
-        nn.init.zeros_(self.rho_predictor[-1].bias)
+        nn.init.constant_(self.rho_predictor[-1].bias, 2.0)
 
-        # ── Shared Markovian Architecture ──────────────────────────────────
-        # Bootstrap memory state from hyper-prior to prevent Slice-0 blindness
+        # ── Bootstrap memory state ─────────────────────────────────────────
         self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=1)
 
-        # K/V projections computed ONCE per image (shared across slices).
-        # Note: per-slice K/V projections would allow slice-specific dictionary
-        # specialisation (see architectural improvement D1 in review).
-        self.k_proj = nn.Linear(self.dict_dim, self.dict_dim)
-        self.v_proj = nn.Linear(self.dict_dim, self.dict_dim)
+        # ── Per-slice K/V projections ────────────────────────────────
+        # num_slices independent projections for slice-specific
+        # dictionary specialisation (coarse slices ≠ fine slices).
+        self.k_projs = nn.ModuleList(
+            [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
+        )
+        self.v_projs = nn.ModuleList(
+            [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
+        )
 
-        # Shared EOT attention module
+        # ── Shared EOT attention module ────────────────────────────────────
         # input_dim = hyper_prior (2M) + memory_state (slice_ch)
         self.eot_attention = UnifiedDictionaryAttention(
             input_dim=2 * M + self.slice_ch,
@@ -146,22 +150,15 @@ class WMDC(CompressionModel):
             dict_dim=self.dict_dim,
             tau=0.5,
             ot_eps=ot_eps,
-            iters=3,
+            iters=sinkhorn_iters,
             routing_mode=routing_mode,
         )
 
-        # Memory updaters (num_slices - 1: last slice has no successor)
+        # ── GatedMemoryUpdater replaces plain residual-add ────────────
+        # List has num_slices entries; last entry is never called in the loop
+        # but avoids index errors if num_slices changes.
         self.memory_updaters = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(
-                        self.slice_ch * 2, self.slice_ch, kernel_size=3, padding=1
-                    ),
-                    nn.GELU(),
-                    nn.Conv2d(self.slice_ch, self.slice_ch, kernel_size=3, padding=1),
-                )
-                for _ in range(num_slices - 1)
-            ]
+            [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices)]
         )
 
         # ── Slice-specific transforms ──────────────────────────────────────
@@ -213,7 +210,7 @@ class WMDC(CompressionModel):
             ]
         )
 
-        # Zero-init final conv of LRP transforms → identity residual at start
+        # Zero-init LRP output → identity residual at start.
         for transform in self.lrp_transforms:
             nn.init.zeros_(transform[-1].weight)
             nn.init.zeros_(transform[-1].bias)
@@ -279,41 +276,42 @@ class WMDC(CompressionModel):
         # rho(x) controls mass-conservation per position; ε is fixed.
         rho_spatial = self._compute_rho_spatial(hyper_prior)  # (B, H, W)
 
-        # Project dictionary keys and values ONCE (shared across slices)
-        k_dict = self.k_proj(dt)  # (B, N, dict_dim)
-        v_dict = self.v_proj(dt)  # (B, N, dict_dim)
-
         y_slices = y.chunk(self.num_slices, 1)
         y_hat_slices: list = []
         y_likelihood: list = []
 
-        # Initialise memory from hyper-prior (prevents Slice-0 conditional blindness)
         memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
 
-        total_dispersion = torch.zeros(1, device=x.device)
+        total_dispersion = torch.zeros(1, device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
+            # Per-slice K/V projections.
+            k_dict = self.k_projs[i](dt)  # (B, N, dict_dim)
+            v_dict = self.v_projs[i](dt)  # (B, N, dict_dim)
+
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            # Dispersion loss only on Slice 0 (coarsest, most semantically meaningful)
+            # Accumulate dispersion over ALL slices, not just slice 0.
+            # Slice 0 has the least context; averaging gives a more stable signal.
             dict_info, disp_loss = self.eot_attention(
-                query, k_dict, v_dict, rho_spatial, calc_disp=(i == 0)
+                query, k_dict, v_dict, rho_spatial, calc_disp=True
             )
-            if i == 0:
-                total_dispersion = disp_loss
+            total_dispersion = total_dispersion + disp_loss / self.num_slices
 
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
             scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
-            # Single call: uniform noise relaxation for rate (likelihood),
-            # STE rounding for the network path (y_hat_slice).
-            # Gradients flow through the STE identity branch — no detach.
-            y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
-                y_slice, scale, means=mu
-            )
-            y_likelihood.append(y_slice_likelihood)
+            # Use explicit STE rounding to match decompress() exactly.
+            # gaussian_conditional() uses noise for the likelihood path and STE
+            # rounding for the network path — these are the SAME tensor object,
+            # but at inference decompress() uses true integer rounding.
+            # We use ste_round explicitly so the network path is identical to
+            # what the decoder will see, removing the noise-vs-round gap from
+            # the memory trajectory.
+            _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, means=mu)
+            y_hat_slice = ste_round(y_slice - mu) + mu  # matches decompress
 
             # LRP post-processing
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
@@ -321,18 +319,11 @@ class WMDC(CompressionModel):
                 self.lrp_transforms[i](lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
+            y_likelihood.append(y_slice_likelihood)
 
-            # Memory update — use post-LRP y_hat_slice directly (detached).
-            # This EXACTLY matches compress() and decompress(), which also use
-            # the post-LRP y_hat_slice from gaussian_conditional.decompress().
-            # The original STE-rounding path created a three-way mismatch:
-            # forward used STE+re-run-LRP, but compress/decompress used the
-            # direct gaussian_conditional output + same LRP — so their memory
-            # trajectories diverged during training vs. inference.
+            # GatedMemoryUpdater for controlled memory evolution.
             if i < self.num_slices - 1:
-                # No detach: STE carries gradients, rounding matches inference.
-                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-                memory_state = memory_state + self.memory_updaters[i](state_input)
+                memory_state = self.memory_updaters[i](memory_state, y_hat_slice)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
 
@@ -351,10 +342,7 @@ class WMDC(CompressionModel):
     # -----------------------------------------------------------------------
 
     def compress(self, x: torch.Tensor) -> dict:
-        assert x.dtype == torch.float32, (
-            f"WMDC requires FP32 input, got {x.dtype}. "
-            "Sinkhorn OT logsumexp overflows in FP16/BF16."
-        )
+        assert x.dtype == torch.float32, f"WMDC requires FP32 input, got {x.dtype}."
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
             raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
 
@@ -371,9 +359,6 @@ class WMDC(CompressionModel):
 
         rho_spatial = self._compute_rho_spatial(hyper_prior)
 
-        k_dict = self.k_proj(dt)
-        v_dict = self.v_proj(dt)
-
         y_slices = y.chunk(self.num_slices, 1)
         y_hat_slices: list = []
         y_strings: list = []
@@ -381,6 +366,9 @@ class WMDC(CompressionModel):
         memory_state = self.init_memory(hyper_prior)
 
         for i, y_slice in enumerate(y_slices):
+            k_dict = self.k_projs[i](dt)
+            v_dict = self.v_projs[i](dt)
+
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, _ = self.eot_attention(
@@ -395,7 +383,7 @@ class WMDC(CompressionModel):
             y_string = self.gaussian_conditional.compress(y_slice, index, means=mu)
             y_strings.append(y_string)
 
-            # Decompress to get the quantised slice (same as decoder will see)
+            # Decompress to get the quantised slice (same as decoder will see).
             y_hat_slice = self.gaussian_conditional.decompress(
                 y_string, index, means=mu
             )
@@ -407,8 +395,7 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
             if i < self.num_slices - 1:
-                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-                memory_state = memory_state + self.memory_updaters[i](state_input)
+                memory_state = self.memory_updaters[i](memory_state, y_hat_slice)
 
         return {
             "strings": [y_strings, z_strings],
@@ -430,13 +417,13 @@ class WMDC(CompressionModel):
 
         rho_spatial = self._compute_rho_spatial(hyper_prior)
 
-        k_dict = self.k_proj(dt)
-        v_dict = self.v_proj(dt)
-
         y_hat_slices: list = []
         memory_state = self.init_memory(hyper_prior)
 
         for i in range(self.num_slices):
+            k_dict = self.k_projs[i](dt)
+            v_dict = self.v_projs[i](dt)
+
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, _ = self.eot_attention(
@@ -459,8 +446,7 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
             if i < self.num_slices - 1:
-                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-                memory_state = memory_state + self.memory_updaters[i](state_input)
+                memory_state = self.memory_updaters[i](memory_state, y_hat_slice)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
