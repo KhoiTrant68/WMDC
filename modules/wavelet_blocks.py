@@ -97,20 +97,6 @@ class IDWT_2D(nn.Module):
 class GatedMemoryUpdater(nn.Module):
     """
     GRU-style gated memory update.
-
-    Replaces the original residual-add updater which had no gate control,
-    allowing unbounded memory drift.  The gate learns how much of the previous
-    memory state to retain vs. how much to write from the new slice.
-
-        gate   = σ(W_g · [memory ‖ new_info])
-        update = tanh(W_u · [memory ‖ new_info])
-        output = gate * memory + (1 − gate) * update
-
-    This is equivalent to the GRU update equation without the reset gate
-    (reset gate empirically unhelpful in compression memory chains).
-
-    Args:
-        slice_ch : number of channels in memory / new_info tensors
     """
 
     def __init__(self, slice_ch: int):
@@ -125,14 +111,13 @@ class GatedMemoryUpdater(nn.Module):
             nn.Conv2d(slice_ch, slice_ch, kernel_size=3, padding=1),
             nn.Tanh(),
         )
-        # Zero-init update output: memory starts as pure identity pass-through.
         nn.init.zeros_(self.update[-2].weight)
         nn.init.zeros_(self.update[-2].bias)
 
     def forward(self, memory: torch.Tensor, new_info: torch.Tensor) -> torch.Tensor:
         x = torch.cat([memory, new_info], dim=1)
-        g = self.gate(x)  # (B, slice_ch, H, W) ∈ (0,1)
-        u = self.update(x)  # (B, slice_ch, H, W) ∈ (-1,1)
+        g = self.gate(x)
+        u = self.update(x)
         return g * memory + (1.0 - g) * u
 
 
@@ -149,19 +134,11 @@ class FrequencyDisentangledMamba(nn.Module):
     ------------
     1. DWT decomposes input into LL (low-freq) + {LH, HL, HH} (high-freq).
     2. LL is processed by a Mamba VSSBlock (global long-range structure).
-    3. HF sub-bands predict FiLM parameters (gamma, beta) to modulate LL output.
-    4. Modulated LL is concatenated with HF, fused, and reconstructed via IDWT.
+    3. LL structure predicts FiLM parameters (gamma, beta) to modulate HF details.
+    4. Modulated HF is concatenated with LL, fused, and reconstructed via IDWT.
 
     FiLM modulation:
-        x_ll_modulated = x_ll_out * (1 + gamma) + beta
-
-    -----------------------------------------------------------------------
-    DWT→Mamba→FiLM→IDWT path.
-    -----------------------------------------------------------------------
-
-    Args:
-        dim      : number of input channels
-        drop_path: stochastic depth rate for VSSBlock
+        x_hf_modulated = x_hf * (1 + gamma) + beta
     """
 
     def __init__(self, dim: int, drop_path: float = 0.1):
@@ -173,19 +150,18 @@ class FrequencyDisentangledMamba(nn.Module):
         # LL sub-band: long-range global structure via Mamba.
         self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
 
-        # HF sub-bands → FiLM parameters (gamma, beta) for LL modulation.
-        # Input : 3 * dim  (LH + HL + HH)
-        # Output: 2 * dim  (gamma and beta, each dim channels)
-        self.hf_conv = nn.Sequential(
-            nn.Conv2d(dim * 3, dim * 3, kernel_size=3, padding=1, groups=dim * 3),
+        # Global structure (LL) predicts FiLM parameters for sparse HF details.
+        # Input: dim (from LL out)
+        # Output: 3*dim*2 (gamma and beta for each of the 3 HF sub-bands)
+        self.ll_to_hf_film = nn.Sequential(
+            nn.Conv2d(dim, dim * 2, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(dim * 3, dim * 2, kernel_size=1),
+            nn.Conv2d(dim * 2, dim * 6, kernel_size=1),
         )
-        # Zero-init: at t=0 gamma=0 → scale=1, beta=0 → no shift.
-        nn.init.zeros_(self.hf_conv[-1].weight)
-        nn.init.zeros_(self.hf_conv[-1].bias)
+        nn.init.zeros_(self.ll_to_hf_film[-1].weight)
+        nn.init.zeros_(self.ll_to_hf_film[-1].bias)
 
-        # Fusion before IDWT: mix modulated LL with HF sub-bands.
+        # Fusion before IDWT: mix LL with modulated HF sub-bands.
         self.fusion = nn.Sequential(
             nn.Conv2d(dim * 4, dim * 4, kernel_size=1),
             nn.GELU(),
@@ -203,15 +179,15 @@ class FrequencyDisentangledMamba(nn.Module):
         x_hf = x_dwt[:, dim:]  # (B, 3*dim, H/2, W/2)  [LH, HL, HH]
         x_ll_out = self.ll_mamba(x_ll)  # (B, dim, H/2, W/2)
 
-        # 3. HF context → FiLM parameters.
-        hf_gamma_beta = self.hf_conv(x_hf)  # (B, 2*dim, H/2, W/2)
-        gamma, beta = hf_gamma_beta.chunk(2, dim=1)  # each (B, dim, H/2, W/2)
+        # 3. Global structure predicts modulation for HF details.
+        hf_gamma_beta = self.ll_to_hf_film(x_ll_out)  # (B, 6*dim, H/2, W/2)
+        gamma, beta = hf_gamma_beta.chunk(2, dim=1)  # each (B, 3*dim, H/2, W/2)
 
-        # 4. Cross-frequency FiLM modulation.
-        x_ll_modulated = x_ll_out * (1.0 + gamma) + beta  # (B, dim, H/2, W/2)
+        # 4. Cross-frequency FiLM modulation of the High-Frequency.
+        x_hf_modulated = x_hf * (1.0 + gamma) + beta  # (B, 3*dim, H/2, W/2)
 
         # 5. Fuse all four sub-bands and reconstruct.
-        merged = torch.cat([x_ll_modulated, x_hf], dim=1)  # (B, 4*dim, H/2, W/2)
+        merged = torch.cat([x_ll_out, x_hf_modulated], dim=1)  # (B, 4*dim, H/2, W/2)
         fused = self.fusion(merged) + merged  # (B, 4*dim, H/2, W/2)
 
         return self.idwt(fused)  # (B, dim, H, W)

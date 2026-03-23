@@ -15,11 +15,6 @@ from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import FrequencyDisentangledMamba, GatedMemoryUpdater
 
 
-def ste_round(x: torch.Tensor) -> torch.Tensor:
-    """Straight-Through Estimator rounding for gradient flow through quantisation."""
-    return torch.round(x) - x.detach() + x
-
-
 class WMDC(CompressionModel):
     """
     Wavelet-Mamba Dictionary Compression model.
@@ -115,15 +110,10 @@ class WMDC(CompressionModel):
         )
 
         # ── Spatially-Adaptive KL Mass Penalty Predictor ──────────────────
-        # Predicts rho(x) per Séjourné et al. §4.7.2.
-        # rho controls how strictly marginal constraints are enforced per position.
-        # Large rho(x) → balanced OT at position x.
-        # Small rho(x) → mass can be created/destroyed freely at position x.
-        # ε is kept FIXED (ot_eps) for numerical stability and convergence guarantee.
         self.rho_predictor = nn.Sequential(
             nn.Conv2d(2 * M, 64, 1),
             nn.GELU(),
-            nn.Conv2d(64, 1, 1),  # outputs 1-channel spatial rho map
+            nn.Conv2d(64, 1, 1),
         )
         nn.init.zeros_(self.rho_predictor[-1].weight)
         nn.init.constant_(self.rho_predictor[-1].bias, 2.0)
@@ -132,8 +122,6 @@ class WMDC(CompressionModel):
         self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=1)
 
         # ── Per-slice K/V projections ────────────────────────────────
-        # num_slices independent projections for slice-specific
-        # dictionary specialisation (coarse slices ≠ fine slices).
         self.k_projs = nn.ModuleList(
             [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
         )
@@ -142,7 +130,6 @@ class WMDC(CompressionModel):
         )
 
         # ── Shared EOT attention module ────────────────────────────────────
-        # input_dim = hyper_prior (2M) + memory_state (slice_ch)
         self.eot_attention = UnifiedDictionaryAttention(
             input_dim=2 * M + self.slice_ch,
             output_dim=M,
@@ -155,14 +142,11 @@ class WMDC(CompressionModel):
         )
 
         # ── GatedMemoryUpdater replaces plain residual-add ────────────
-        # List has num_slices entries; last entry is never called in the loop
-        # but avoids index errors if num_slices changes.
         self.memory_updaters = nn.ModuleList(
             [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices)]
         )
 
         # ── Slice-specific transforms ──────────────────────────────────────
-        # shared_input_dim = hyper_prior (2M) + memory (slice_ch) + dict_info (M)
         shared_input_dim = 3 * M + self.slice_ch
 
         self.cc_mean_transforms = nn.ModuleList(
@@ -210,7 +194,6 @@ class WMDC(CompressionModel):
             ]
         )
 
-        # Zero-init LRP output → identity residual at start.
         for transform in self.lrp_transforms:
             nn.init.zeros_(transform[-1].weight)
             nn.init.zeros_(transform[-1].bias)
@@ -233,19 +216,7 @@ class WMDC(CompressionModel):
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
     def _compute_rho_spatial(self, hyper_prior: torch.Tensor) -> torch.Tensor:
-        """
-        Compute spatially-varying KL mass-conservation strength ρ(x).
-
-        Uses softplus to ensure strict positivity, then clamps away from zero
-        to prevent degenerate near-zero ρ (which would disable mass conservation
-        entirely and make the plan trivially uniform).
-
-        Output shape: (B, H, W) — to be flattened to (B, HW) inside the
-        UnifiedDictionaryAttention routing.
-
-        Note: ε (Sinkhorn regularisation) is a fixed scalar (self.eot_attention.ot_eps)
-        and is NOT varied spatially — that would break convergence guarantees.
-        """
+        """Compute spatially-varying KL mass-conservation strength ρ(x)."""
         rho = F.softplus(self.rho_predictor(hyper_prior))  # (B, 1, H, W)
         rho = rho.clamp(min=0.05) + 1e-4  # strictly positive
         return rho.squeeze(1)  # (B, H, W)
@@ -266,33 +237,28 @@ class WMDC(CompressionModel):
         z = self.h_a(y)
 
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        dt = self.hyper_to_dict(z_hat)  # (B, N, dict_dim)
+        dt = self.hyper_to_dict(z_hat)
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
-        hyper_prior = torch.cat([latent_scales, latent_means], dim=1)  # (B, 2M, H, W)
+        hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        # Compute spatially-varying rho ONCE per image (shared across slices).
-        # rho(x) controls mass-conservation per position; ε is fixed.
-        rho_spatial = self._compute_rho_spatial(hyper_prior)  # (B, H, W)
+        rho_spatial = self._compute_rho_spatial(hyper_prior)
 
         y_slices = y.chunk(self.num_slices, 1)
         y_hat_slices: list = []
         y_likelihood: list = []
 
-        memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
+        memory_state = self.init_memory(hyper_prior)
 
         total_dispersion = torch.zeros(1, device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
-            # Per-slice K/V projections.
-            k_dict = self.k_projs[i](dt)  # (B, N, dict_dim)
-            v_dict = self.v_projs[i](dt)  # (B, N, dict_dim)
+            k_dict = self.k_projs[i](dt)
+            v_dict = self.v_projs[i](dt)
 
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            # Accumulate dispersion over ALL slices, not just slice 0.
-            # Slice 0 has the least context; averaging gives a more stable signal.
             dict_info, disp_loss = self.eot_attention(
                 query, k_dict, v_dict, rho_spatial, calc_disp=True
             )
@@ -303,15 +269,11 @@ class WMDC(CompressionModel):
             mu = self.cc_mean_transforms[i](support)
             scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
-            # Use explicit STE rounding to match decompress() exactly.
-            # gaussian_conditional() uses noise for the likelihood path and STE
-            # rounding for the network path — these are the SAME tensor object,
-            # but at inference decompress() uses true integer rounding.
-            # We use ste_round explicitly so the network path is identical to
-            # what the decoder will see, removing the noise-vs-round gap from
-            # the memory trajectory.
-            _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, means=mu)
-            y_hat_slice = ste_round(y_slice - mu) + mu  # matches decompress
+            # Properly use mathematically sound continuous noise relaxation
+            # for BOTH the forward pass and likelihood estimation
+            y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
+                y_slice, scale, means=mu
+            )
 
             # LRP post-processing
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
@@ -383,7 +345,6 @@ class WMDC(CompressionModel):
             y_string = self.gaussian_conditional.compress(y_slice, index, means=mu)
             y_strings.append(y_string)
 
-            # Decompress to get the quantised slice (same as decoder will see).
             y_hat_slice = self.gaussian_conditional.decompress(
                 y_string, index, means=mu
             )

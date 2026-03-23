@@ -8,6 +8,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -91,16 +92,6 @@ class RateDistortionLoss(nn.Module):
     Rate-distortion loss with adaptive dispersion regularisation.
 
     L = λ · distortion + bpp + w_disp · scale · dispersion
-
-    The dispersion coefficient w_disp is adaptively scaled to keep the
-    dispersion term commensurate with the BPP term.  EMA buffers track
-    running magnitudes; scale is clamped to [0.01, 10].
-
-
-    Args:
-        lmbda        : RD tradeoff (MSE: 0.0018–0.05; MS-SSIM: 2.4–115)
-        metric       : 'mse' or 'ms-ssim'
-        disp_weight  : base weight for dispersion loss (default 0.1)
     """
 
     def __init__(
@@ -116,7 +107,6 @@ class RateDistortionLoss(nn.Module):
         self.disp_weight = disp_weight
         self.register_buffer("ema_bpp", torch.tensor(1.0))
         self.register_buffer("ema_disp", torch.tensor(1.0))
-        # Track effective coefficient for logging.
         self.effective_disp_coeff: float = disp_weight
 
     def forward(self, output: dict, target: torch.Tensor) -> dict:
@@ -140,8 +130,13 @@ class RateDistortionLoss(nn.Module):
 
             if self.training:
                 with torch.no_grad():
-                    self.ema_bpp.mul_(0.99).add_(bpp_loss.abs(), alpha=0.01)
-                    self.ema_disp.mul_(0.99).add_(disp.abs(), alpha=0.01)
+                    b_val = bpp_loss.abs().detach()
+                    d_val = disp.abs().detach()
+                    if dist.is_initialized():
+                        dist.all_reduce(b_val, op=dist.ReduceOp.AVG)
+                        dist.all_reduce(d_val, op=dist.ReduceOp.AVG)
+                    self.ema_bpp.mul_(0.99).add_(b_val, alpha=0.01)
+                    self.ema_disp.mul_(0.99).add_(d_val, alpha=0.01)
 
             scale = (self.ema_bpp / (self.ema_disp + 1e-8)).clamp(0.01, 10.0)
             effective = float(self.disp_weight * scale.item())
@@ -261,27 +256,17 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
     """
     Measure PSNR gap between forward() (noise relaxation) and
     compress/decompress() (true quantisation) on the same batch.
-
-    A gap > 0.5 dB indicates a meaningful train/inference distribution
-    mismatch that will hurt deployment performance.
-
-    Returns:
-        delta_psnr : PSNR(forward) − PSNR(compress/decompress)  [dB]
     """
     model.eval()
-
-    # Pad to multiple of 64.
     d_padded, H_orig, W_orig = pad_to_multiple(batch.to(device), p=64)
 
     with torch.no_grad():
-        # Path A: differentiable forward (noise relaxation).
         out_fwd = model(d_padded)
         x_hat_fwd = out_fwd["x_hat"][:, :, :H_orig, :W_orig].clamp(0, 1)
 
         mse_fwd = F.mse_loss(batch.to(device), x_hat_fwd)
         psnr_fwd = -10 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
 
-        # Path B: true compress → decompress.
         out_enc = model.compress(d_padded)
         out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
         x_hat_dec = out_dec["x_hat"][:, :, :H_orig, :W_orig].clamp(0, 1)
@@ -307,19 +292,6 @@ def test_epoch(
     accelerator,
     gap_check: bool = False,
 ):
-    """
-    Validation with correct BPP denominator.
-
-    BPP is now normalised to *original* (unpadded) pixel count to match
-    eval.py exactly.
-    Correct formula:
-        bpp_padded   = likelihood_bits / num_pixels_pad
-        bpp_original = bpp_padded * (num_pixels_pad / num_pixels_orig)
-
-    This is equivalent to:
-        bpp_original = likelihood_bits / num_pixels_orig
-    which is the standard definition used in compression literature.
-    """
     model.eval()
     psnr_meter = AverageMeter()
     bpp_meter = AverageMeter()
@@ -337,33 +309,27 @@ def test_epoch(
             d_padded, H_orig, W_orig = pad_to_multiple(d, p=64)
             out_net = model(d_padded)
 
-            # Crop reconstruction to original dimensions.
             x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
             d_orig = d[:, :, :H_orig, :W_orig]
 
-            # Image logging.
             if i == 0 and accelerator.is_main_process and writer is not None:
                 n = min(d_orig.size(0), 4)
                 cmp = torch.cat([d_orig[:n], x_hat[:n]])
                 grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
                 writer.add_image("Val/Reconstruction", grid, epoch)
 
-            # ── BPP normalised to original pixel count ────────────────
             B = d_padded.size(0)
             H_pad = d_padded.size(2)
             W_pad = d_padded.size(3)
             num_pixels_pad = B * H_pad * W_pad
             num_pixels_orig = B * H_orig * W_orig
 
-            # Likelihood tensor covers padded area; rescale to original.
             bpp_padded = compute_bpp(out_net, num_pixels_pad)
             bpp_val = bpp_padded * (num_pixels_pad / num_pixels_orig)
 
-            # Distortion on original (unpadded) region.
             mse_val = F.mse_loss(x_hat, d_orig)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
 
-            # Loss for checkpoint selection — uses original-pixel BPP.
             if criterion.metric == "mse":
                 loss_val = criterion.lmbda * 255.0**2 * mse_val + bpp_val
             else:
@@ -386,12 +352,11 @@ def test_epoch(
             bpp_meter.update(metrics[1].item())
             loss_meter.update(metrics[2].item())
 
-            # Train/inference gap on first batch only (expensive: runs compress).
             if gap_check and not gap_measured and accelerator.is_main_process:
                 try:
                     gap_psnr = measure_train_inference_gap(
                         accelerator.unwrap_model(model),
-                        d[:1],  # single image to keep it fast
+                        d[:1],
                         device=str(accelerator.device),
                     )
                     gap_measured = True
@@ -456,21 +421,18 @@ def parse_args():
         "--sinkhorn-iters",
         type=int,
         default=20,
-        help="Sinkhorn iterations. ≥20 recommended for ot_eps=0.1 (C_max/eps = 20).",
     )
     p.add_argument(
         "--lr-milestones",
         type=int,
         nargs="+",
         default=[60, 85],
-        help="Epoch milestones for MultiStepLR. Default: [60, 85] (was [3, 12]).",
     )
     p.add_argument("--lr-gamma", type=float, default=0.1)
     p.add_argument(
         "--gap-check-interval",
         type=int,
         default=10,
-        help="Measure train/inference PSNR gap every N epochs. 0=never.",
     )
     p.add_argument("--seed", type=int, default=2026)
     return p.parse_args()
