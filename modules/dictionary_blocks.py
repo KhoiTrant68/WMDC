@@ -421,9 +421,13 @@ class UnifiedDictionaryAttention(nn.Module):
         # ── Routing ──────────────────────────────────────────────────────────
         if self.routing_mode == "softmax":
             P = self._route_softmax(C_mat)
+            if self.training:
+                P = P + 0.0 * rho_spatial.sum()
 
         elif self.routing_mode == "balanced_eot":
             P = self._route_balanced_eot(C_mat)
+            if self.training:
+                P = P + 0.0 * rho_spatial.sum()
 
         elif self.routing_mode == "unbalanced_eot":
             # Flatten and clamp rho: (B, H, W) → (B, HW), strictly positive
