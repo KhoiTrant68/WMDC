@@ -130,8 +130,8 @@ class RateDistortionLoss(nn.Module):
 
             if self.training:
                 with torch.no_grad():
-                    b_val = bpp_loss.abs().detach()
-                    d_val = disp.abs().detach()
+                    b_val = bpp_loss.abs().detach().squeeze()
+                    d_val = disp.abs().detach().squeeze()
                     if dist.is_initialized():
                         dist.all_reduce(b_val, op=dist.ReduceOp.AVG)
                         dist.all_reduce(d_val, op=dist.ReduceOp.AVG)
