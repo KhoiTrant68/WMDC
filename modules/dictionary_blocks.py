@@ -128,6 +128,9 @@ class UnifiedDictionaryAttention(nn.Module):
         log_a = -math.log(HW)  # scalar
         log_b = -math.log(self.dict_num)  # scalar
 
+        eps_spatial = spatial_epsilon.view(B, HW, 1).clamp(min=1e-3)  # (B, HW, 1)
+        eps_global = eps_spatial.mean(dim=1, keepdim=True)  # (B, 1, 1)
+
         if self.routing_mode == "softmax":
             # BASELINE: standard softmax (spatial_epsilon not used here)
             dummy_eps = 0.0 * spatial_epsilon.sum()
@@ -141,25 +144,24 @@ class UnifiedDictionaryAttention(nn.Module):
             #        = -ε·log(HW) - ε·LSE_cols((-C + v)/ε)
             #   g_j ← ε·log(b_j) - ε·LSE_i[(f_i - C_ij)/ε]
             #        = -ε·log(N)  - ε·LSE_rows((-C + u)/ε)
-            eps = spatial_epsilon.mean(dim=(2, 3)).view(B, 1).clamp(min=1e-3)  # (B, 1)
-
             u = torch.zeros(B, HW, device=x.device, dtype=x.dtype)
             v_vec = torch.zeros(B, self.dict_num, device=x.device, dtype=x.dtype)
 
             for _ in range(self.iters):
                 # Row update: uses log(a_i) = log_a = -log(HW)
-                u = log_a * eps - eps * torch.logsumexp(
-                    (-C_mat + v_vec.unsqueeze(1)) / eps.unsqueeze(2),
-                    dim=2,
+                u = log_a * eps_spatial.squeeze(2) - eps_spatial.squeeze(
+                    2
+                ) * torch.logsumexp(
+                    (-C_mat + v_vec.unsqueeze(1)) / eps_spatial, dim=2
                 )  # (B, HW)
-
                 # Col update: uses log(b_j) = log_b = -log(N)
-                v_vec = log_b * eps - eps * torch.logsumexp(
-                    (-C_mat + u.unsqueeze(2)) / eps.unsqueeze(2),
-                    dim=1,
+                v_vec = log_b * eps_global.squeeze(2) - eps_global.squeeze(
+                    2
+                ) * torch.logsumexp(
+                    (-C_mat + u.unsqueeze(2)) / eps_global, dim=1
                 )  # (B, N)
 
-            logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps.unsqueeze(2)
+            logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps_spatial
             P = torch.exp(torch.clamp(logits, max=20.0))
 
         elif self.routing_mode == "unbalanced_eot":
@@ -171,29 +173,29 @@ class UnifiedDictionaryAttention(nn.Module):
             #   u     = τ/(τ+ε) · raw_u
             #   raw_v = ε·log(b_j) - ε·LSE_i[(u_i - C_ij)/ε]
             #   v     = τ/(τ+ε) · raw_v
-            eps = spatial_epsilon.mean(dim=(2, 3)).view(B, 1).clamp(min=1e-3)  # (B, 1)
-
-            tau_ratio = self.tau / (self.tau + eps)  # (B, 1)
+            tau_ratio_spatial = self.tau / (self.tau + eps_spatial.squeeze(2))
+            tau_ratio_global = self.tau / (self.tau + eps_global.squeeze(2))
 
             u = torch.zeros(B, HW, device=x.device, dtype=x.dtype)
             v_vec = torch.zeros(B, self.dict_num, device=x.device, dtype=x.dtype)
 
             for _ in range(self.iters):
                 # Row update — KL Aprox on source side
-                raw_u = log_a * eps - eps * torch.logsumexp(
-                    (-C_mat + v_vec.unsqueeze(1)) / eps.unsqueeze(2),
-                    dim=2,
+                raw_u = log_a * eps_spatial.squeeze(2) - eps_spatial.squeeze(
+                    2
+                ) * torch.logsumexp(
+                    (-C_mat + v_vec.unsqueeze(1)) / eps_spatial, dim=2
                 )  # (B, HW)
-                u = tau_ratio * raw_u
-
+                u = tau_ratio_spatial * raw_u
                 # Col update — KL Aprox on target side
-                raw_v = log_b * eps - eps * torch.logsumexp(
-                    (-C_mat + u.unsqueeze(2)) / eps.unsqueeze(2),
-                    dim=1,
+                raw_v = log_b * eps_global.squeeze(2) - eps_global.squeeze(
+                    2
+                ) * torch.logsumexp(
+                    (-C_mat + u.unsqueeze(2)) / eps_global, dim=1
                 )  # (B, N)
-                v_vec = tau_ratio * raw_v
+                v_vec = tau_ratio_global * raw_v
 
-            logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps.unsqueeze(2)
+            logits = (-C_mat + u.unsqueeze(2) + v_vec.unsqueeze(1)) / eps_spatial
             # clamp(max=20) prevents exp overflow while allowing plan entries > 1
             # (correct for unbalanced OT where total mass need not equal 1)
             P = torch.exp(torch.clamp(logits, max=20.0))
@@ -213,7 +215,6 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.training and calc_disp:
             # Use torch.cdist to avoid allocating the (B, HW, N, D) intermediate
             # that the naive (q_expanded - k_expanded)**2 broadcast would create.
-            # For B=8, HW=256, N=128, D=640 that intermediate is ~2.1 GB.
             dist_sq = torch.cdist(q, k, p=2).pow(2)  # (B, HW, N)
             dispersion_loss = torch.mean(torch.sum(P.detach() * dist_sq, dim=2))
         else:

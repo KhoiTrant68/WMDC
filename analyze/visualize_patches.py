@@ -8,6 +8,7 @@ parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, parent_dir)
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
@@ -48,7 +49,7 @@ def parse_args():
         "--use-actual-bpp",
         action="store_true",
         help="Use actual entropy-coded BPP (slower) instead of the soft "
-             "training-time estimate. Recommended for paper figures.",
+        "training-time estimate. Recommended for paper figures.",
     )
     parser.add_argument("--cuda", action="store_true")
     return parser.parse_args()
@@ -82,7 +83,7 @@ def main():
             # This matches the eval.py protocol exactly.
             out_enc = model.compress(x_padded)
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
-            x_hat_padded = out_dec["x_hat"]   # already clamped in decompress()
+            x_hat_padded = out_dec["x_hat"]  # already clamped in decompress()
 
             # Actual BPP from compressed string lengths
             def _get_size(obj):

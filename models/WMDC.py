@@ -15,6 +15,12 @@ from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import FrequencyDisentangledMamba
 
 
+# Helper function to solve the train/test quantization gap
+def ste_round(x):
+    """Straight-Through Estimator rounding."""
+    return torch.round(x) - x.detach() + x
+
+
 class WMDC(CompressionModel):
     def __init__(
         self,
@@ -174,6 +180,11 @@ class WMDC(CompressionModel):
             ]
         )
 
+        # Zero-initialize the final convolution of LRP transforms to start as identity
+        for transform in self.lrp_transforms:
+            nn.init.zeros_(transform[-1].weight)
+            nn.init.zeros_(transform[-1].bias)
+
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             # Explicit float32 prevents dtype mismatch if the default dtype
@@ -252,16 +263,26 @@ class WMDC(CompressionModel):
             )
             y_likelihood.append(y_slice_likelihood)
 
+            # Output-bound update (receives uniform noise for loss stability)
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
                 self.lrp_transforms[i](lrp_support)
             )
             y_hat_slices.append(y_hat_slice)
 
-            # Do not update memory on the final slice
+            # Memory-bound update uses strictly discrete variables via STE rounding
+            # This perfectly bridges the train-test quantization gap.
             if i < self.num_slices - 1:
-                state_input = torch.cat([memory_state, y_hat_slice], dim=1)
-                # Use the slice-specific memory updater
+                # 1. Strip continuous noise, mimic exactly what happens in decompress()
+                y_hat_discrete = ste_round(y_slice - mu) + mu
+
+                # 2. Run the exact same LRP post-processing
+                discrete_lrp_support = torch.cat([support, y_hat_discrete], dim=1)
+                y_hat_discrete = y_hat_discrete + 0.5 * torch.tanh(
+                    self.lrp_transforms[i](discrete_lrp_support)
+                )
+
+                state_input = torch.cat([memory_state, y_hat_discrete], dim=1)
                 memory_state = memory_state + self.memory_updaters[i](state_input)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))

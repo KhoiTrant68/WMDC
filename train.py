@@ -183,19 +183,6 @@ def train_one_epoch(
 
 
 def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, accelerator):
-    """
-    Validation loop.
-
-    Images are padded to the nearest multiple of 64 (required by WMDC),
-    then cropped back to original size before metric computation.  This
-    matches the eval.py protocol exactly so that checkpoint selection and
-    final benchmark numbers are consistent.
-
-    Previously the validation dataset used CenterCrop(patch_size=256),
-    which caused best-checkpoint selection to be based on 256×256 patches
-    while eval.py reports metrics on full images — a reproducibility
-    violation corrected here.
-    """
     model.eval()
     psnr_meter, bpp_meter, loss_meter = AverageMeter(), AverageMeter(), AverageMeter()
 
@@ -225,12 +212,10 @@ def test_epoch(epoch, test_dataloader, model, criterion, logger, writer, acceler
                     "Val/Reconstruction (Top: Orig, Bot: Rec)", grid, epoch
                 )
 
-            # BPP uses padded pixel count (bitstream encodes padded image)
-            num_pixels_padded = d_padded.size(0) * d_padded.size(2) * d_padded.size(3)
-            # Metrics use original pixel count
+            # Compute BPP using the original, unpadded pixel count to match eval.py
             num_pixels_orig = d_orig.size(0) * H_orig * W_orig
 
-            bpp_val = compute_bpp(out_net, num_pixels_padded)
+            bpp_val = compute_bpp(out_net, num_pixels_orig)
             mse_val = F.mse_loss(x_hat, d_orig)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
 
@@ -281,14 +266,13 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     p.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
-    # Required: no default=None to prevent silent TypeError at first training step
     p.add_argument(
         "--lambda",
         dest="lmbda",
         type=float,
         required=True,
-        help="Rate-distortion tradeoff lambda (e.g. 0.0018, 0.0035, "
-        "0.0067, 0.013, 0.025, 0.05)",
+        help="RD tradeoff lambda. For MSE use (e.g. 0.0018, 0.0035, 0.013, 0.05). "
+        "For MS-SSIM use (e.g. 2.4, 4.58, 8.73, 16.64, 31.73, 115.37).",
     )
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
@@ -335,9 +319,6 @@ def main():
         ),
     )
 
-    # Validation: NO crop — use full images (pad in test_epoch to meet model
-    # alignment requirement).  This ensures best-checkpoint selection is based
-    # on full-image quality, matching the eval.py benchmark protocol.
     test_dataset = ImageFolder(
         args.dataset,
         split="valid",
@@ -353,8 +334,6 @@ def main():
         drop_last=True,
         worker_init_fn=worker_init_fn,
     )
-    # Validation batch size = 1 because full images may have different sizes
-    # and cannot be trivially collated into a batch.
     test_loader = DataLoader(
         test_dataset,
         batch_size=1,
@@ -376,8 +355,6 @@ def main():
         )
     )
 
-    # Restore best_loss from checkpoint so the best model is not overwritten
-    # spuriously on the first validation epoch after resume.
     start_epoch, best_loss = 0, float("inf")
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")

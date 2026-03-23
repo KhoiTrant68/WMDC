@@ -57,13 +57,13 @@ python train.py \
 
 Multi-GPU distributed training:
 ```bash
-acceleate launch --multi_gpu train.py \
+acceleate launch train.py \
     -d /path/to/dataset \
     --save_path checkpoints \
-    --epochs 20 \
+    --epochs 10 \
     --batch-size 8 \
-    --lambda 0.05 \
-    --metric mse
+    --lambda 0.0018 \
+    --routing_mode softmax
 ```
 
 
@@ -79,6 +79,7 @@ acceleate launch --multi_gpu train.py \
 - `--clip_max_norm`: Gradient clipping (default: 1.0)
 - `--checkpoint`: Path to resume from checkpoint
 - `--metric`: Loss metric - `mse` or `ms-ssim` (default: `mse`)
+- `--routing_mode`: Routing mode - `softmax`, `balanced_eot`, or `unbalanced_eot` (default: `softmax`)
 - `--seed`: Random seed (default: 2026)
 
 ### Evaluation
@@ -98,7 +99,8 @@ python eval.py \
     --dataset /kaggle/input/datasets/kodak-test \
     --checkpoint ./checkpoints/lambda_0.0018_mse/checkpoint_best.pth.tar \
     --output kodak \
-    --cuda
+    --cuda \
+    --routing_mode softmax
 ```
 
 **Evaluation Arguments:**
@@ -106,32 +108,38 @@ python eval.py \
 - `--checkpoint`: Path to model checkpoint (required)
 - `--output`: Output directory for results (default: `output`)
 - `--cuda`: Use GPU for inference
+- `--routing_mode`: Routing mode - `softmax`, `balanced_eot`, or `unbalanced_eot` (default: `softmax`)
 
 ### Visualization
 
 Visualize attention maps on image directory:
 ```bash
-python visualize_attention.py \
+python analyze/visualize_attention.py \
     --img_dir /path/to/image \
     --checkpoint /path/to/checkpoint.pth \
     --slice 3 \
-    --cuda
+    --cuda \
+    -o attention_maps.pdf \
+    --routing_mode softmax
 ```
 
 Visualize latent features:
 ```bash
-python visualize_latents.py \
+python analyze/visualize_latents.py \
     --image /path/to/image.png \
-    --checkpoint /path/to/checkpoint.pth
+    --checkpoint /path/to/checkpoint.pth \
+    --routing_mode softmax \
+    --output latent_visualization
 ```
-
 
 Visualize patches:
 ```bash
-python visualize_patches.py \
+python analyze/visualize_patches.py \
     -i /path/to/image.png \
     -c /path/to/checkpoint.pth \
-    --cuda
+    --cuda \
+    --routing_mode softmax \
+    -o visual_comparison
 ```
 
 
