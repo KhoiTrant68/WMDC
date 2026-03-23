@@ -494,7 +494,7 @@ def main():
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
