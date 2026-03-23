@@ -519,7 +519,7 @@ def main():
         lmbda=args.lmbda,
         metric=args.metric,
         disp_weight=args.disp_weight,
-    )
+    ).to(accelerator.device)
 
     (
         model,
