@@ -143,7 +143,7 @@ class WMDC(CompressionModel):
 
         # ── GatedMemoryUpdater replaces plain residual-add ────────────
         self.memory_updaters = nn.ModuleList(
-            [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices)]
+            [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices - 1)]
         )
 
         # ── Slice-specific transforms ──────────────────────────────────────
@@ -251,7 +251,7 @@ class WMDC(CompressionModel):
 
         memory_state = self.init_memory(hyper_prior)
 
-        total_dispersion = torch.zeros(1, device=x.device, dtype=x.dtype)
+        total_dispersion = torch.zeros(0, device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
             k_dict = self.k_projs[i](dt)
