@@ -177,9 +177,11 @@ class FrequencyDisentangledMamba(nn.Module):
 
         # Fusion before IDWT: mix LL with modulated HF sub-bands.
         self.fusion = nn.Sequential(
-            nn.Conv2d(dim * 4, dim * 4, kernel_size=1),
+            # Spatial mixing (3x3 depthwise) to capture local high-frequency geometry
+            nn.Conv2d(dim * 4, dim * 4, kernel_size=3, padding=1, groups=dim * 4),
             nn.GELU(),
-            nn.Conv2d(dim * 4, dim * 4, kernel_size=1, groups=4),
+            # Channel mixing (1x1) to fuse the modulated sub-bands
+            nn.Conv2d(dim * 4, dim * 4, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
