@@ -534,7 +534,14 @@ def main():
     test_dataset = ImageFolder(
         args.dataset,
         split="valid",
-        transform=transforms.ToTensor(),
+        transform=transforms.Compose(
+            [
+                transforms.CenterCrop(
+                    args.patch_size
+                ),  # Forces identical sizes for batching
+                transforms.ToTensor(),
+            ]
+        ),
     )
 
     train_loader = DataLoader(
@@ -548,7 +555,7 @@ def main():
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
