@@ -28,13 +28,13 @@ class WMDC(CompressionModel):
     Decoder  g_s : y_hat → image reconstruction
 
     Args:
-        N            : channels in hyper-encoder/decoder
-        M            : latent channels (split into num_slices slices)
-        num_slices   : number of autoregressive channel slices
-        dict_head_num: used to set dict_dim = 32 * dict_head_num
-        dict_num     : number of dictionary tokens N
-        routing_mode : {'softmax', 'balanced_eot', 'unbalanced_eot'}
-        ot_eps       : fixed Sinkhorn entropic regularisation ε
+        N             : channels in hyper-encoder/decoder
+        M             : latent channels (split into num_slices slices)
+        num_slices    : number of autoregressive channel slices
+        dict_head_num : used to set dict_dim = 32 * dict_head_num
+        dict_num      : number of dictionary tokens
+        routing_mode  : {'softmax', 'balanced_eot', 'unbalanced_eot'}
+        ot_eps        : fixed Sinkhorn entropic regularisation ε
         sinkhorn_iters: Sinkhorn iterations (≥20 recommended for eps=0.1)
     """
 
@@ -109,14 +109,23 @@ class WMDC(CompressionModel):
             num_heads=4,
         )
 
-        # ── Spatially-Adaptive KL Mass Penalty Predictor ──────────────────
-        self.rho_predictor = nn.Sequential(
-            nn.Conv2d(2 * M, 64, 1),
-            nn.GELU(),
-            nn.Conv2d(64, 1, 1),
+        # ── Spatially-Adaptive KL Mass Penalty Predictor (per-slice) ──────
+        # Each slice gets its own rho predictor conditioned on the growing
+        # context (hyper_prior + accumulated reconstruction so far).
+        # Slice i sees hyper_prior (2*M) + i decoded slices (i * slice_ch).
+        self.rho_predictors = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(2 * M + i * self.slice_ch, 32, 1),
+                    nn.GELU(),
+                    nn.Conv2d(32, 1, 1),
+                )
+                for i in range(num_slices)
+            ]
         )
-        nn.init.zeros_(self.rho_predictor[-1].weight)
-        nn.init.constant_(self.rho_predictor[-1].bias, 2.0)
+        for predictor in self.rho_predictors:
+            nn.init.zeros_(predictor[-1].weight)
+            nn.init.constant_(predictor[-1].bias, 2.0)
 
         # ── Bootstrap memory state ─────────────────────────────────────────
         self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=1)
@@ -215,9 +224,34 @@ class WMDC(CompressionModel):
         """Auxiliary loss for entropy bottleneck CDF approximation."""
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
-    def _compute_rho_spatial(self, hyper_prior: torch.Tensor) -> torch.Tensor:
-        """Compute spatially-varying KL mass-conservation strength ρ(x)."""
-        rho = F.softplus(self.rho_predictor(hyper_prior))  # (B, 1, H, W)
+    def _compute_rho_spatial(
+        self,
+        slice_idx: int,
+        hyper_prior: torch.Tensor,
+        decoded_slices: list,
+    ) -> torch.Tensor:
+        """
+        Compute spatially-varying KL mass-conservation strength ρ(x) for a
+        given slice.  The predictor for slice i is conditioned on the global
+        hyper-prior (2*M channels) plus all previously decoded slices
+        (i * slice_ch channels), so the routing budget adapts to how much of
+        the image has already been described.
+
+        Args:
+            slice_idx     : index of the current slice (0 … num_slices-1)
+            hyper_prior   : (B, 2*M, H, W)
+            decoded_slices: list of previously decoded y_hat_slices,
+                            each (B, slice_ch, H, W).  Length == slice_idx.
+
+        Returns:
+            rho : (B, H, W)  strictly positive
+        """
+        if slice_idx == 0:
+            context = hyper_prior
+        else:
+            context = torch.cat([hyper_prior] + decoded_slices, dim=1)
+
+        rho = F.softplus(self.rho_predictors[slice_idx](context))  # (B, 1, H, W)
         rho = rho.clamp(min=0.05) + 1e-4  # strictly positive
         return rho.squeeze(1)  # (B, H, W)
 
@@ -243,8 +277,6 @@ class WMDC(CompressionModel):
         latent_means = self.h_mean_s(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        rho_spatial = self._compute_rho_spatial(hyper_prior)
-
         y_slices = y.chunk(self.num_slices, 1)
         y_hat_slices: list = []
         y_likelihood: list = []
@@ -254,6 +286,9 @@ class WMDC(CompressionModel):
         total_dispersion = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
+            # Per-slice rho conditioned on context available so far
+            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
 
@@ -269,23 +304,26 @@ class WMDC(CompressionModel):
             mu = self.cc_mean_transforms[i](support)
             scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
-            # Properly use mathematically sound continuous noise relaxation
-            # for BOTH the forward pass and likelihood estimation
+            # Continuous noise relaxation for forward pass + likelihood
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
                 y_slice, scale, means=mu
             )
 
-            # LRP post-processing
+            # LRP post-processing: uses the entropy-model output (y_hat_slice
+            # before LRP) so rate is unaffected; only distortion benefits.
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
-            y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
+            y_hat_slice_lrp = y_hat_slice + 0.5 * torch.tanh(
                 self.lrp_transforms[i](lrp_support)
             )
-            y_hat_slices.append(y_hat_slice)
+
+            # Append the LRP-corrected slice for downstream context and output.
+            y_hat_slices.append(y_hat_slice_lrp)
             y_likelihood.append(y_slice_likelihood)
 
-            # GatedMemoryUpdater for controlled memory evolution.
+            # Memory update uses the LRP-corrected slice so that subsequent
+            # slices benefit from the best available reconstruction signal.
             if i < self.num_slices - 1:
-                memory_state = self.memory_updaters[i](memory_state, y_hat_slice)
+                memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
 
@@ -319,8 +357,6 @@ class WMDC(CompressionModel):
         latent_means = self.h_mean_s(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        rho_spatial = self._compute_rho_spatial(hyper_prior)
-
         y_slices = y.chunk(self.num_slices, 1)
         y_hat_slices: list = []
         y_strings: list = []
@@ -328,6 +364,9 @@ class WMDC(CompressionModel):
         memory_state = self.init_memory(hyper_prior)
 
         for i, y_slice in enumerate(y_slices):
+            # Per-slice rho using context decoded so far (matches decompress)
+            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
 
@@ -345,18 +384,19 @@ class WMDC(CompressionModel):
             y_string = self.gaussian_conditional.compress(y_slice, index, means=mu)
             y_strings.append(y_string)
 
+            # Decompress to get the quantised slice (identical to decompress())
             y_hat_slice = self.gaussian_conditional.decompress(
                 y_string, index, means=mu
             )
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
-            y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
+            y_hat_slice_lrp = y_hat_slice + 0.5 * torch.tanh(
                 self.lrp_transforms[i](lrp_support)
             )
-            y_hat_slices.append(y_hat_slice)
+            y_hat_slices.append(y_hat_slice_lrp)
 
             if i < self.num_slices - 1:
-                memory_state = self.memory_updaters[i](memory_state, y_hat_slice)
+                memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         return {
             "strings": [y_strings, z_strings],
@@ -376,12 +416,13 @@ class WMDC(CompressionModel):
         latent_means = self.h_mean_s(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
-        rho_spatial = self._compute_rho_spatial(hyper_prior)
-
         y_hat_slices: list = []
         memory_state = self.init_memory(hyper_prior)
 
         for i in range(self.num_slices):
+            # Per-slice rho using context decoded so far (matches compress)
+            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
 
@@ -401,13 +442,13 @@ class WMDC(CompressionModel):
             )
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
-            y_hat_slice = y_hat_slice + 0.5 * torch.tanh(
+            y_hat_slice_lrp = y_hat_slice + 0.5 * torch.tanh(
                 self.lrp_transforms[i](lrp_support)
             )
-            y_hat_slices.append(y_hat_slice)
+            y_hat_slices.append(y_hat_slice_lrp)
 
             if i < self.num_slices - 1:
-                memory_state = self.memory_updaters[i](memory_state, y_hat_slice)
+                memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)

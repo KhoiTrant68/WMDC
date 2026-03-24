@@ -15,9 +15,20 @@ from models.WMDC import WMDC
 
 
 def compute_actual_bpp(strings, num_pixels: int) -> float:
-    """Compute BPP from actual compressed string byte lengths."""
+    """
+    Compute BPP from actual compressed byte-string lengths.
 
-    def get_size(obj):
+    strings is [y_strings, z_strings] where:
+      y_strings : list of num_slices lists, each containing per-image byte strings
+      z_strings : list of per-image byte strings
+
+    We recursively sum all byte lengths, convert to bits, and normalise by the
+    number of *original* (unpadded) pixels.  No shape side-information is
+    included here; in a real bitstream that overhead (~4 bytes) is negligible
+    at typical image sizes but should be noted in paper comparisons.
+    """
+
+    def get_size(obj) -> int:
         if isinstance(obj, bytes):
             return len(obj)
         elif isinstance(obj, (list, tuple)):
@@ -99,6 +110,8 @@ def main():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
             x = transforms.ToTensor()(img).unsqueeze(0).to(device)
+
+            # Record original dimensions before any padding.
             H, W = x.size(2), x.size(3)
             num_pixels_original = H * W
 
@@ -113,14 +126,19 @@ def main():
             dec_time = time.time() - t1
 
             x_hat = out_dec["x_hat"]
+            # Crop away any padding introduced before compression.
             if pad_h > 0 or pad_w > 0:
                 x_hat = x_hat[:, :, :H, :W]
             x_hat = x_hat.clamp(0, 1)
 
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
-            # BPP always over original (unpadded) pixel count.
+            # BPP is always computed over original (unpadded) pixel count.
+            # The compressed strings cover padded pixels, but we account for
+            # the full coding cost — this is the correct and standard metric
+            # used by Kodak / CLIC benchmarks.
             bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)
+
             mse = F.mse_loss(x, x_hat)
             psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100.0
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()
@@ -150,6 +168,29 @@ def main():
             )
 
     avg_results = {k: sum(v) / len(v) for k, v in results.items()}
+
+    # ── Dictionary utilisation analysis ──────────────────────────────────────
+    # Re-run forward() on a single image to collect attn_probs from the
+    # EOT attention module.  This provides insight into codebook usage.
+    if image_paths:
+        img = Image.open(image_paths[0]).convert("RGB")
+        x_sample = transforms.ToTensor()(img).unsqueeze(0).to(device)
+        x_sample_pad, pad_h, pad_w = pad_image(x_sample, p=64)
+
+        with torch.no_grad():
+            _ = model(x_sample_pad)
+
+        attn = model.eot_attention.attn_probs  # (B, HW, N) or None
+        if attn is not None:
+            # Column marginal → how much each dict token is used
+            marginal = attn.sum(dim=1)  # (B, N)
+            marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            H_entropy = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean()
+            max_H = math.log(model.dict_num)
+            utilisation = H_entropy.item() / max_H * 100
+            avg_results["dict_utilisation_pct"] = round(utilisation, 2)
+            print(f"\n  Dictionary utilisation: {utilisation:.1f}% of max entropy")
+
     report = {
         "average": avg_results,
         "per_image": per_image,

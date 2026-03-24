@@ -134,11 +134,18 @@ class FrequencyDisentangledMamba(nn.Module):
     ------------
     1. DWT decomposes input into LL (low-freq) + {LH, HL, HH} (high-freq).
     2. LL is processed by a Mamba VSSBlock (global long-range structure).
-    3. LL structure predicts FiLM parameters (gamma, beta) to modulate HF details.
-    4. Modulated HF is concatenated with LL, fused, and reconstructed via IDWT.
+    3. LL structure predicts FiLM parameters (gamma, beta) for each HF
+       sub-band via **separate** sub-band-specific predictors.
+       Separate predictors are justified because LH (horizontal edges),
+       HL (vertical edges) and HH (diagonal / texture) have fundamentally
+       different statistics and should be modulated independently.
+    4. Modulated HF is concatenated with LL, fused, and reconstructed via
+       IDWT.
 
-    FiLM modulation:
-        x_hf_modulated = x_hf * (1 + gamma) + beta
+    FiLM modulation per sub-band b:
+        x_hf_b_modulated = x_hf_b * (1 + gamma_b) + beta_b
+
+    Zero-init of the FiLM output layers ensures identity at start of training.
     """
 
     def __init__(self, dim: int, drop_path: float = 0.1):
@@ -150,16 +157,23 @@ class FrequencyDisentangledMamba(nn.Module):
         # LL sub-band: long-range global structure via Mamba.
         self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
 
-        # Global structure (LL) predicts FiLM parameters for sparse HF details.
-        # Input: dim (from LL out)
-        # Output: 3*dim*2 (gamma and beta for each of the 3 HF sub-bands)
-        self.ll_to_hf_film = nn.Sequential(
-            nn.Conv2d(dim, dim * 2, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(dim * 2, dim * 6, kernel_size=1),
-        )
-        nn.init.zeros_(self.ll_to_hf_film[-1].weight)
-        nn.init.zeros_(self.ll_to_hf_film[-1].bias)
+        # Per-sub-band FiLM predictors (LH, HL, HH treated independently).
+        # Input: dim channels (LL output)
+        # Output: 2*dim channels per sub-band (gamma + beta)
+        # Zero-init final layer → identity modulation at init.
+        def _make_film_predictor(in_dim: int, out_dim: int) -> nn.Sequential:
+            net = nn.Sequential(
+                nn.Conv2d(in_dim, in_dim * 2, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(in_dim * 2, out_dim * 2, kernel_size=1),
+            )
+            nn.init.zeros_(net[-1].weight)
+            nn.init.zeros_(net[-1].bias)
+            return net
+
+        self.film_lh = _make_film_predictor(dim, dim)  # for LH sub-band
+        self.film_hl = _make_film_predictor(dim, dim)  # for HL sub-band
+        self.film_hh = _make_film_predictor(dim, dim)  # for HH sub-band
 
         # Fusion before IDWT: mix LL with modulated HF sub-bands.
         self.fusion = nn.Sequential(
@@ -176,18 +190,23 @@ class FrequencyDisentangledMamba(nn.Module):
 
         # 2. Global structure from LL sub-band (channels 0..dim-1).
         x_ll = x_dwt[:, :dim]  # (B, dim, H/2, W/2)
-        x_hf = x_dwt[:, dim:]  # (B, 3*dim, H/2, W/2)  [LH, HL, HH]
+        x_lh = x_dwt[:, dim : 2 * dim]  # (B, dim, H/2, W/2)
+        x_hl = x_dwt[:, 2 * dim : 3 * dim]
+        x_hh = x_dwt[:, 3 * dim :]
         x_ll_out = self.ll_mamba(x_ll)  # (B, dim, H/2, W/2)
 
-        # 3. Global structure predicts modulation for HF details.
-        hf_gamma_beta = self.ll_to_hf_film(x_ll_out)  # (B, 6*dim, H/2, W/2)
-        gamma, beta = hf_gamma_beta.chunk(2, dim=1)  # each (B, 3*dim, H/2, W/2)
+        # 3. Per-sub-band FiLM modulation predicted from global LL structure.
+        gamma_lh, beta_lh = self.film_lh(x_ll_out).chunk(2, dim=1)
+        gamma_hl, beta_hl = self.film_hl(x_ll_out).chunk(2, dim=1)
+        gamma_hh, beta_hh = self.film_hh(x_ll_out).chunk(2, dim=1)
 
-        # 4. Cross-frequency FiLM modulation of the High-Frequency.
-        x_hf_modulated = x_hf * (1.0 + gamma) + beta  # (B, 3*dim, H/2, W/2)
+        # 4. Apply modulation independently to each HF sub-band.
+        x_lh_mod = x_lh * (1.0 + gamma_lh) + beta_lh
+        x_hl_mod = x_hl * (1.0 + gamma_hl) + beta_hl
+        x_hh_mod = x_hh * (1.0 + gamma_hh) + beta_hh
 
         # 5. Fuse all four sub-bands and reconstruct.
-        merged = torch.cat([x_ll_out, x_hf_modulated], dim=1)  # (B, 4*dim, H/2, W/2)
+        merged = torch.cat([x_ll_out, x_lh_mod, x_hl_mod, x_hh_mod], dim=1)
         fused = self.fusion(merged) + merged  # (B, 4*dim, H/2, W/2)
 
         return self.idwt(fused)  # (B, dim, H, W)

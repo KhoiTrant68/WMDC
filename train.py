@@ -65,7 +65,14 @@ class AverageMeter:
 
 
 def compute_bpp(out_net: dict, num_pixels: int) -> torch.Tensor:
-    """Differentiable training-time BPP estimate from likelihood tensors."""
+    """
+    Differentiable training-time BPP estimate from likelihood tensors.
+
+    num_pixels must be the number of *original* (unpadded) pixels so that
+    the rate objective correctly reflects the cost per actual image pixel.
+    Under DDP this is the per-device pixel count; gradients are averaged
+    across devices by the DDP all-reduce on the loss, which is correct.
+    """
     return sum(
         torch.log(lh.float()).sum() / (-math.log(2) * num_pixels)
         for lh in out_net["likelihoods"].values()
@@ -91,7 +98,22 @@ class RateDistortionLoss(nn.Module):
     """
     Rate-distortion loss with adaptive dispersion regularisation.
 
-    L = λ · distortion + bpp + w_disp · scale · dispersion
+    L = λ · distortion + bpp  −  w_disp · scale · dispersion_entropy
+
+    The dispersion term is *subtracted* because `_dispersion_loss` returns
+    negative entropy; subtracting it is equivalent to maximising the entropy
+    of dictionary usage, which encourages diverse codebook utilisation.
+
+    EMA buffers track the running magnitudes of the BPP and dispersion terms
+    so that `scale` auto-normalises their relative contribution, making the
+    effective dispersion coefficient `disp_weight` interpretable as a
+    fraction of the rate loss rather than an absolute value.
+
+    Note on DDP:
+        The criterion is NOT wrapped by accelerate.prepare() and therefore
+        lives as an independent module on each device.  To keep EMA buffers
+        synchronised across ranks we explicitly all-reduce the scalar values
+        before updating, which mirrors the behaviour of a single-GPU run.
     """
 
     def __init__(
@@ -110,6 +132,9 @@ class RateDistortionLoss(nn.Module):
         self.effective_disp_coeff: float = disp_weight
 
     def forward(self, output: dict, target: torch.Tensor) -> dict:
+        # Use unpadded pixel count so BPP is always normalised to true image
+        # size.  target is already the unpadded crop (patch_size × patch_size
+        # during training, original dimensions at validation).
         num_pixels = target.size(0) * target.size(2) * target.size(3)
         bpp_loss = compute_bpp(output, num_pixels)
 
@@ -130,18 +155,26 @@ class RateDistortionLoss(nn.Module):
 
             if self.training:
                 with torch.no_grad():
-                    b_val = bpp_loss.abs().detach().sum().view(1)
-                    d_val = disp.abs().detach().sum().view(1)
-                    if dist.is_initialized():
+                    # Scalar tensors for all-reduce
+                    b_val = bpp_loss.abs().detach().reshape(1)
+                    d_val = disp.abs().detach().reshape(1)
+
+                    # Synchronise EMA inputs across DDP ranks so all devices
+                    # update their buffers with the same value.
+                    if dist.is_available() and dist.is_initialized():
                         dist.all_reduce(b_val, op=dist.ReduceOp.AVG)
                         dist.all_reduce(d_val, op=dist.ReduceOp.AVG)
+
                     self.ema_bpp.mul_(0.99).add_(b_val.item(), alpha=0.01)
                     self.ema_disp.mul_(0.99).add_(d_val.item(), alpha=0.01)
 
             scale = (self.ema_bpp / (self.ema_disp + 1e-8)).clamp(0.01, 10.0)
             effective = float(self.disp_weight * scale.item())
             self.effective_disp_coeff = effective
-            out["loss"] = out["loss"] + effective * disp
+
+            # Subtract dispersion loss: disp = −H, so −(effective * (−H)) = +H·effective
+            # This maximises dictionary entropy (diverse codebook usage).
+            out["loss"] = out["loss"] - effective * disp
 
         return out
 
@@ -202,7 +235,13 @@ def train_one_epoch(
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
+        # d is a patch of shape (B, 3, patch_size, patch_size).
+        # patch_size is a multiple of 64 by construction (default 256), so
+        # no padding is needed during training.
         out_net = model(d)
+
+        # Pass unpadded target (= d itself during training) to the loss so
+        # that num_pixels is computed over the true image content.
         out_criterion = criterion(out_net, d)
 
         # ── Pass 1: RD loss (main parameters) ────────────────────────────
@@ -306,9 +345,12 @@ def test_epoch(
             desc=f"Val Epoch {epoch}",
             disable=not accelerator.is_local_main_process,
         ):
+            # Pad to multiple of 64 for the model; track original dimensions
+            # so metrics are computed over the true image content.
             d_padded, H_orig, W_orig = pad_to_multiple(d, p=64)
             out_net = model(d_padded)
 
+            # Crop reconstruction and reference back to unpadded size
             x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
             d_orig = d[:, :, :H_orig, :W_orig]
 
@@ -318,14 +360,19 @@ def test_epoch(
                 grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
                 writer.add_image("Val/Reconstruction", grid, epoch)
 
-            B = d_padded.size(0)
-            H_pad = d_padded.size(2)
-            W_pad = d_padded.size(3)
-            num_pixels_pad = B * H_pad * W_pad
+            B = d.size(0)
+            # BPP must be normalised to original pixel count, not padded.
+            # compute_bpp divides by whatever we pass; pass original pixels.
             num_pixels_orig = B * H_orig * W_orig
 
-            bpp_padded = compute_bpp(out_net, num_pixels_pad)
-            bpp_val = bpp_padded * (num_pixels_pad / num_pixels_orig)
+            # The likelihoods were computed on the padded input, so the sum
+            # of log-likelihoods covers padded pixels.  We want bits per
+            # original pixel, so we divide the total bits by num_pixels_orig.
+            total_bits = sum(
+                torch.log(lh.float()).sum() / (-math.log(2))
+                for lh in out_net["likelihoods"].values()
+            )
+            bpp_val = total_bits / num_pixels_orig
 
             mse_val = F.mse_loss(x_hat, d_orig)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
@@ -455,6 +502,13 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # Validate that patch_size is divisible by 64 so forward() never sees
+    # non-compliant input during training.
+    if args.patch_size % 64 != 0:
+        raise ValueError(
+            f"--patch-size must be a multiple of 64, got {args.patch_size}."
+        )
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
 
@@ -515,6 +569,10 @@ def main():
         milestones=args.lr_milestones,
         gamma=args.lr_gamma,
     )
+
+    # Criterion is placed on the accelerator device but NOT passed to
+    # accelerate.prepare() — it holds no parameters that need DDP wrapping.
+    # EMA buffers are synchronised manually via all_reduce inside forward().
     criterion = RateDistortionLoss(
         lmbda=args.lmbda,
         metric=args.metric,
