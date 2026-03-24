@@ -245,7 +245,7 @@ def train_one_epoch(
         out_criterion = criterion(out_net, d)
 
         # ── Pass 1: RD loss (main parameters) ────────────────────────────
-        accelerator.backward(out_criterion["loss"])
+        accelerator.backward(out_criterion["loss"], retain_graph=True)
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
