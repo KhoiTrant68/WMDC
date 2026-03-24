@@ -301,10 +301,12 @@ class UnifiedDictionaryAttention(nn.Module):
 
         elif self.routing_mode == "balanced_eot":
             P = self._route_balanced_eot(C_mat)
+            P = P * HW
 
         elif self.routing_mode == "unbalanced_eot":
             rho_flat = rho_spatial.view(B, HW).clamp(min=0.01)
             P = self._route_unbalanced_eot(C_mat, rho_flat)
+            P = P * HW
 
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode}")

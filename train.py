@@ -88,11 +88,12 @@ class RateDistortionLoss(nn.Module):
     """
     Rate-distortion loss with adaptive dispersion regularisation.
 
-    L = λ · distortion + bpp  −  w_disp · scale · dispersion_entropy
+    L = λ · distortion + bpp  +  w_disp · scale · dispersion_loss
 
-    The dispersion term is *subtracted* because `_dispersion_loss` returns
-    negative entropy; subtracting it is equivalent to maximising the entropy
-    of dictionary usage, which encourages diverse codebook utilisation.
+    The dispersion term is *added* because `_dispersion_loss` already returns
+    negative entropy (-H). Minimizing -H is mathematically equivalent to
+    maximizing the entropy (H) of dictionary usage, which encourages diverse
+    codebook utilisation.
 
     EMA buffers track the running magnitudes of the BPP and dispersion terms
     so that `scale` auto-normalises their relative contribution, making the
@@ -162,9 +163,9 @@ class RateDistortionLoss(nn.Module):
             effective = float(self.disp_weight * scale.item())
             self.effective_disp_coeff = effective
 
-            # Subtract dispersion loss: disp = −H, so −(effective * (−H)) = +H·effective
-            # This maximises dictionary entropy (diverse codebook usage).
-            out["loss"] = out["loss"] - effective * disp
+            # Add dispersion loss: disp = −H, so + (effective * (−H)) = −H·effective
+            # Minimising −H maximises dictionary entropy (diverse codebook usage).
+            out["loss"] = out["loss"] + effective * disp
 
         return out
 
