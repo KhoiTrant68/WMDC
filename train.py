@@ -79,16 +79,6 @@ def compute_bpp(out_net: dict, num_pixels: int) -> torch.Tensor:
     )
 
 
-def pad_to_multiple(x: torch.Tensor, p: int = 64):
-    """Pad tensor to make H and W multiples of p using reflect padding."""
-    H, W = x.size(2), x.size(3)
-    pad_h = (p - H % p) % p
-    pad_w = (p - W % p) % p
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-    return x, H, W
-
-
 # ---------------------------------------------------------------------------
 # Rate-Distortion Loss
 # ---------------------------------------------------------------------------
@@ -295,22 +285,25 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
     """
     Measure PSNR gap between forward() (noise relaxation) and
     compress/decompress() (true quantisation) on the same batch.
+    Input is guaranteed to be a multiple of 64 from the test dataloader.
     """
     model.eval()
-    d_padded, H_orig, W_orig = pad_to_multiple(batch.to(device), p=64)
+    d = batch.to(device)
 
     with torch.no_grad():
-        out_fwd = model(d_padded)
-        x_hat_fwd = out_fwd["x_hat"][:, :, :H_orig, :W_orig].clamp(0, 1)
+        # Forward pass (continuous noise relaxation)
+        out_fwd = model(d)
+        x_hat_fwd = out_fwd["x_hat"].clamp(0, 1)
 
-        mse_fwd = F.mse_loss(batch.to(device), x_hat_fwd)
+        mse_fwd = F.mse_loss(d, x_hat_fwd)
         psnr_fwd = -10 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
 
-        out_enc = model.compress(d_padded)
+        # Compress/Decompress pass (discrete quantization)
+        out_enc = model.compress(d)
         out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
-        x_hat_dec = out_dec["x_hat"][:, :, :H_orig, :W_orig].clamp(0, 1)
+        x_hat_dec = out_dec["x_hat"].clamp(0, 1)
 
-        mse_dec = F.mse_loss(batch.to(device), x_hat_dec)
+        mse_dec = F.mse_loss(d, x_hat_dec)
         psnr_dec = -10 * math.log10(mse_dec.item()) if mse_dec.item() > 0 else 100.0
 
     return psnr_fwd - psnr_dec
@@ -345,44 +338,32 @@ def test_epoch(
             desc=f"Val Epoch {epoch}",
             disable=not accelerator.is_local_main_process,
         ):
-            # Pad to multiple of 64 for the model; track original dimensions
-            # so metrics are computed over the true image content.
-            d_padded, H_orig, W_orig = pad_to_multiple(d, p=64)
-            out_net = model(d_padded)
-
-            # Crop reconstruction and reference back to unpadded size
-            x_hat = out_net["x_hat"][:, :, :H_orig, :W_orig].clamp_(0, 1)
-            d_orig = d[:, :, :H_orig, :W_orig]
+            out_net = model(d)
+            x_hat = out_net["x_hat"].clamp_(0, 1)
 
             if i == 0 and accelerator.is_main_process and writer is not None:
-                n = min(d_orig.size(0), 4)
-                cmp = torch.cat([d_orig[:n], x_hat[:n]])
+                n = min(d.size(0), 4)
+                cmp = torch.cat([d[:n], x_hat[:n]])
                 grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
                 writer.add_image("Val/Reconstruction", grid, epoch)
 
-            B = d.size(0)
-            # BPP must be normalised to original pixel count, not padded.
-            # compute_bpp divides by whatever we pass; pass original pixels.
-            num_pixels_orig = B * H_orig * W_orig
+            B, _, H, W = d.size()
+            num_pixels = B * H * W
 
-            # The likelihoods were computed on the padded input, so the sum
-            # of log-likelihoods covers padded pixels.  We want bits per
-            # original pixel, so we divide the total bits by num_pixels_orig.
             total_bits = sum(
                 torch.log(lh.float()).sum() / (-math.log(2))
                 for lh in out_net["likelihoods"].values()
             )
-            bpp_val = total_bits / num_pixels_orig
+            bpp_val = total_bits / num_pixels
 
-            mse_val = F.mse_loss(x_hat, d_orig)
+            mse_val = F.mse_loss(x_hat, d)
             psnr_val = -10 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
 
             if criterion.metric == "mse":
                 loss_val = criterion.lmbda * 255.0**2 * mse_val + bpp_val
             else:
                 loss_val = (
-                    criterion.lmbda * (1 - ms_ssim(x_hat, d_orig, data_range=1.0))
-                    + bpp_val
+                    criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
                 )
 
             metrics = (
@@ -418,13 +399,13 @@ def test_epoch(
             logger.info(
                 f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | "
                 f"PSNR: {psnr_meter.avg:.2f} dB | "
-                f"BPP (original pixels): {bpp_meter.avg:.4f}"
+                f"BPP: {bpp_meter.avg:.4f}"
                 + (f" | Train/Infer ΔPSNR: {gap_psnr:+.3f} dB" if gap_measured else "")
             )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
             writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
-            writer.add_scalar("Val/Bpp_orig", bpp_meter.avg, epoch)
+            writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
             if gap_measured and not math.isnan(gap_psnr):
                 writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
 
@@ -536,9 +517,7 @@ def main():
         split="valid",
         transform=transforms.Compose(
             [
-                transforms.CenterCrop(
-                    args.patch_size
-                ),  # Forces identical sizes for batching
+                transforms.CenterCrop(args.patch_size),
                 transforms.ToTensor(),
             ]
         ),
