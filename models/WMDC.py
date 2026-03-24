@@ -284,6 +284,9 @@ class WMDC(CompressionModel):
         memory_state = self.init_memory(hyper_prior)
 
         total_dispersion = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        if self.eot_attention.routing_mode != "unbalanced_eot":
+            for p in self.rho_predictors.parameters():
+                total_dispersion = total_dispersion + p.sum() * 0.0
 
         for i, y_slice in enumerate(y_slices):
             # Per-slice rho conditioned on context available so far
