@@ -255,7 +255,7 @@ def train_one_epoch(
 
         pbar.set_postfix(
             rd=f"{rd_meter.avg:.4f}",
-            aux=f"{aux_meter.avg:.5f}",
+            # aux=f"{aux_meter.avg:.5f}",
             bpp=f"{bpp_meter.avg:.4f}",
             disp=f"{disp_meter.avg:.4f}",
         )
