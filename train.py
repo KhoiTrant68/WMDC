@@ -486,13 +486,6 @@ def main():
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    # Enable deterministic algorithms where CUDA kernels allow it.
-    # warn_only=True so non-deterministic ops (e.g. atomics) log a warning
-    # rather than raising — useful during development.
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except TypeError:
-        torch.use_deterministic_algorithms(True)  # older PyTorch
 
     if args.patch_size % 64 != 0:
         raise ValueError(
