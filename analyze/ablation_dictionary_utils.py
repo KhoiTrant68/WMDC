@@ -35,7 +35,9 @@ from torchvision import transforms
 from models.WMDC import WMDC
 
 
-def compute_utilization_entropy(model, x_padded: torch.Tensor) -> float:
+def compute_utilization_entropy(
+    model, x_padded: torch.Tensor, orig_h: int, orig_w: int
+) -> float:
     """
     Compute Shannon entropy of the dictionary token utilisation marginal
     for a single image.
@@ -61,12 +63,29 @@ def compute_utilization_entropy(model, x_padded: torch.Tensor) -> float:
     finally:
         hook.remove()
 
+    true_latent_h = orig_h // 16
+    true_latent_w = orig_w // 16
+
     for P in plans:
-        # True OT target marginal (consistent with fixed _dispersion_loss).
-        target_marginal = P.sum(dim=1)  # (B, N)
+        # P is shape (B, padded_HW, N)
+        B, _, N = P.shape
+
+        # Reshape to spatial grid: (B, padded_H, padded_W, N)
+        # Note: In WMDC, HW is derived from the latent shape.
+        latent_h_pad = x_padded.size(2) // 16
+        latent_w_pad = x_padded.size(3) // 16
+
+        P_spatial = P.view(B, latent_h_pad, latent_w_pad, N)
+
+        # Crop out the padding!
+        P_cropped = P_spatial[:, :true_latent_h, :true_latent_w, :].reshape(B, -1, N)
+
+        # Now calculate the true target marginal
+        target_marginal = P_cropped.sum(dim=1)  # (B, N)
         target_marginal = target_marginal / (
             target_marginal.sum(dim=1, keepdim=True) + 1e-8
         )
+
         H = -(target_marginal * (target_marginal + 1e-8).log()).sum(dim=1).mean()
         entropies.append(H.item())
 
@@ -91,7 +110,7 @@ def evaluate_dataset(model, dataset_dir: str, device: str) -> list:
         pad_h = (64 - H % 64) % 64
         pad_w = (64 - W % 64) % 64
         x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-        ent = compute_utilization_entropy(model, x_padded)
+        ent = compute_utilization_entropy(model, x_padded, H, W)
         entropies.append(ent)
         print(f"  {os.path.basename(img_path)}: H = {ent:.4f} nats")
 

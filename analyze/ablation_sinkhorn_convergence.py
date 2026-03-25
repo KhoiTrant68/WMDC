@@ -39,7 +39,9 @@ def measure_convergence(model, x_padded, max_iters: int, device: str):
         latent_scales = model.h_scale_s(z_hat)
         latent_means = model.h_mean_s(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
-        rho_spatial = model._compute_rho_spatial(hyper_prior)
+        rho_spatial = model._compute_rho_spatial(
+            slice_idx=0, hyper_prior=hyper_prior, decoded_slices=[]
+        )
 
         # Use slice-0 projection for the convergence test.
         k_dict = model.k_projs[0](dt)
@@ -65,9 +67,37 @@ def measure_convergence(model, x_padded, max_iters: int, device: str):
         model.eot_attention.iters = n_iters
         with torch.no_grad():
             P = model.eot_attention._route_unbalanced_eot(C_mat, rho_flat)
-            # Primal cost: Σ_{ij} C_{ij} * P_{ij}
-            cost = (C_mat * P).sum(dim=(1, 2)).mean().item()
-        costs.append(cost)
+
+            # 1. Linear Transport Cost
+            transport_cost = (C_mat * P).sum(dim=(1, 2))
+
+            # 2. Marginal KL Divergences (Penalty for creating/destroying mass)
+            # P_row_sum is P1, P_col_sum is P^T1
+            P_row_sum = P.sum(dim=2) + 1e-8  # (B, HW)
+            P_col_sum = P.sum(dim=1) + 1e-8  # (B, N)
+
+            alpha = 1.0 / HW
+            beta = 1.0 / C_mat.size(-1)
+
+            # D_KL(u || v) = u log(u/v) - u + v
+            kl_row = (P_row_sum * torch.log(P_row_sum / alpha) - P_row_sum + alpha).sum(
+                dim=1
+            )
+            kl_col = (P_col_sum * torch.log(P_col_sum / beta) - P_col_sum + beta).sum(
+                dim=1
+            )
+
+            # Spatial Rho applies to rows, uniform epsilon to cols (as per your derivation)
+            rho_penalty = (rho_flat * kl_row).sum(dim=1)  # (B)
+
+            # Total Unbalanced Primal Objective
+            total_cost = (
+                (transport_cost + rho_penalty + model.eot_attention.ot_eps * kl_col)
+                .mean()
+                .item()
+            )
+
+        costs.append(total_cost)
 
     model.eot_attention.iters = original_iters
     return iter_counts, costs

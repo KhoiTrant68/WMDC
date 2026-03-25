@@ -4,6 +4,7 @@ import math
 import os
 import time
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -13,41 +14,101 @@ from torchvision.utils import save_image
 
 from models.WMDC import WMDC
 
+# ---------------------------------------------------------------------------
+# BPP helpers
+# ---------------------------------------------------------------------------
+
+
+def _byte_size(obj) -> int:
+    """Recursively sum the byte-lengths of all byte-strings in a nested structure."""
+    if isinstance(obj, bytes):
+        return len(obj)
+    if isinstance(obj, (list, tuple)):
+        return sum(_byte_size(s) for s in obj)
+    return 0
+
 
 def compute_actual_bpp(strings, num_pixels: int) -> float:
-    """
-    Compute BPP from actual compressed byte-string lengths.
+    """Bits-per-pixel from actual compressed byte lengths."""
+    return (_byte_size(strings) * 8) / num_pixels
 
-    strings is [y_strings, z_strings] where:
-      y_strings : list of num_slices lists, each containing per-image byte strings
-      z_strings : list of per-image byte strings
 
-    We recursively sum all byte lengths, convert to bits, and normalise by the
-    number of *original* (unpadded) pixels.  No shape side-information is
-    included here; in a real bitstream that overhead (~4 bytes) is negligible
-    at typical image sizes but should be noted in paper comparisons.
-    """
-
-    def get_size(obj) -> int:
-        if isinstance(obj, bytes):
-            return len(obj)
-        elif isinstance(obj, (list, tuple)):
-            return sum(get_size(s) for s in obj)
-        return 0
-
-    return (get_size(strings) * 8) / num_pixels
+# ---------------------------------------------------------------------------
+# Padding
+# ---------------------------------------------------------------------------
 
 
 def pad_image(x: torch.Tensor, p: int = 64):
     H, W = x.size(2), x.size(3)
     pad_h = (p - H % p) % p
     pad_w = (p - W % p) % p
-    x_padded = (
-        F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-        if (pad_h > 0 or pad_w > 0)
-        else x
-    )
+    if pad_h > 0 or pad_w > 0:
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+    else:
+        x_padded = x
     return x_padded, pad_h, pad_w
+
+
+# ---------------------------------------------------------------------------
+# Timing helper
+# ---------------------------------------------------------------------------
+
+
+def _sync(device: str):
+    """Synchronise CUDA stream so wall-clock timings are accurate."""
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Dictionary utilisation
+# ---------------------------------------------------------------------------
+
+
+def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
+    """
+    Run a single forward pass and extract per-slice utilisation metrics.
+
+    Returns a dict with:
+      - 'marginal_entropy'  : column-marginal entropy H(m)  (nats)
+      - 'max_entropy'       : log(dict_num)                  (nats)
+      - 'utilisation_pct'   : H(m) / log(dict_num) * 100
+      - 'slice_utilisation' : list[float] — one value per slice
+                              (NOTE: eot_attention only stores the LAST slice's
+                               attn_probs; full per-slice tracking requires a
+                               small model change — see comment below)
+    """
+    x = x.to(device).float()
+    x_pad, _, _ = pad_image(x, p=64)
+
+    model.eval()
+    with torch.no_grad():
+        _ = model(x_pad)
+
+    attn = model.eot_attention.attn_probs  # (B, HW, N) from last slice, or None
+    result = {
+        "marginal_entropy": float("nan"),
+        "max_entropy": math.log(model.dict_num),
+        "utilisation_pct": float("nan"),
+        "slice_utilisation": [],
+    }
+
+    if attn is not None:
+        marginal = attn.sum(dim=1)  # (B, N)
+        marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean()
+        result["marginal_entropy"] = H.item()
+        result["utilisation_pct"] = H.item() / result["max_entropy"] * 100.0
+
+    # Clear buffer to prevent memory accumulation (32 MB per 4K image).
+    model.eot_attention.attn_probs = None
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -62,18 +123,18 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, default="output")
     parser.add_argument(
-        "--ot-eps",
-        type=float,
-        default=0.1,
-        help="Must match the value used during training.",
+        "--ot-eps", type=float, default=0.1, help="Must match training value."
     )
     parser.add_argument(
-        "--sinkhorn-iters",
-        type=int,
-        default=20,
-        help="Must match the value used during training.",
+        "--sinkhorn-iters", type=int, default=20, help="Must match training value."
     )
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument(
+        "--measure-dict-util",
+        action="store_true",
+        help="Run an extra forward pass per image to measure "
+        "dictionary utilisation (slower but informative).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -81,6 +142,7 @@ def main():
     img_dir = os.path.join(args.output, "images")
     os.makedirs(img_dir, exist_ok=True)
 
+    # ── Model ────────────────────────────────────────────────────────────────
     model = WMDC(
         N=192,
         M=320,
@@ -90,122 +152,167 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
     ).to(device)
 
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint.get("state_dict", checkpoint))
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
     model.update(force=True)
 
+    # ── Image list ───────────────────────────────────────────────────────────
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
     image_paths = sorted(
-        [
-            os.path.join(args.dataset, f)
-            for f in os.listdir(args.dataset)
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ]
+        os.path.join(args.dataset, f)
+        for f in os.listdir(args.dataset)
+        if os.path.splitext(f)[1].lower() in exts
     )
+    if not image_paths:
+        raise RuntimeError(f"No images found in {args.dataset}")
 
-    results = {"bpp": [], "psnr": [], "ms_ssim": [], "enc_time": [], "dec_time": []}
-    per_image = []
+    # ── Per-image evaluation ──────────────────────────────────────────────────
+    metrics = {
+        k: []
+        for k in (
+            "bpp",
+            "bpp_padded",
+            "pad_overhead_bpp",
+            "psnr",
+            "ms_ssim",
+            "enc_time",
+            "dec_time",
+        )
+    }
+    util_pcts: list[float] = []
+    per_image: list[dict] = []
+
+    to_tensor = transforms.ToTensor()
 
     with torch.no_grad():
         for img_path in image_paths:
             img = Image.open(img_path).convert("RGB")
-            x = transforms.ToTensor()(img).unsqueeze(0).to(device)
+            x = to_tensor(img).unsqueeze(0).to(device).float()
 
-            # Record original dimensions before any padding.
             H, W = x.size(2), x.size(3)
-            num_pixels_original = H * W
+            num_pixels_orig = H * W
 
-            x_padded, pad_h, pad_w = pad_image(x, p=64)
+            x_pad, pad_h, pad_w = pad_image(x, p=64)
+            H_pad = H + pad_h
+            W_pad = W + pad_w
+            num_pixels_padded = H_pad * W_pad
 
+            # Encode
+            _sync(device)
             t0 = time.time()
-            out_enc = model.compress(x_padded)
+            out_enc = model.compress(x_pad)
+            _sync(device)
             enc_time = time.time() - t0
 
+            # Decode
+            _sync(device)
             t1 = time.time()
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
+            _sync(device)
             dec_time = time.time() - t1
 
+            # Crop padding and clamp
             x_hat = out_dec["x_hat"]
-            # Crop away any padding introduced before compression.
             if pad_h > 0 or pad_w > 0:
                 x_hat = x_hat[:, :, :H, :W]
             x_hat = x_hat.clamp(0, 1)
 
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
-            # BPP is always computed over original (unpadded) pixel count.
-            # The compressed strings cover padded pixels, but we account for
-            # the full coding cost — this is the correct and standard metric
-            # used by Kodak / CLIC benchmarks.
-            bpp = compute_actual_bpp(out_enc["strings"], num_pixels_original)
+            # BPP — two variants
+            # bpp_orig  : bits / original pixels  (standard Kodak/CLIC metric)
+            # bpp_pad   : bits / padded pixels     (codec's actual cost domain)
+            # pad_overhead = bpp_orig - bpp_pad    (should be < 0.001 for large images)
+            bpp_orig = compute_actual_bpp(out_enc["strings"], num_pixels_orig)
+            bpp_pad = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
+            pad_oh = bpp_orig - bpp_pad
 
+            # Quality
             mse = F.mse_loss(x, x_hat)
-            psnr = -10 * math.log10(mse.item()) if mse.item() > 0 else 100.0
+            psnr = -10.0 * math.log10(mse.item()) if mse.item() > 0 else 100.0
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()
 
-            results["bpp"].append(bpp)
-            results["psnr"].append(psnr)
-            results["ms_ssim"].append(msssim)
-            results["enc_time"].append(enc_time)
-            results["dec_time"].append(dec_time)
+            metrics["bpp"].append(bpp_orig)
+            metrics["bpp_padded"].append(bpp_pad)
+            metrics["pad_overhead_bpp"].append(pad_oh)
+            metrics["psnr"].append(psnr)
+            metrics["ms_ssim"].append(msssim)
+            metrics["enc_time"].append(enc_time)
+            metrics["dec_time"].append(dec_time)
 
-            per_image.append(
-                {
-                    "file": os.path.basename(img_path),
-                    "bpp": round(bpp, 4),
-                    "psnr": round(psnr, 2),
-                    "ms_ssim": round(msssim, 4),
-                    "enc_time": round(enc_time, 3),
-                    "dec_time": round(dec_time, 3),
-                }
-            )
+            row = {
+                "file": os.path.basename(img_path),
+                "resolution": f"{W}x{H}",
+                "bpp": round(bpp_orig, 4),
+                "bpp_padded": round(bpp_pad, 4),
+                "pad_overhead_bpp": round(pad_oh, 6),
+                "psnr": round(psnr, 2),
+                "ms_ssim": round(msssim, 4),
+                "enc_time": round(enc_time, 3),
+                "dec_time": round(dec_time, 3),
+            }
+
+            # Optional dictionary utilisation (extra forward pass)
+            if args.measure_dict_util:
+                util = measure_dict_utilisation(model, x, device)
+                row["dict_utilisation_pct"] = round(util["utilisation_pct"], 2)
+                util_pcts.append(util["utilisation_pct"])
+
+            per_image.append(row)
 
             print(
-                f"{os.path.basename(img_path)} | "
-                f"BPP: {bpp:.4f} | PSNR: {psnr:.2f} dB | "
-                f"MS-SSIM: {msssim:.4f} | "
-                f"Enc: {enc_time:.3f}s | Dec: {dec_time:.3f}s"
+                f"{os.path.basename(img_path):30s} | "
+                f"BPP: {bpp_orig:.4f} (pad-domain: {bpp_pad:.4f}, "
+                f"overhead: {pad_oh:+.5f}) | "
+                f"PSNR: {psnr:.2f} dB | MS-SSIM: {msssim:.4f} | "
+                f"Enc: {enc_time:.3f}s  Dec: {dec_time:.3f}s"
             )
 
-    avg_results = {k: sum(v) / len(v) for k, v in results.items()}
+    # ── Aggregate statistics ──────────────────────────────────────────────────
+    def _stats(vals):
+        a = float(np.mean(vals))
+        s = float(np.std(vals))
+        return {"mean": round(a, 4), "std": round(s, 4)}
 
-    # ── Dictionary utilisation analysis ──────────────────────────────────────
-    # Re-run forward() on a single image to collect attn_probs from the
-    # EOT attention module.  This provides insight into codebook usage.
-    if image_paths:
-        img = Image.open(image_paths[0]).convert("RGB")
-        x_sample = transforms.ToTensor()(img).unsqueeze(0).to(device)
-        x_sample_pad, pad_h, pad_w = pad_image(x_sample, p=64)
+    avg = {k: _stats(v) for k, v in metrics.items()}
 
-        with torch.no_grad():
-            _ = model(x_sample_pad)
+    if util_pcts:
+        avg["dict_utilisation_pct"] = _stats(util_pcts)
 
-        attn = model.eot_attention.attn_probs  # (B, HW, N) or None
-        if attn is not None:
-            # Column marginal → how much each dict token is used
-            marginal = attn.sum(dim=1)  # (B, N)
-            marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            H_entropy = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean()
-            max_H = math.log(model.dict_num)
-            utilisation = H_entropy.item() / max_H * 100
-            avg_results["dict_utilisation_pct"] = round(utilisation, 2)
-            print(f"\n  Dictionary utilisation: {utilisation:.1f}% of max entropy")
+    print("\n── Average results ──────────────────────────────")
+    print(
+        f"  BPP (original pixels) : {avg['bpp']['mean']:.4f} ± {avg['bpp']['std']:.4f}"
+    )
+    print(
+        f"  BPP (padded pixels)   : {avg['bpp_padded']['mean']:.4f} ± {avg['bpp_padded']['std']:.4f}"
+    )
+    print(
+        f"  Pad overhead          : {avg['pad_overhead_bpp']['mean']:+.5f} bpp (mean)"
+    )
+    print(
+        f"  PSNR                  : {avg['psnr']['mean']:.2f} ± {avg['psnr']['std']:.2f} dB"
+    )
+    print(
+        f"  MS-SSIM               : {avg['ms_ssim']['mean']:.4f} ± {avg['ms_ssim']['std']:.4f}"
+    )
+    print(f"  Enc time              : {avg['enc_time']['mean']:.3f}s")
+    print(f"  Dec time              : {avg['dec_time']['mean']:.3f}s")
+    if util_pcts:
+        print(
+            f"  Dict utilisation      : {avg['dict_utilisation_pct']['mean']:.1f}% ± "
+            f"{avg['dict_utilisation_pct']['std']:.1f}%"
+        )
 
     report = {
-        "average": avg_results,
+        "average": avg,
         "per_image": per_image,
         "args": vars(args),
     }
     report_path = os.path.join(args.output, "RD_report.json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=4)
-
-    print(f"\nAverage results saved to {report_path}")
-    print(f"  BPP:     {avg_results['bpp']:.4f}")
-    print(f"  PSNR:    {avg_results['psnr']:.2f} dB")
-    print(f"  MS-SSIM: {avg_results['ms_ssim']:.4f}")
-    print(f"  Enc:     {avg_results['enc_time']:.3f}s")
-    print(f"  Dec:     {avg_results['dec_time']:.3f}s")
+    print(f"\nFull report saved → {report_path}")
 
 
 if __name__ == "__main__":

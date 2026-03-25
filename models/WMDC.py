@@ -28,14 +28,15 @@ class WMDC(CompressionModel):
     Decoder  g_s : y_hat → image reconstruction
 
     Args:
-        N             : channels in hyper-encoder/decoder
-        M             : latent channels (split into num_slices slices)
-        num_slices    : number of autoregressive channel slices
-        dict_head_num : used to set dict_dim = 32 * dict_head_num
-        dict_num      : number of dictionary tokens
-        routing_mode  : {'softmax', 'balanced_eot', 'unbalanced_eot'}
-        ot_eps        : fixed Sinkhorn entropic regularisation ε
-        sinkhorn_iters: Sinkhorn iterations (≥20 recommended for eps=0.1)
+        N              : channels in hyper-encoder/decoder
+        M              : latent channels (split into num_slices slices)
+        num_slices     : number of autoregressive channel slices
+        dict_head_num  : dict_dim = 32 × dict_head_num
+        dict_num       : number of dictionary tokens
+        routing_mode   : {'softmax', 'balanced_eot', 'unbalanced_eot'}
+        ot_eps         : Sinkhorn entropic regularisation ε (match train value)
+        sinkhorn_iters : Sinkhorn iterations (≥ 20 recommended for ε = 0.1)
+        tv_weight      : spatial TV weight on transport plan P (0 = disabled)
     """
 
     def __init__(
@@ -48,6 +49,7 @@ class WMDC(CompressionModel):
         routing_mode: str = "unbalanced_eot",
         ot_eps: float = 0.1,
         sinkhorn_iters: int = 20,
+        tv_weight: float = 0.0,
     ):
         super().__init__()
         self.N = N
@@ -110,7 +112,7 @@ class WMDC(CompressionModel):
         )
 
         # ── Spatially-Adaptive KL Mass Penalty Predictor (per-slice) ──────
-        # Each slice gets its own rho predictor conditioned on the growing
+        # Slice gets its own rho predictor conditioned on the growing
         # context (hyper_prior + accumulated reconstruction so far).
         # Slice i sees hyper_prior (2*M) + i decoded slices (i * slice_ch).
         self.rho_predictors = nn.ModuleList(
@@ -123,14 +125,17 @@ class WMDC(CompressionModel):
                 for i in range(num_slices)
             ]
         )
+        # Bias init: softplus(2.0) ≈ 2.13 → rho starts moderately large,
+        # meaning the OT starts close to the balanced (hard-constraint) regime
+        # and can relax as training progresses.
         for predictor in self.rho_predictors:
             nn.init.zeros_(predictor[-1].weight)
             nn.init.constant_(predictor[-1].bias, 2.0)
 
         # ── Bootstrap memory state ─────────────────────────────────────────
-        self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=1)
+        self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=3, padding=1)
 
-        # ── Per-slice K/V projections ────────────────────────────────
+        # ── Per-slice K/V projections ──────────────────────────────────────
         self.k_projs = nn.ModuleList(
             [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
         )
@@ -148,9 +153,10 @@ class WMDC(CompressionModel):
             ot_eps=ot_eps,
             iters=sinkhorn_iters,
             routing_mode=routing_mode,
+            tv_weight=tv_weight,
         )
 
-        # ── GatedMemoryUpdater replaces plain residual-add ────────────
+        # ── GatedMemoryUpdater replaces plain residual-add ─────────────────
         self.memory_updaters = nn.ModuleList(
             [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices - 1)]
         )
@@ -202,7 +208,7 @@ class WMDC(CompressionModel):
                 for _ in range(num_slices)
             ]
         )
-
+        # Zero-init LRP final layer: identity at start of training.
         for transform in self.lrp_transforms:
             nn.init.zeros_(transform[-1].weight)
             nn.init.zeros_(transform[-1].bias)
@@ -220,7 +226,7 @@ class WMDC(CompressionModel):
         updated |= super().update(force=force)
         return updated
 
-    def aux_loss(self):
+    def aux_loss(self) -> torch.Tensor:
         """Auxiliary loss for entropy bottleneck CDF approximation."""
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
@@ -260,12 +266,10 @@ class WMDC(CompressionModel):
     # -----------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> dict:
-        assert x.dtype == torch.float32, (
-            f"WMDC requires FP32 input, got {x.dtype}. "
-            "Sinkhorn OT logsumexp overflows in FP16/BF16."
-        )
+        # Force FP32 — Sinkhorn logsumexp overflows in FP16/BF16.
+        x = x.float()
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
-            raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
+            raise ValueError(f"Input must be divisible by 64.  Got {x.shape}")
 
         y = self.g_a(x)
         z = self.h_a(y)
@@ -284,14 +288,14 @@ class WMDC(CompressionModel):
         memory_state = self.init_memory(hyper_prior)
 
         total_dispersion = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        if self.eot_attention.routing_mode != "unbalanced_eot":
-            for p in self.rho_predictors.parameters():
-                total_dispersion = total_dispersion + p.sum() * 0.0
 
         for i, y_slice in enumerate(y_slices):
-            # Per-slice rho conditioned on context available so far
+            # rho always flows gradient to rho_predictors regardless of mode.
             rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
 
+            # For non-unbalanced modes the attention ignores rho internally,
+            # but computing it keeps rho_predictors in the gradient graph so
+            # DDP never encounters truly unused parameters.
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
 
@@ -345,9 +349,9 @@ class WMDC(CompressionModel):
     # -----------------------------------------------------------------------
 
     def compress(self, x: torch.Tensor) -> dict:
-        assert x.dtype == torch.float32, f"WMDC requires FP32 input, got {x.dtype}."
+        x = x.float()
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
-            raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
+            raise ValueError(f"Input must be divisible by 64.  Got {x.shape}")
 
         y = self.g_a(x)
         z = self.h_a(y)
