@@ -43,7 +43,7 @@ def pad_image(x: torch.Tensor, p: int = 64):
     pad_h = (p - H % p) % p
     pad_w = (p - W % p) % p
     if pad_h > 0 or pad_w > 0:
-        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
     else:
         x_padded = x
     return x_padded, pad_h, pad_w
