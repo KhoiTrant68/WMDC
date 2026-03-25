@@ -325,7 +325,7 @@ class UnifiedDictionaryAttention(nn.Module):
         # ── Dispersion loss ───────────────────────────────────────────────────
         # Returns −H (negative entropy).  Only computed during training.
         if self.training and calc_disp:
-            disp_loss = self._dispersion_loss(P) + tv_loss
+            disp_loss = self._dispersion_loss(P) + tv_loss + 0.0 * rho_spatial.sum()
         else:
             disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
