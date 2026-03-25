@@ -86,7 +86,7 @@ class RateDistortionLoss(nn.Module):
     """
     Rate-distortion loss with adaptive entropy-dispersion bonus.
 
-        L = λ · distortion + bpp  −  w_disp · scale · H(m)
+        L = λ · distortion + bpp  −  effective · H(m)
 
     where H(m) is the Shannon entropy of the column-marginal distribution of
     the transport plan (high H → diverse codebook usage).  We SUBTRACT the
@@ -120,15 +120,18 @@ class RateDistortionLoss(nn.Module):
         self.metric = metric
         self.disp_weight = disp_weight
 
-        # EMA of |bpp| and |entropy bonus|.  Both are always positive scalars.
-        self.register_buffer("ema_bpp", torch.tensor(1.0))
-        self.register_buffer("ema_disp", torch.tensor(1.0))
+        # Initialise EMA accumulators at 0 and track step
+        # count for bias correction.  The correction factor is
+        #   1 - α^t  (α = 0.99, lerp weight = 0.01)
+        # which approaches 1 after ~300 steps, eliminating the warm-up bias.
+        self.register_buffer("ema_bpp", torch.tensor(0.0))
+        self.register_buffer("ema_disp", torch.tensor(0.0))
+        self.register_buffer("ema_steps", torch.tensor(0, dtype=torch.long))
 
         # Exposed for TensorBoard logging.
         self.effective_disp_coeff: float = disp_weight
 
     def forward(self, output: dict, target: torch.Tensor) -> dict:
-        # target is the unpadded patch — correct pixel denominator.
         num_pixels = target.size(0) * target.size(2) * target.size(3)
         bpp_loss = compute_bpp(output, num_pixels)
 
@@ -144,32 +147,40 @@ class RateDistortionLoss(nn.Module):
         out["loss"] = self.lmbda * distortion + bpp_loss
 
         if "dispersion_loss" in output:
-            # dispersion_loss = −H  (negative entropy, from model)
-            # dispersion_bonus = H  (positive — what we want to maximise)
-            disp_bonus = -output["dispersion_loss"]  # always ≥ 0
-            out["dispersion_bonus"] = disp_bonus  # store for logging
+            disp_bonus = -output["dispersion_loss"]  # H ≥ 0  (bits)
+            out["dispersion_bonus"] = disp_bonus
 
             if self.training:
                 with torch.no_grad():
                     b_val = bpp_loss.abs().detach().reshape(1)
-                    d_val = disp_bonus.abs().detach().reshape(1)  # = H ≥ 0
+                    d_val = disp_bonus.abs().detach().reshape(1)
 
-                    # All-reduce BEFORE lerp so all ranks update identically.
                     if dist.is_available() and dist.is_initialized():
                         dist.all_reduce(b_val, op=dist.ReduceOp.AVG)
                         dist.all_reduce(d_val, op=dist.ReduceOp.AVG)
 
+                    self.ema_steps += 1
                     self.ema_bpp.lerp_(b_val.squeeze(), weight=0.01)
                     self.ema_disp.lerp_(d_val.squeeze(), weight=0.01)
 
-            # scale ≈ bpp_magnitude / entropy_magnitude
-            # → effective coefficient keeps the dispersion term at ~disp_weight
-            #   fraction of the rate loss regardless of absolute magnitudes.
-            scale = (self.ema_bpp / (self.ema_disp + 1e-8)).clamp(0.01, 10.0)
-            effective = float(self.disp_weight * scale.item())
-            self.effective_disp_coeff = effective
+                # Adam-style bias correction.
+                # Without this, the scale ratio is corrupted for the first
+                # ~300 steps because ema_bpp / ema_disp starts at 0/0 = NaN,
+                # then trends toward the wrong ratio before stabilising.
+                t = float(self.ema_steps.item())
+                bc = 1.0 - 0.99**t  # correction factor → 1 as t → ∞
+                bc = max(bc, 1e-6)
+                ema_bpp_hat = self.ema_bpp / bc
+                ema_disp_hat = self.ema_disp / bc
 
-            # Subtract the entropy bonus: minimising L maximises H.
+                scale = (ema_bpp_hat / (ema_disp_hat + 1e-8)).clamp(0.01, 10.0)
+                effective = float(self.disp_weight * scale.item())
+                self.effective_disp_coeff = effective
+            else:
+                # In eval mode, use the current (already bias-corrected)
+                # effective coefficient without updating EMA.
+                effective = self.effective_disp_coeff
+
             out["loss"] = out["loss"] - effective * disp_bonus
 
         return out
@@ -215,10 +226,12 @@ def train_one_epoch(
     accelerator,
 ):
     model.train()
+    criterion.train()
+
     rd_meter = AverageMeter()
     aux_meter = AverageMeter()
     bpp_meter = AverageMeter()
-    disp_meter = AverageMeter()  # tracks entropy bonus H (positive)
+    disp_meter = AverageMeter()
 
     pbar = tqdm(
         enumerate(train_dataloader),
@@ -258,7 +271,7 @@ def train_one_epoch(
             rd=f"{rd_meter.avg:.4f}",
             # aux=f"{aux_meter.avg:.5f}",
             bpp=f"{bpp_meter.avg:.4f}",
-            H=f"{disp_meter.avg:.3f}",  # entropy bonus (positive = good)
+            H=f"{disp_meter.avg:.3f}",
         )
 
         if accelerator.is_main_process and i % 100 == 0:
@@ -296,6 +309,9 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
     d = batch.to(device).float()
 
     with torch.no_grad():
+        # Rebuild entropy tables BEFORE codec calls.
+        model.update(force=True)
+
         # Forward pass (noise relaxation)
         out_fwd = model(d)
         x_hat_fwd = out_fwd["x_hat"].clamp(0, 1)
@@ -331,9 +347,14 @@ def test_epoch(
     gap_check: bool = False,
 ):
     model.eval()
+    # Put criterion in eval mode so EMA is not updated from val
+    # data, and so train / val losses use identical computation paths.
+    criterion.eval()
+
     psnr_meter = AverageMeter()
     bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
+    disp_meter = AverageMeter()
     gap_psnr: float = float("nan")
 
     with torch.no_grad():
@@ -344,6 +365,13 @@ def test_epoch(
             disable=not accelerator.is_local_main_process,
         ):
             out_net = model(d)
+
+            # Use criterion for val loss so the computation is
+            # identical to training (same lambda scaling, same bpp formula).
+            # dispersion_loss is 0 in eval mode (model.eval()), so val loss
+            # equals pure RD loss — correct and comparable across epochs.
+            out_criterion = criterion(out_net, d)
+
             x_hat = out_net["x_hat"].clamp_(0, 1)
 
             if i == 0 and accelerator.is_main_process and writer is not None:
@@ -352,29 +380,20 @@ def test_epoch(
                 grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
                 writer.add_image("Val/Reconstruction", grid, epoch)
 
-            B, _, H, W = d.size()
-            num_pixels = B * H * W
-
-            total_bits = sum(
-                torch.log(lh.float()).sum() / (-math.log(2))
-                for lh in out_net["likelihoods"].values()
-            )
-            bpp_val = total_bits / num_pixels
             mse_val = F.mse_loss(x_hat, d)
             psnr_val = (
                 -10.0 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
             )
 
-            if criterion.metric == "mse":
-                loss_val = criterion.lmbda * 255.0**2 * mse_val + bpp_val
-            else:
-                loss_val = (
-                    criterion.lmbda * (1 - ms_ssim(x_hat, d, data_range=1.0)) + bpp_val
-                )
+            bpp_val = out_criterion["bpp_loss"].item()
+            loss_val = out_criterion["loss"].item()
 
-            # Gather across DDP ranks: stack into (world_size * B, 3) then mean.
+            # dispersion_bonus is 0 in eval mode; still log for transparency.
+            if "dispersion_bonus" in out_criterion:
+                disp_meter.update(out_criterion["dispersion_bonus"].item())
+
             local = torch.tensor(
-                [psnr_val, bpp_val.item(), loss_val.item()],
+                [psnr_val, bpp_val, loss_val],
                 device=accelerator.device,
             )
             gathered = accelerator.gather(local.unsqueeze(0))  # (world*1, 3)
@@ -383,10 +402,12 @@ def test_epoch(
             bpp_meter.update(m[1].item())
             loss_meter.update(m[2].item())
 
+    # Restore criterion to training mode BEFORE gap check and checkpoint.
+    criterion.train()
+
     # Gap measurement: compress one patch on the main process only.
     if gap_check and accelerator.is_main_process:
         try:
-            # Re-iterate to grab one batch at the current device.
             sample = next(iter(test_dataloader))[:1]
             gap_psnr = measure_train_inference_gap(
                 accelerator.unwrap_model(model),
@@ -397,6 +418,7 @@ def test_epoch(
             if logger:
                 logger.warning(f"Gap check failed: {e}")
         finally:
+            accelerator.unwrap_model(model).train()
             model.train()
 
     if accelerator.is_main_process:
@@ -415,6 +437,7 @@ def test_epoch(
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
             writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
             writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
+            writer.add_scalar("Val/Dict_H", disp_meter.avg, epoch)
             if not math.isnan(gap_psnr):
                 writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
 
@@ -468,7 +491,6 @@ def parse_args():
 
 
 def worker_init_fn(worker_id: int):
-    """Per-worker deterministic seed using PyTorch generator API."""
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -560,7 +582,6 @@ def main():
         gamma=args.lr_gamma,
     )
 
-    # Criterion lives on the accelerator device but is NOT DDP-wrapped.
     criterion = RateDistortionLoss(
         lmbda=args.lmbda,
         metric=args.metric,
@@ -589,7 +610,7 @@ def main():
             criterion.load_state_dict(ckpt["criterion"])
         if logger:
             logger.info(
-                f"Resumed from epoch {start_epoch - 1} " f"(best_loss={best_loss:.4f})"
+                f"Resumed from epoch {start_epoch - 1} (best_loss={best_loss:.4f})"
             )
 
     # ── Per-lambda summary (for final paper table) ────────────────────────────

@@ -22,7 +22,7 @@ class WMDC(CompressionModel):
     Architecture overview
     ----------------------
     Encoder  g_a : image → latent y  (4× stride via FrequencyDisentangledMamba)
-    Hyper    h_a : y → z             (2× stride via VSSBlock)
+    Hyper    h_a : y → z             (2× stride via HyperResBlock)
     Hyper-dec:    z_hat → scales, means, dictionary dt
     Slice loop:   5 autoregressive slices with per-slice EOT dictionary attention
     Decoder  g_s : y_hat → image reconstruction
@@ -58,6 +58,11 @@ class WMDC(CompressionModel):
         self.slice_ch = M // num_slices
         self.dict_num = dict_num
         self.dict_dim = 32 * dict_head_num
+        self.routing_mode = routing_mode
+
+        # Populated during eval forward/compress/decompress for analysis.
+        # Each entry is (B, HW, N) for the corresponding slice.
+        self.slice_attn_probs: list[torch.Tensor] = []
 
         # ── Encoder / Decoder ──────────────────────────────────────────────
         self.g_a = nn.Sequential(
@@ -156,7 +161,7 @@ class WMDC(CompressionModel):
             tv_weight=tv_weight,
         )
 
-        # ── GatedMemoryUpdater replaces plain residual-add ─────────────────
+        # ── GatedMemoryUpdater ─────────────────────────────────────────────
         self.memory_updaters = nn.ModuleList(
             [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices - 1)]
         )
@@ -266,10 +271,12 @@ class WMDC(CompressionModel):
     # -----------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> dict:
-        # Force FP32 — Sinkhorn logsumexp overflows in FP16/BF16.
         x = x.float()
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
-            raise ValueError(f"Input must be divisible by 64.  Got {x.shape}")
+            raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
+
+        # Clear per-slice attention storage (populated in eval mode below).
+        self.slice_attn_probs.clear()
 
         y = self.g_a(x)
         z = self.h_a(y)
@@ -305,6 +312,11 @@ class WMDC(CompressionModel):
                 query, k_dict, v_dict, rho_spatial, calc_disp=True
             )
             total_dispersion = total_dispersion + disp_loss / self.num_slices
+
+            # Store attention maps in eval mode for analysis.
+            if not self.training and self.eot_attention.attn_probs is not None:
+                self.slice_attn_probs.append(self.eot_attention.attn_probs)
+                self.eot_attention.attn_probs = None  # free memory immediately
 
             support = torch.cat([query, dict_info], dim=1)
 
@@ -351,7 +363,9 @@ class WMDC(CompressionModel):
     def compress(self, x: torch.Tensor) -> dict:
         x = x.float()
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
-            raise ValueError(f"Input must be divisible by 64.  Got {x.shape}")
+            raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
+
+        self.slice_attn_probs.clear()
 
         y = self.g_a(x)
         z = self.h_a(y)
@@ -382,6 +396,12 @@ class WMDC(CompressionModel):
             dict_info, _ = self.eot_attention(
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
             )
+
+            # Store per-slice attention maps for codec analysis.
+            if self.eot_attention.attn_probs is not None:
+                self.slice_attn_probs.append(self.eot_attention.attn_probs)
+                self.eot_attention.attn_probs = None
+
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)
@@ -417,6 +437,8 @@ class WMDC(CompressionModel):
     def decompress(self, strings: list, shape) -> dict:
         y_strings, z_strings = strings[0], strings[1]
 
+        self.slice_attn_probs.clear()
+
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
         dt = self.hyper_to_dict(z_hat)
         latent_scales = self.h_scale_s(z_hat)
@@ -438,6 +460,11 @@ class WMDC(CompressionModel):
             dict_info, _ = self.eot_attention(
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
             )
+
+            if self.eot_attention.attn_probs is not None:
+                self.slice_attn_probs.append(self.eot_attention.attn_probs)
+                self.eot_attention.attn_probs = None
+
             support = torch.cat([query, dict_info], dim=1)
 
             mu = self.cc_mean_transforms[i](support)

@@ -176,18 +176,16 @@ class UnifiedDictionaryAttention(nn.Module):
         log_g = C_mat.new_zeros(B, 1, N)  # (B,  1, N)
 
         for _ in range(self.iters):
-            # Column update
-            raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B,1,N)
-            log_g = raw_g  # balanced: no shrinkage, just replace
-
-            # Row update
-            raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B,HW,1)
-            log_f = raw_f
+            # Column update (direct replacement — balanced Sinkhorn):
+            log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
+            # Row update:
+            log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
 
         log_P = log_f + log_g - M  # (B, HW, N)
-        # Overflow protection: shift by row max before exp.
-        log_P = log_P - log_P.amax(dim=-1, keepdim=True).detach()
-        return torch.exp(log_P)
+
+        # exp(-60) ≈ 1e-26, contributing negligibly to row sums.
+        P = torch.exp(log_P.clamp(min=-60.0))
+        return P
 
     # -----------------------------------------------------------------------
     # KL-unbalanced Sinkhorn with spatially-varying ρ (log-domain)
@@ -210,9 +208,9 @@ class UnifiedDictionaryAttention(nn.Module):
 
         M = C_mat.float() / eps  # (B, HW, N)
 
-        # Per-pixel row shrinkage:  s_i = ρ_i / (ρ_i + ε) ∈ (0, 1)
-        # When ρ → ∞  : s → 1  →  hard marginal constraint (balanced limit)
-        # When ρ → 0  : s → 0  →  no marginal constraint (free transport)
+        # Per-pixel row shrinkage: s_i = ρ_i / (ρ_i + ε) ∈ (0, 1)
+        #   ρ → ∞ : s → 1 → hard marginal (balanced limit)
+        #   ρ → 0 : s → 0 → no marginal constraint (free transport)
         shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
 
         # Shared column shrinkage from mean row strength.
@@ -223,18 +221,20 @@ class UnifiedDictionaryAttention(nn.Module):
         log_g = C_mat.new_zeros(B, 1, N)
 
         for _ in range(self.iters):
-            # Column update: EMA-damped step toward the raw dual update.
-            raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B,1,N)
-            log_g = log_g + shrink_col * (raw_g - log_g)
+            # Column update — DIRECT scaling of the balanced dual update.
+            raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
+            log_g = shrink_col * raw_g  # ← direct scale, NOT EMA
 
-            # Row update: per-pixel EMA-damped step.
-            raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B,HW,1)
-            log_f = log_f + shrink_row * (raw_f - log_f)
+            # Row update — per-pixel DIRECT scaling.
+            raw_f = log_a - torch.logsumexp(
+                log_g - M, dim=2, keepdim=True
+            )  # (B, HW, 1)
+            log_f = shrink_row * raw_f  # ← direct scale, NOT EMA
 
         log_P = log_f + log_g - M  # (B, HW, N)
-        # Overflow protection: row-max shift keeps values in safe exp() range.
-        log_P = log_P - log_P.amax(dim=-1, keepdim=True).detach()
-        return torch.exp(log_P)
+
+        P = torch.exp(log_P.clamp(min=-60.0))
+        return P
 
     # -----------------------------------------------------------------------
     # Softmax routing
@@ -244,36 +244,22 @@ class UnifiedDictionaryAttention(nn.Module):
         return F.softmax(-C_mat / self.tau, dim=-1)
 
     # -----------------------------------------------------------------------
-    # Dispersion loss
+    # Dispersion loss  (returns −H in BITS)
     # -----------------------------------------------------------------------
 
     @staticmethod
     def _dispersion_loss(P: torch.Tensor) -> torch.Tensor:
         """
-        Returns  −H(m)  where H(m) is the Shannon entropy of the column-marginal
-        distribution m_j = Σ_i P_ij / Z.
+        Returns  −H(m)  where H(m) is the Shannon entropy of the column-
+        marginal distribution m_j = Σ_i P_ij / Z
 
-        Sign convention:
-          The caller (RateDistortionLoss) treats this value as a PENALTY:
-              loss += effective * dispersion_loss
-          Since dispersion_loss = −H ≤ 0, adding it SUBTRACTS H from the
-          total loss, which is equivalent to MAXIMISING dictionary entropy.
-
-          Alternatively (and more intuitively), the caller can negate and
-          subtract:
-              dispersion_bonus = −dispersion_loss = H ≥ 0
-              loss −= effective * dispersion_bonus
-          Both are equivalent.  The corrected RateDistortionLoss uses the
-          second form for clarity.
-
-        Returns:  scalar, value ∈ [−log(N), 0]
         """
         marginal = P.sum(dim=1)  # (B, N)
-        # Normalise to a probability simplex
-        marginal = marginal / (marginal.sum(dim=1, keepdim=True) + 1e-8)  # (B, N)
-        # Shannon entropy H = −Σ_j m_j log(m_j), averaged over batch
-        H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean()
-        return -H  # negative entropy; caller subtracts this to maximise H
+        marginal = marginal / (marginal.sum(dim=1, keepdim=True).clamp(min=1e-8))
+        # Entropy in bits — consistent with bpp_loss units.
+        _log2e = 1.0 / math.log(2)
+        H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean() * _log2e
+        return -H  # negative entropy in bits; caller subtracts to maximise H
 
     # -----------------------------------------------------------------------
     # Forward
@@ -299,7 +285,7 @@ class UnifiedDictionaryAttention(nn.Module):
 
         elif self.routing_mode == "balanced_eot":
             P = self._route_balanced_eot(C_mat)
-            P = P * HW  # restore natural scale (rows sum to 1 before ×HW)
+            P = P * HW  # scale so rows sum to ~1 (before ×HW, rows sum to ~1/HW)
 
         elif self.routing_mode == "unbalanced_eot":
             rho_flat = rho_spatial.view(B, HW).float().clamp(min=0.01)
@@ -309,11 +295,9 @@ class UnifiedDictionaryAttention(nn.Module):
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode}")
 
-        # Store attention map for analysis.  In eval mode, clear immediately
-        # after storage to prevent 32 MB/image accumulation in long runs.
         self.attn_probs = P.detach()
 
-        # ── Spatial TV regularisation on P (optional, training only) ─────────
+        # ── Spatial TV regularisation (optional, training only) ───────────────
         tv_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if self.training and self.tv_weight > 0.0:
             tv_loss = self._spatial_tv(P, H, W) * self.tv_weight
@@ -322,10 +306,9 @@ class UnifiedDictionaryAttention(nn.Module):
         # P: (B, HW, N)   v: (B, N, dict_dim)
         out = torch.bmm(P, v).transpose(1, 2).contiguous().view(B, -1, H, W)
 
-        # ── Dispersion loss ───────────────────────────────────────────────────
-        # Returns −H (negative entropy).  Only computed during training.
+        # ── Dispersion loss (bits, training only) ─────────────────────────────
         if self.training and calc_disp:
-            disp_loss = self._dispersion_loss(P) + tv_loss + 0.0 * rho_spatial.sum()
+            disp_loss = self._dispersion_loss(P) + tv_loss
         else:
             disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 

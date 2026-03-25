@@ -42,10 +42,7 @@ def pad_image(x: torch.Tensor, p: int = 64):
     H, W = x.size(2), x.size(3)
     pad_h = (p - H % p) % p
     pad_w = (p - W % p) % p
-    if pad_h > 0 or pad_w > 0:
-        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-    else:
-        x_padded = x
+    x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect") if (pad_h or pad_w) else x
     return x_padded, pad_h, pad_w
 
 
@@ -61,7 +58,7 @@ def _sync(device: str):
 
 
 # ---------------------------------------------------------------------------
-# Dictionary utilisation
+# Dictionary utilisation (all slices)
 # ---------------------------------------------------------------------------
 
 
@@ -70,40 +67,72 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
     Run a single forward pass and extract per-slice utilisation metrics.
 
     Returns a dict with:
-      - 'marginal_entropy'  : column-marginal entropy H(m)  (nats)
-      - 'max_entropy'       : log(dict_num)                  (nats)
-      - 'utilisation_pct'   : H(m) / log(dict_num) * 100
-      - 'slice_utilisation' : list[float] — one value per slice
-                              (NOTE: eot_attention only stores the LAST slice's
-                               attn_probs; full per-slice tracking requires a
-                               small model change — see comment below)
+      - 'per_slice_utilisation_pct': list[float], one per slice
+      - 'mean_utilisation_pct'     : float, average over slices
+      - 'max_entropy_bits'         : float, log2(dict_num)
+      - 'assignment_maps'          : list of (H_lat, W_lat) int tensors (top-1 token)
+      - 'entropy_maps'             : list of (H_lat, W_lat) float tensors (local H)
     """
-    x = x.to(device).float()
-    x_pad, _, _ = pad_image(x, p=64)
+    x_pad, _, _ = pad_image(x.to(device).float(), p=64)
 
     model.eval()
     with torch.no_grad():
-        _ = model(x_pad)
+        out_enc = model.compress(x_pad)  # populates model.slice_attn_probs
 
-    attn = model.eot_attention.attn_probs  # (B, HW, N) from last slice, or None
-    result = {
-        "marginal_entropy": float("nan"),
-        "max_entropy": math.log(model.dict_num),
-        "utilisation_pct": float("nan"),
-        "slice_utilisation": [],
-    }
+    # Retrieve all-slice attention from the model.
+    all_probs = model.slice_attn_probs  # list of (1, HW, N)
+    if not all_probs:
+        return {
+            "error": "No attention maps collected. Check routing_mode != 'softmax'."
+        }
 
-    if attn is not None:
-        marginal = attn.sum(dim=1)  # (B, N)
+    # Infer spatial dims from z shape.
+    H_lat = out_enc["shape"][0]
+    W_lat = out_enc["shape"][1]
+    # latent y is 4× the z spatial dims (h_a applies 4× downsampling overall)
+    H_lat_y = H_lat * 4
+    W_lat_y = W_lat * 4
+
+    max_ent = math.log2(model.dict_num)  # FIX: bits, not nats
+
+    per_slice_util: list[float] = []
+    assignment_maps: list = []
+    entropy_maps: list = []
+
+    for P in all_probs:
+        # P: (1, HW, N)  — already detached
+        B, HW, N = P.shape
+
+        # Column marginal → utilisation entropy in BITS
+        marginal = P.sum(dim=1)  # (1, N)
         marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean()
-        result["marginal_entropy"] = H.item()
-        result["utilisation_pct"] = H.item() / result["max_entropy"] * 100.0
+        H_bits = -(marginal * marginal.clamp(1e-8).log2()).sum(dim=1).mean()
+        per_slice_util.append(float(H_bits.item() / max_ent * 100.0))
 
-    # Clear buffer to prevent memory accumulation (32 MB per 4K image).
-    model.eot_attention.attn_probs = None
+        # Spatial maps: reshape P to (H_lat_y, W_lat_y, N)
+        try:
+            P_sp = P[0].view(H_lat_y, W_lat_y, N)
+        except RuntimeError:
+            # HW mismatch (e.g., non-standard image size): skip spatial maps
+            assignment_maps.append(None)
+            entropy_maps.append(None)
+            continue
 
-    return result
+        # Top-1 assignment map (which dict token each spatial position prefers)
+        assignment_maps.append(P_sp.argmax(dim=-1).cpu())  # (H, W) int
+
+        # Per-pixel entropy map (how uncertain the routing is at each location)
+        p_norm = P_sp / P_sp.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        H_pixel = -(p_norm * p_norm.clamp(1e-8).log2()).sum(dim=-1)
+        entropy_maps.append(H_pixel.cpu())  # (H, W) float
+
+    return {
+        "per_slice_utilisation_pct": per_slice_util,
+        "mean_utilisation_pct": float(np.mean(per_slice_util)),
+        "max_entropy_bits": max_ent,
+        "assignment_maps": assignment_maps,
+        "entropy_maps": entropy_maps,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -122,18 +151,20 @@ def main():
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, default="output")
-    parser.add_argument(
-        "--ot-eps", type=float, default=0.1, help="Must match training value."
-    )
-    parser.add_argument(
-        "--sinkhorn-iters", type=int, default=20, help="Must match training value."
-    )
+    parser.add_argument("--ot-eps", type=float, default=0.1)
+    parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
         action="store_true",
-        help="Run an extra forward pass per image to measure "
-        "dictionary utilisation (slower but informative).",
+        help="Record per-slice dictionary utilisation, assignment maps, and "
+        "entropy maps for every image.",
+    )
+    parser.add_argument(
+        "--save-attn-maps",
+        action="store_true",
+        help="Save assignment and entropy map tensors as .pt files "
+        "(only effective with --measure-dict-util).",
     )
     args = parser.parse_args()
 
@@ -141,6 +172,9 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     img_dir = os.path.join(args.output, "images")
     os.makedirs(img_dir, exist_ok=True)
+    if args.save_attn_maps:
+        attn_dir = os.path.join(args.output, "attn_maps")
+        os.makedirs(attn_dir, exist_ok=True)
 
     # ── Model ────────────────────────────────────────────────────────────────
     model = WMDC(
@@ -180,7 +214,7 @@ def main():
             "dec_time",
         )
     }
-    util_pcts: list[float] = []
+    per_slice_util_all: list[list[float]] = []
     per_image: list[dict] = []
 
     to_tensor = transforms.ToTensor()
@@ -253,20 +287,50 @@ def main():
                 "dec_time": round(dec_time, 3),
             }
 
-            # Optional dictionary utilisation (extra forward pass)
             if args.measure_dict_util:
                 util = measure_dict_utilisation(model, x, device)
-                row["dict_utilisation_pct"] = round(util["utilisation_pct"], 2)
-                util_pcts.append(util["utilisation_pct"])
+                row["per_slice_utilisation_pct"] = [
+                    round(v, 2) for v in util["per_slice_utilisation_pct"]
+                ]
+                row["mean_utilisation_pct"] = round(util["mean_utilisation_pct"], 2)
+                per_slice_util_all.append(util["per_slice_utilisation_pct"])
+
+                if args.save_attn_maps:
+                    stem = os.path.splitext(os.path.basename(img_path))[0]
+                    for s_idx, (amap, emap) in enumerate(
+                        zip(util["assignment_maps"], util["entropy_maps"])
+                    ):
+                        if amap is not None:
+                            torch.save(
+                                amap,
+                                os.path.join(
+                                    attn_dir, f"{stem}_slice{s_idx}_assign.pt"
+                                ),
+                            )
+                        if emap is not None:
+                            torch.save(
+                                emap,
+                                os.path.join(
+                                    attn_dir, f"{stem}_slice{s_idx}_entropy.pt"
+                                ),
+                            )
 
             per_image.append(row)
 
+            util_str = ""
+            if args.measure_dict_util:
+                slices = row["per_slice_utilisation_pct"]
+                util_str = (
+                    f" | Util: ["
+                    + ", ".join(f"{v:.1f}%" for v in slices)
+                    + f"] mean={row['mean_utilisation_pct']:.1f}%"
+                )
+
             print(
                 f"{os.path.basename(img_path):30s} | "
-                f"BPP: {bpp_orig:.4f} (pad-domain: {bpp_pad:.4f}, "
-                f"overhead: {pad_oh:+.5f}) | "
+                f"BPP: {bpp_orig:.4f} (pad: {bpp_pad:.4f}, oh: {pad_oh:+.5f}) | "
                 f"PSNR: {psnr:.2f} dB | MS-SSIM: {msssim:.4f} | "
-                f"Enc: {enc_time:.3f}s  Dec: {dec_time:.3f}s"
+                f"Enc: {enc_time:.3f}s  Dec: {dec_time:.3f}s{util_str}"
             )
 
     # ── Aggregate statistics ──────────────────────────────────────────────────
@@ -277,8 +341,17 @@ def main():
 
     avg = {k: _stats(v) for k, v in metrics.items()}
 
-    if util_pcts:
-        avg["dict_utilisation_pct"] = _stats(util_pcts)
+    if per_slice_util_all:
+        per_slice_arr = np.array(per_slice_util_all)  # (N_images, num_slices)
+        avg["per_slice_utilisation_pct"] = [
+            {
+                "slice": i,
+                "mean": round(float(per_slice_arr[:, i].mean()), 2),
+                "std": round(float(per_slice_arr[:, i].std()), 2),
+            }
+            for i in range(per_slice_arr.shape[1])
+        ]
+        avg["mean_utilisation_pct"] = _stats(per_slice_arr.mean(axis=1))
 
     print("\n── Average results ──────────────────────────────")
     print(
@@ -298,11 +371,11 @@ def main():
     )
     print(f"  Enc time              : {avg['enc_time']['mean']:.3f}s")
     print(f"  Dec time              : {avg['dec_time']['mean']:.3f}s")
-    if util_pcts:
-        print(
-            f"  Dict utilisation      : {avg['dict_utilisation_pct']['mean']:.1f}% ± "
-            f"{avg['dict_utilisation_pct']['std']:.1f}%"
-        )
+    if per_slice_util_all:
+        print("  Dict utilisation per slice:")
+        for s in avg["per_slice_utilisation_pct"]:
+            print(f"    Slice {s['slice']}: {s['mean']:.1f}% ± {s['std']:.1f}%")
+        print(f"  Overall mean util     : {avg['mean_utilisation_pct']['mean']:.1f}%")
 
     report = {
         "average": avg,
