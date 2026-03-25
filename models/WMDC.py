@@ -311,6 +311,8 @@ class WMDC(CompressionModel):
             dict_info, disp_loss = self.eot_attention(
                 query, k_dict, v_dict, rho_spatial, calc_disp=True
             )
+            if self.routing_mode != "unbalanced_eot" and self.training:
+                disp_loss = disp_loss + 0.0 * rho_spatial.sum()
             total_dispersion = total_dispersion + disp_loss / self.num_slices
 
             # Store attention maps in eval mode for analysis.
