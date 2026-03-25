@@ -108,18 +108,16 @@ class GatedMemoryUpdater(nn.Module):
             nn.Tanh(),
         )
 
-        # gate bias → +3.0 so the gate starts nearly open.
-        nn.init.constant_(self.gate[0].bias, 3.0)
-
-        # Zero-init update branch: zero output at init → no update at init.
+        # Start gate near 0 so identity map works flawlessly at init
+        nn.init.constant_(self.gate[0].bias, -3.0)
         nn.init.zeros_(self.update[-2].weight)
         nn.init.zeros_(self.update[-2].bias)
 
     def forward(self, memory: torch.Tensor, new_info: torch.Tensor) -> torch.Tensor:
         x = torch.cat([memory, new_info], dim=1)
-        g = self.gate(x)  # ≈ 0.95 at init
-        u = self.update(x)  # ≈ 0.0 at init
-        return g * memory + (1.0 - g) * u
+        g = self.gate(x)
+        u = self.update(x)
+        return memory + g * u
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +179,6 @@ class FrequencyDisentangledMamba(nn.Module):
             # Spatial mixing (3x3 depthwise) to capture local high-frequency geometry
             nn.Conv2d(dim * 4, dim * 4, kernel_size=3, padding=1, groups=dim * 4),
             nn.GELU(),
-            # Channel mixing (1x1) to fuse the modulated sub-bands
-            nn.Conv2d(dim * 4, dim * 4, kernel_size=1),
         )
 
     @staticmethod

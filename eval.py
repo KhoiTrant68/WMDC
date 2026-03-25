@@ -93,7 +93,7 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
     H_lat_y = H_lat * 4
     W_lat_y = W_lat * 4
 
-    max_ent = math.log2(model.dict_num)  # FIX: bits, not nats
+    max_ent = math.log2(model.dict_num)
 
     per_slice_util: list[float] = []
     assignment_maps: list = []
@@ -113,7 +113,6 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
         try:
             P_sp = P[0].view(H_lat_y, W_lat_y, N)
         except RuntimeError:
-            # HW mismatch (e.g., non-standard image size): skip spatial maps
             assignment_maps.append(None)
             entropy_maps.append(None)
             continue
@@ -254,15 +253,15 @@ def main():
 
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
-            # BPP — two variants
-            # bpp_orig  : bits / original pixels  (standard Kodak/CLIC metric)
-            # bpp_pad   : bits / padded pixels     (codec's actual cost domain)
-            # pad_overhead = bpp_orig - bpp_pad    (should be < 0.001 for large images)
-            bpp_orig = compute_actual_bpp(out_enc["strings"], num_pixels_orig)
-            bpp_pad = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
+            # Include shape overhead in actual BPP calculation
+            bpp_orig = compute_actual_bpp(
+                out_enc["strings"], out_enc["shape"], num_pixels_orig
+            )
+            bpp_pad = compute_actual_bpp(
+                out_enc["strings"], out_enc["shape"], num_pixels_padded
+            )
             pad_oh = bpp_orig - bpp_pad
 
-            # Quality
             mse = F.mse_loss(x, x_hat)
             psnr = -10.0 * math.log10(mse.item()) if mse.item() > 0 else 100.0
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()

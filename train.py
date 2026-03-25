@@ -64,13 +64,6 @@ class AverageMeter:
 
 
 def compute_bpp(out_net: dict, num_pixels: int) -> torch.Tensor:
-    """
-    Differentiable training-time BPP estimate from likelihood tensors.
-
-    num_pixels must be the number of ORIGINAL (unpadded) pixels.
-    During training all patches are exact multiples of 64 so no padding
-    is ever introduced — num_pixels == patch_size^2 * batch_size.
-    """
     return sum(
         torch.log(lh.float()).sum() / (-math.log(2) * num_pixels)
         for lh in out_net["likelihoods"].values()
@@ -357,6 +350,10 @@ def test_epoch(
     disp_meter = AverageMeter()
     gap_psnr: float = float("nan")
 
+    # Sync tables on all ranks safely BEFORE eval loop to prevent NCCL desyncs
+    if gap_check:
+        accelerator.unwrap_model(model).update(force=True)
+
     with torch.no_grad():
         for i, d in tqdm(
             enumerate(test_dataloader),
@@ -365,13 +362,7 @@ def test_epoch(
             disable=not accelerator.is_local_main_process,
         ):
             out_net = model(d)
-
-            # Use criterion for val loss so the computation is
-            # identical to training (same lambda scaling, same bpp formula).
-            # dispersion_loss is 0 in eval mode (model.eval()), so val loss
-            # equals pure RD loss — correct and comparable across epochs.
             out_criterion = criterion(out_net, d)
-
             x_hat = out_net["x_hat"].clamp_(0, 1)
 
             if i == 0 and accelerator.is_main_process and writer is not None:
@@ -384,31 +375,29 @@ def test_epoch(
             psnr_val = (
                 -10.0 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
             )
-
             bpp_val = out_criterion["bpp_loss"].item()
             loss_val = out_criterion["loss"].item()
 
-            # dispersion_bonus is 0 in eval mode; still log for transparency.
             if "dispersion_bonus" in out_criterion:
-                disp_meter.update(out_criterion["dispersion_bonus"].item())
+                disp_meter.update(out_criterion["dispersion_bonus"].item(), d.size(0))
 
+            # FIX: Safely gather metrics dropping DDP padded samples
             local = torch.tensor(
-                [psnr_val, bpp_val, loss_val],
-                device=accelerator.device,
+                [psnr_val, bpp_val, loss_val], device=accelerator.device
             )
-            gathered = accelerator.gather(local.unsqueeze(0))  # (world*1, 3)
-            m = gathered.mean(dim=0)
-            psnr_meter.update(m[0].item())
-            bpp_meter.update(m[1].item())
-            loss_meter.update(m[2].item())
+            local_batch = local.unsqueeze(0).repeat(d.size(0), 1)
+            gathered = accelerator.gather_for_metrics(local_batch)
 
-    # Restore criterion to training mode BEFORE gap check and checkpoint.
+            psnr_meter.update(gathered[:, 0].mean().item(), gathered.size(0))
+            bpp_meter.update(gathered[:, 1].mean().item(), gathered.size(0))
+            loss_meter.update(gathered[:, 2].mean().item(), gathered.size(0))
+
     criterion.train()
 
-    # Gap measurement: compress one patch on the main process only.
     if gap_check and accelerator.is_main_process:
         try:
-            sample = next(iter(test_dataloader))[:1]
+            # Safely use the last processed batch to avoid breaking DDP samplers
+            sample = d[:1]
             gap_psnr = measure_train_inference_gap(
                 accelerator.unwrap_model(model),
                 sample,
@@ -577,18 +566,14 @@ def main():
 
     optimizer, aux_optimizer = configure_optimizers(model, args)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=args.lr_milestones,
-        gamma=args.lr_gamma,
+        optimizer, milestones=args.lr_milestones, gamma=args.lr_gamma
     )
 
     criterion = RateDistortionLoss(
-        lmbda=args.lmbda,
-        metric=args.metric,
-        disp_weight=args.disp_weight,
+        lmbda=args.lmbda, metric=args.metric, disp_weight=args.disp_weight
     ).to(accelerator.device)
 
-    (model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler) = (
+    model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler = (
         accelerator.prepare(
             model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
         )

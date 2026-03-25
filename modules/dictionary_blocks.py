@@ -175,8 +175,17 @@ class UnifiedDictionaryAttention(nn.Module):
         log_f = C_mat.new_zeros(B, HW, 1)  # (B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)  # (B,  1, N)
 
-        for _ in range(self.iters):
-            # Column update (direct replacement — balanced Sinkhorn):
+        # Truncated backpropagation to prevent OOM / unstable gradients
+        n_grad_iters = 5
+        n_nograd_iters = max(0, self.iters - n_grad_iters)
+
+        if self.training and n_nograd_iters > 0:
+            with torch.no_grad():
+                for _ in range(n_nograd_iters):
+                    log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
+                    log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
+
+        for _ in range(n_grad_iters if self.training else self.iters):
             log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
             # Row update:
             log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
@@ -220,19 +229,30 @@ class UnifiedDictionaryAttention(nn.Module):
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
-        for _ in range(self.iters):
-            # Column update — DIRECT scaling of the balanced dual update.
-            raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
-            log_g = shrink_col * raw_g  # ← direct scale, NOT EMA
+        # Truncated backpropagation
+        n_grad_iters = 5
+        n_nograd_iters = max(0, self.iters - n_grad_iters)
 
-            # Row update — per-pixel DIRECT scaling.
-            raw_f = log_a - torch.logsumexp(
-                log_g - M, dim=2, keepdim=True
-            )  # (B, HW, 1)
-            log_f = shrink_row * raw_f  # ← direct scale, NOT EMA
+        if self.training and n_nograd_iters > 0:
+            with torch.no_grad():
+                for _ in range(n_nograd_iters):
+                    raw_g = log_b - torch.logsumexp(
+                        log_f - M, dim=1, keepdim=True
+                    )  # (B, 1, N)
+                    log_g = shrink_col * raw_g
+                    # Row update — per-pixel DIRECT scaling.
+                    raw_f = log_a - torch.logsumexp(
+                        log_g - M, dim=2, keepdim=True
+                    )  # (B, HW, 1)
+                    log_f = shrink_row * raw_f
+
+        for _ in range(n_grad_iters if self.training else self.iters):
+            raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
+            log_g = shrink_col * raw_g
+            raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
+            log_f = shrink_row * raw_f
 
         log_P = log_f + log_g - M  # (B, HW, N)
-
         P = torch.exp(log_P.clamp(min=-60.0))
         return P
 

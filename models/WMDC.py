@@ -148,17 +148,22 @@ class WMDC(CompressionModel):
             [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
         )
 
-        # ── Shared EOT attention module ────────────────────────────────────
-        self.eot_attention = UnifiedDictionaryAttention(
-            input_dim=2 * M + self.slice_ch,
-            output_dim=M,
-            dict_num=self.dict_num,
-            dict_dim=self.dict_dim,
-            tau=0.5,
-            ot_eps=ot_eps,
-            iters=sinkhorn_iters,
-            routing_mode=routing_mode,
-            tv_weight=tv_weight,
+        # Per-slice independent EOT attention to prevent query projection bottlenecks
+        self.eot_attentions = nn.ModuleList(
+            [
+                UnifiedDictionaryAttention(
+                    input_dim=2 * M + self.slice_ch,
+                    output_dim=M,
+                    dict_num=self.dict_num,
+                    dict_dim=self.dict_dim,
+                    tau=0.5,
+                    ot_eps=ot_eps,
+                    iters=sinkhorn_iters,
+                    routing_mode=routing_mode,
+                    tv_weight=tv_weight,
+                )
+                for _ in range(num_slices)
+            ]
         )
 
         # ── GatedMemoryUpdater ─────────────────────────────────────────────
@@ -224,8 +229,9 @@ class WMDC(CompressionModel):
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
+            # Expand scale table upper limit to 1024 to support low-bitrate compression
             scale_table = torch.exp(
-                torch.linspace(math.log(0.11), math.log(256), 64, dtype=torch.float32)
+                torch.linspace(math.log(0.11), math.log(1024), 64, dtype=torch.float32)
             )
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
@@ -236,10 +242,7 @@ class WMDC(CompressionModel):
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
     def _compute_rho_spatial(
-        self,
-        slice_idx: int,
-        hyper_prior: torch.Tensor,
-        decoded_slices: list,
+        self, slice_idx: int, hyper_prior: torch.Tensor, decoded_slices: list
     ) -> torch.Tensor:
         """
         Compute spatially-varying KL mass-conservation strength ρ(x) for a
@@ -308,32 +311,34 @@ class WMDC(CompressionModel):
 
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, disp_loss = self.eot_attention(
+            dict_info, disp_loss = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=True
             )
             if self.routing_mode != "unbalanced_eot" and self.training:
                 disp_loss = disp_loss + 0.0 * rho_spatial.sum()
             total_dispersion = total_dispersion + disp_loss / self.num_slices
 
-            # Store attention maps in eval mode for analysis.
-            if not self.training and self.eot_attention.attn_probs is not None:
-                self.slice_attn_probs.append(self.eot_attention.attn_probs)
-                self.eot_attention.attn_probs = None  # free memory immediately
+            if not self.training and self.eot_attentions[i].attn_probs is not None:
+                self.slice_attn_probs.append(self.eot_attentions[i].attn_probs)
+                self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-
             mu = self.cc_mean_transforms[i](support)
             scale = torch.clamp(self.cc_scale_transforms[i](support), min=0.11)
 
-            # Continuous noise relaxation for forward pass + likelihood
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
                 y_slice, scale, means=mu
             )
 
-            # LRP post-processing: uses the entropy-model output (y_hat_slice
-            # before LRP) so rate is unaffected; only distortion benefits.
-            lrp_support = torch.cat([support, y_hat_slice], dim=1)
-            y_hat_slice_lrp = y_hat_slice + 0.5 * torch.tanh(
+            # Straight-Through Estimator (STE) for LRP module quantization gap
+            if self.training:
+                y_hat_hard = torch.round(y_slice - mu) + mu
+                y_hat_for_lrp = y_hat_hard.detach() - y_hat_slice.detach() + y_hat_slice
+            else:
+                y_hat_for_lrp = y_hat_slice
+
+            lrp_support = torch.cat([support, y_hat_for_lrp], dim=1)
+            y_hat_slice_lrp = y_hat_for_lrp + 0.5 * torch.tanh(
                 self.lrp_transforms[i](lrp_support)
             )
 
@@ -350,10 +355,7 @@ class WMDC(CompressionModel):
 
         return {
             "x_hat": x_hat,
-            "likelihoods": {
-                "y": torch.cat(y_likelihood, dim=1),
-                "z": z_likelihoods,
-            },
+            "likelihoods": {"y": torch.cat(y_likelihood, dim=1), "z": z_likelihoods},
             "aux_loss": self.aux_loss(),
             "dispersion_loss": total_dispersion,
         }
@@ -395,14 +397,13 @@ class WMDC(CompressionModel):
 
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attention(
+            dict_info, _ = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
             )
 
-            # Store per-slice attention maps for codec analysis.
-            if self.eot_attention.attn_probs is not None:
-                self.slice_attn_probs.append(self.eot_attention.attn_probs)
-                self.eot_attention.attn_probs = None
+            if self.eot_attentions[i].attn_probs is not None:
+                self.slice_attn_probs.append(self.eot_attentions[i].attn_probs)
+                self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
 
@@ -459,13 +460,13 @@ class WMDC(CompressionModel):
 
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attention(
+            dict_info, _ = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
             )
 
-            if self.eot_attention.attn_probs is not None:
-                self.slice_attn_probs.append(self.eot_attention.attn_probs)
-                self.eot_attention.attn_probs = None
+            if self.eot_attentions[i].attn_probs is not None:
+                self.slice_attn_probs.append(self.eot_attentions[i].attn_probs)
+                self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
 
