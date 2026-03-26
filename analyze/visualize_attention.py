@@ -77,16 +77,7 @@ def main():
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
 
-    # 2. Setup Hook (Registered exactly once to prevent memory leaks)
-    attn_maps = []
-
-    def hook_fn(module, input, output):
-        # We detach and move to CPU immediately to save VRAM
-        attn_maps.append(module.attn_probs.detach().cpu())
-
-    hook = model.eot_attentions.register_forward_hook(hook_fn)
-
-    # 3. Discover Images
+    # 2. Discover Images
     img_files = sorted(
         f
         for f in os.listdir(args.img_dir)
@@ -122,117 +113,110 @@ def main():
 
     plt.subplots_adjust(wspace=0.05, hspace=0.05)
 
-    try:
-        for row_idx, img_name in enumerate(img_files):
-            print(f"Processing {img_name}...")
-            attn_maps.clear()  # CRITICAL: clear maps from previous image
+    for row_idx, img_name in enumerate(img_files):
+        print(f"Processing {img_name}...")
 
-            img_path = os.path.join(args.img_dir, img_name)
-            img = Image.open(img_path).convert("RGB")
-            x = transforms.ToTensor()(img).unsqueeze(0).to(device)
+        img_path = os.path.join(args.img_dir, img_name)
+        img = Image.open(img_path).convert("RGB")
+        x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-            # Pad to multiple of 64
-            H, W = x.size(2), x.size(3)
-            pad_h = (64 - H % 64) % 64
-            pad_w = (64 - W % 64) % 64
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+        # Pad to multiple of 64
+        H, W = x.size(2), x.size(3)
+        pad_h = (64 - H % 64) % 64
+        pad_w = (64 - W % 64) % 64
+        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
 
-            # Forward pass (hook captures the maps)
-            with torch.no_grad():
-                _ = model(x_padded)
+        # Forward pass
+        with torch.no_grad():
+            _ = model(x_padded)
 
-            padded_h, padded_w = x_padded.size(2), x_padded.size(3)
-            latent_h, latent_w = (
-                padded_h // 16,
-                padded_w // 16,
-            )  # 4 stride-2 downsamples
+        # The WMDC model natively stores the attention maps in eval mode!
+        # Access them directly (Shape: [B, HW, N])
+        attn_maps = [p.cpu() for p in model.slice_attn_probs]
 
-            # Plot original image in column 0
-            orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
-            ax_img = axes[row_idx][0]
-            ax_img.imshow(orig_np)
-            ax_img.axis("off")
-            if row_idx == 0:
-                ax_img.set_title("Input Image", fontsize=16, pad=10)
+        padded_h, padded_w = x_padded.size(2), x_padded.size(3)
+        latent_h, latent_w = (
+            padded_h // 16,
+            padded_w // 16,
+        )  # 4 stride-2 downsamples
 
-            # --- MODE 1: Top Tokens ---
-            if args.mode == "top_tokens":
-                probs = attn_maps[args.slice].squeeze(0)  # (HW, N)
-                probs = probs.view(latent_h, latent_w, probs.size(-1))
+        # Plot original image in column 0
+        orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+        ax_img = axes[row_idx][0]
+        ax_img.imshow(orig_np)
+        ax_img.axis("off")
+        if row_idx == 0:
+            ax_img.set_title("Input Image", fontsize=16, pad=10)
 
-                # Dynamically find the top 4 most utilized tokens
-                token_usage = probs.sum(dim=(0, 1))
-                top_tokens = torch.topk(token_usage, k=4).indices.tolist()
-                print(
-                    f"  Top 4 tokens for {img_name} (Slice {args.slice}): {top_tokens}"
+        # --- MODE 1: Top Tokens ---
+        if args.mode == "top_tokens":
+            probs = attn_maps[args.slice].squeeze(0)  # (HW, N)
+            probs = probs.view(latent_h, latent_w, probs.size(-1))
+
+            # Dynamically find the top 4 most utilized tokens
+            token_usage = probs.sum(dim=(0, 1))
+            top_tokens = torch.topk(token_usage, k=4).indices.tolist()
+            print(f"  Top 4 tokens for {img_name} (Slice {args.slice}): {top_tokens}")
+
+            # Find global maximum probability for these specific tokens
+            # to normalize the colormap scientifically.
+            global_max_prob = max([probs[:, :, t].max().item() for t in top_tokens])
+
+            for col_idx, dict_idx in enumerate(top_tokens):
+                attn_map = (
+                    probs[:, :, dict_idx].unsqueeze(0).unsqueeze(0)
+                )  # (1, 1, H_lat, W_lat)
+
+                # Interpolate back to padded image resolution
+                attn_resized = F.interpolate(
+                    attn_map,
+                    size=(padded_h, padded_w),
+                    mode="bilinear",
+                    align_corners=False,
                 )
+                attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
 
-                # Find global maximum probability for these specific tokens
-                # to normalize the colormap scientifically.
-                global_max_prob = max([probs[:, :, t].max().item() for t in top_tokens])
+                ax_map = axes[row_idx][col_idx + 1]
+                ax_map.imshow(orig_np)
+                ax_map.imshow(
+                    attn_np, cmap="jet", alpha=0.55, vmin=0, vmax=global_max_prob
+                )
+                ax_map.axis("off")
+                if row_idx == 0:
+                    ax_map.set_title(f"Dict Token {dict_idx}", fontsize=14, pad=10)
 
-                for col_idx, dict_idx in enumerate(top_tokens):
-                    attn_map = (
-                        probs[:, :, dict_idx].unsqueeze(0).unsqueeze(0)
-                    )  # (1, 1, H, W)
+        # --- MODE 2: Slice Evolution ---
+        elif args.mode == "slice_evolution":
+            target = args.target_token
 
-                    # FIX: Use bilinear to prevent probability overshoot (<0 or >1)
-                    attn_resized = F.interpolate(
-                        attn_map,
-                        size=(padded_h, padded_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
+            # Collect the map for the target token across all 5 slices
+            slice_maps = []
+            for s in range(5):
+                probs = attn_maps[s].squeeze(0).view(latent_h, latent_w, -1)
+                slice_maps.append(probs[:, :, target])
 
-                    ax_map = axes[row_idx][col_idx + 1]
-                    ax_map.imshow(orig_np)
-                    # FIX: Use fixed vmin/vmax so heatmaps reflect true relative magnitudes
-                    ax_map.imshow(
-                        attn_np, cmap="jet", alpha=0.55, vmin=0, vmax=global_max_prob
-                    )
-                    ax_map.axis("off")
-                    if row_idx == 0:
-                        ax_map.set_title(f"Dict Token {dict_idx}", fontsize=14, pad=10)
+            # Find global maximum across all slices for accurate comparison
+            global_max_prob = max([sm.max().item() for sm in slice_maps])
 
-            # --- MODE 2: Slice Evolution ---
-            elif args.mode == "slice_evolution":
-                target = args.target_token
+            for s in range(5):
+                attn_map = slice_maps[s].unsqueeze(0).unsqueeze(0)
 
-                # Collect the map for the target token across all 5 slices
-                slice_maps = []
-                for s in range(5):
-                    probs = attn_maps[s].squeeze(0).view(latent_h, latent_w, -1)
-                    slice_maps.append(probs[:, :, target])
+                attn_resized = F.interpolate(
+                    attn_map,
+                    size=(padded_h, padded_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
 
-                # Find global maximum across all slices for accurate comparison
-                global_max_prob = max([sm.max().item() for sm in slice_maps])
-
-                for s in range(5):
-                    attn_map = slice_maps[s].unsqueeze(0).unsqueeze(0)
-
-                    attn_resized = F.interpolate(
-                        attn_map,
-                        size=(padded_h, padded_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
-
-                    ax_map = axes[row_idx][s + 1]
-                    ax_map.imshow(orig_np)
-                    ax_map.imshow(
-                        attn_np, cmap="jet", alpha=0.55, vmin=0, vmax=global_max_prob
-                    )
-                    ax_map.axis("off")
-                    if row_idx == 0:
-                        ax_map.set_title(
-                            f"Slice {s} (Token {target})", fontsize=14, pad=10
-                        )
-
-    finally:
-        # Guarantee hook is removed even if script crashes
-        hook.remove()
+                ax_map = axes[row_idx][s + 1]
+                ax_map.imshow(orig_np)
+                ax_map.imshow(
+                    attn_np, cmap="jet", alpha=0.55, vmin=0, vmax=global_max_prob
+                )
+                ax_map.axis("off")
+                if row_idx == 0:
+                    ax_map.set_title(f"Slice {s} (Token {target})", fontsize=14, pad=10)
 
     fig.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)
     plt.close(fig)
