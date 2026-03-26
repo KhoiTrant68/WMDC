@@ -68,11 +68,27 @@ class UnifiedDictionaryAttention(nn.Module):
     """
     Unified Dictionary Attention with three routing modes.
 
-    routing_mode options:
-      'softmax'        — standard temperature-scaled softmax over cost matrix
-      'balanced_eot'   — log-domain Sinkhorn with uniform marginals
-      'unbalanced_eot' — KL-unbalanced Sinkhorn (Séjourné et al. 2019) with
-                         spatially-varying row marginal strength ρ(x)
+    routing_mode options
+    --------------------
+    'softmax'        — standard temperature-scaled softmax over cost matrix.
+
+    'balanced_eot'   — log-domain Sinkhorn with uniform marginals.
+                       Iteration order follows Algorithm 1 of Séjourné et al.
+                       2019 (column/g update first, row/f update second).
+                       After Sinkhorn, P is scaled by HW so row sums ≈ 1,
+                       matching the softmax normalisation convention.
+
+    'unbalanced_eot' — KL-unbalanced Sinkhorn (Séjourné et al. 2019, §4.7.2)
+                       with spatially-varying row marginal strength ρ(x).
+                       P is scaled by HW after Sinkhorn.  Row sums are then
+                       ρ_i/(ρ_i + ε) · HW/(1/HW) ≠ 1 in general: pixels
+                       where no dictionary token matches well (high cost
+                       everywhere) receive low row mass, attenuating the
+                       aggregated feature.  This is the intended "spatial
+                       gating" mechanism — normalising rows to 1 would
+                       discard it (Séjourné et al. §4.7.2).  The raw row
+                       mass per pixel is stored in `last_row_mass` (eval
+                       mode only) for ablation studies.
     """
 
     def __init__(
@@ -85,7 +101,7 @@ class UnifiedDictionaryAttention(nn.Module):
         ot_eps: float = 0.1,
         iters: int = 20,
         routing_mode: str = "unbalanced_eot",
-        tv_weight: float = 0.0,  # optional spatial TV on P (0 = disabled)
+        tv_weight: float = 0.0,
     ):
         super().__init__()
         self.dict_num = dict_num
@@ -108,8 +124,14 @@ class UnifiedDictionaryAttention(nn.Module):
             nn.Conv2d(dict_dim, output_dim, 1),
         )
 
-        # Set to None in eval mode after each call to prevent memory leak.
+        # Populated in eval mode only (cleared in training mode) to avoid
+        # retaining (B, HW, N) tensors on the autograd graph each step.
         self.attn_probs: torch.Tensor | None = None
+
+        # Row mass map for the unbalanced path — (B, HW) tensor, eval only.
+        # Values > 1 indicate pixels strongly matched by a dictionary token;
+        # values < 1 indicate low-confidence / outlier regions.
+        self.last_row_mass: torch.Tensor | None = None
 
     # -----------------------------------------------------------------------
     # Cost matrix  C ∈ [0, 2]   (cosine distance, symmetric)
@@ -121,8 +143,8 @@ class UnifiedDictionaryAttention(nn.Module):
         """
         Cosine-distance cost matrix C[b, hw, n] = 1 − cos(q_hw, k_n) ∈ [0, 2].
 
-        NO spatial smoothing is applied here — smoothing C would make the
-        distance non-metric and break the OT interpretation.
+        No spatial smoothing is applied — smoothing C would make the distance
+        non-metric and break the OT interpretation.
         """
         B = x.shape[0]
         HW = H * W
@@ -162,8 +184,13 @@ class UnifiedDictionaryAttention(nn.Module):
 
         Marginals: uniform row (1/HW) and uniform col (1/N).
 
-        Stability: potentials are updated via a damped step rather than a
-        direct replacement, preventing divergence for ill-conditioned C.
+        Iteration order follows Algorithm 1 of Séjourné et al. 2019:
+        column potential (g) is updated first, then row potential (f).
+        This is correct — the paper initialises f=0 and runs g first.
+
+        Truncated backprop: the first (iters - 5) iterations run under
+        torch.no_grad() to reduce peak memory; gradients flow through
+        the last 5 iterations only.
         """
         B, HW, N = C_mat.shape
         eps = self.ot_eps
@@ -182,10 +209,12 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.training and n_nograd_iters > 0:
             with torch.no_grad():
                 for _ in range(n_nograd_iters):
+                    # Column update first (Algorithm 1, Séjourné et al. 2019)
                     log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
                     log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
 
         for _ in range(n_grad_iters if self.training else self.iters):
+            # Column update first (Algorithm 1, Séjourné et al. 2019)
             log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
             # Row update:
             log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
@@ -204,11 +233,16 @@ class UnifiedDictionaryAttention(nn.Module):
         self, C_mat: torch.Tensor, rho_flat: torch.Tensor
     ) -> torch.Tensor:
         """
-        KL-unbalanced Sinkhorn OT.
+        KL-unbalanced Sinkhorn OT (Séjourné et al. 2019, §3.2 and §4.7.2).
 
         Row marginal strength: per-pixel ρ_i  (spatially varying).
         Col marginal strength: mean(ρ) shared across all dictionary tokens.
 
+        The Aprox operator for ρKL is Aprox(p) = (ρ/(ρ+ε)) · p (Table 1),
+        which in log-domain becomes the direct scaling used below.
+
+        Iteration order follows Algorithm 1: column (g) update first, then
+        row (f) update.  Truncated backprop as in the balanced path.
         """
         B, HW, N = C_mat.shape
         eps = self.ot_eps
@@ -236,17 +270,14 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.training and n_nograd_iters > 0:
             with torch.no_grad():
                 for _ in range(n_nograd_iters):
-                    raw_g = log_b - torch.logsumexp(
-                        log_f - M, dim=1, keepdim=True
-                    )  # (B, 1, N)
+                    # Column update first (Algorithm 1, Séjourné et al. 2019)
+                    raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
                     log_g = shrink_col * raw_g
-                    # Row update — per-pixel DIRECT scaling.
-                    raw_f = log_a - torch.logsumexp(
-                        log_g - M, dim=2, keepdim=True
-                    )  # (B, HW, 1)
+                    raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
                     log_f = shrink_row * raw_f
 
         for _ in range(n_grad_iters if self.training else self.iters):
+            # Column update first (Algorithm 1, Séjourné et al. 2019)
             raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
             log_g = shrink_col * raw_g
             raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
@@ -271,12 +302,12 @@ class UnifiedDictionaryAttention(nn.Module):
     def _dispersion_loss(P: torch.Tensor) -> torch.Tensor:
         """
         Returns  −H(m)  where H(m) is the Shannon entropy of the column-
-        marginal distribution m_j = Σ_i P_ij / Z
+        marginal distribution m_j = Σ_i P_ij / Z.
 
+        Entropy is in bits to be commensurate with bpp_loss units.
         """
         marginal = P.sum(dim=1)  # (B, N)
         marginal = marginal / (marginal.sum(dim=1, keepdim=True).clamp(min=1e-8))
-        # Entropy in bits — consistent with bpp_loss units.
         _log2e = 1.0 / math.log(2)
         H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean() * _log2e
         return -H  # negative entropy in bits; caller subtracts to maximise H
@@ -296,7 +327,7 @@ class UnifiedDictionaryAttention(nn.Module):
         B, _, H, W = x.shape
         HW = H * W
 
-        # Cost matrix is always computed in float32 regardless of input dtype.
+        # Cost matrix always computed in float32 regardless of input dtype.
         C_mat = self._cost_matrix(x, k, H, W).float()
 
         # ── Routing ──────────────────────────────────────────────────────────
@@ -305,17 +336,41 @@ class UnifiedDictionaryAttention(nn.Module):
 
         elif self.routing_mode == "balanced_eot":
             P = self._route_balanced_eot(C_mat)
-            P = P * HW  # scale so rows sum to ~1 (before ×HW, rows sum to ~1/HW)
+            # Scale so rows sum to ~1 (balanced marginals are uniform 1/HW
+            # before scaling; this matches the softmax normalisation convention).
+            P = P * HW
 
         elif self.routing_mode == "unbalanced_eot":
             rho_flat = rho_spatial.view(B, HW).float().clamp(min=0.01)
             P = self._route_unbalanced_eot(C_mat, rho_flat)
+            # Scale by HW as in the balanced case.  Row sums are NOT forced to
+            # 1 here — unbalanced OT intentionally relaxes the row marginal
+            # constraint (Séjourné et al. §4.7.2).  Low-confidence pixels
+            # (no good dictionary match) yield row sums < 1, attenuating the
+            # aggregated feature (spatial gating).  High-affinity pixels may
+            # exceed 1.  The GroupNorm in out_proj stabilises the resulting
+            # magnitude variation before the final projection.
             P = P * HW
+
+            # Store raw row mass in eval mode for ablation analysis.
+            # Callers can inspect last_row_mass to verify the gating mechanism
+            # correlates with image texture (high-frequency regions → low ρ
+            # → low row mass → attenuated dict feature).
+            if not self.training:
+                self.last_row_mass = P.sum(dim=-1).detach()  # (B, HW)
+            else:
+                self.last_row_mass = None
 
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode}")
 
-        self.attn_probs = P.detach()
+        # Store full attention plan in eval mode only.
+        # During training this tensor is large ((B, HW, N) per slice × 5 slices)
+        # and is never read, so we avoid retaining it on the graph.
+        if not self.training:
+            self.attn_probs = P.detach()
+        else:
+            self.attn_probs = None
 
         # ── Spatial TV regularisation (optional, training only) ───────────────
         tv_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)

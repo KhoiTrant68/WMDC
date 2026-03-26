@@ -83,16 +83,25 @@ class IDWT_2D(nn.Module):
 
 class GatedMemoryUpdater(nn.Module):
     """
-    GRU-style gated memory update.
+    Residual gated memory update.
 
-        new_memory = g ⊙ memory + (1 − g) ⊙ update(memory, new_info)
+        new_memory = memory + g ⊙ update(memory, new_info)
 
-    Initialisation:
-      - Gate bias = +3.0  → sigmoid(3) ≈ 0.95 at init
-        → new_memory ≈ memory  (near-identity, stable first epoch)
-      - Update branch final conv weight/bias = 0
-        → update(x) = tanh(0) = 0 at init
-        → new_memory = 0.95 * memory + 0.05 * 0 ≈ memory  ✓
+    where g = sigmoid(W · [memory, new_info] + b_gate).
+
+    This is a residual formulation: the skip connection preserves the memory
+    by default; the gate controls how much of the learned update to add.
+
+    Initialisation
+    --------------
+    - Gate bias = −3.0  →  sigmoid(−3) ≈ 0.047 at init
+      → new_memory ≈ memory + 0.047 · update ≈ memory  (near-identity)
+    - Update branch final conv weight/bias = 0
+      → update(x) = tanh(0) = 0 at init
+      → new_memory = memory + 0.047 · 0 = memory  ✓
+
+    Both initialisation conditions independently ensure identity behaviour at
+    the start of training, giving the slice pipeline a stable first epoch.
     """
 
     def __init__(self, slice_ch: int):
@@ -108,15 +117,19 @@ class GatedMemoryUpdater(nn.Module):
             nn.Tanh(),
         )
 
-        # Start gate near 0 so identity map works flawlessly at init
+        # Gate bias → −3.0 so the gate opens slowly, keeping the update
+        # contribution near zero at initialisation.
         nn.init.constant_(self.gate[0].bias, -3.0)
+
+        # Zero-init the update branch output layer: tanh(0) = 0 at init,
+        # so the residual addition is a no-op regardless of gate value.
         nn.init.zeros_(self.update[-2].weight)
         nn.init.zeros_(self.update[-2].bias)
 
     def forward(self, memory: torch.Tensor, new_info: torch.Tensor) -> torch.Tensor:
         x = torch.cat([memory, new_info], dim=1)
-        g = self.gate(x)
-        u = self.update(x)
+        g = self.gate(x)  # ≈ 0.047 at init
+        u = self.update(x)  # ≈ 0.0 at init
         return memory + g * u
 
 
@@ -145,6 +158,12 @@ class FrequencyDisentangledMamba(nn.Module):
     high-lambda (low-bitrate) models may collapse to blur-only reconstructions.
 
     Zero-init of the FiLM output layers ensures identity at training start.
+
+    Fusion
+    ------
+    After modulation, a depthwise 3×3 convolution with a residual connection
+    provides spatial smoothing before IDWT.  Cross-band channel mixing is
+    handled implicitly by the subsequent stride-2 conv in g_a / deconv in g_s.
     """
 
     def __init__(self, dim: int, drop_path: float = 0.1):
@@ -170,13 +189,14 @@ class FrequencyDisentangledMamba(nn.Module):
             nn.init.zeros_(net[-1].bias)
             return net
 
-        self.film_lh = _make_film_predictor(dim, dim)  # for LH sub-band
-        self.film_hl = _make_film_predictor(dim, dim)  # for HL sub-band
-        self.film_hh = _make_film_predictor(dim, dim)  # for HH sub-band
+        self.film_lh = _make_film_predictor(dim, dim)
+        self.film_hl = _make_film_predictor(dim, dim)
+        self.film_hh = _make_film_predictor(dim, dim)
 
-        # Fusion before IDWT: depthwise spatial + pointwise channel mixing.
+        # Depthwise spatial fusion with residual connection.
+        # Cross-band channel mixing is not applied here; it is provided by
+        # the surrounding stride-2 convolutions in the encoder/decoder.
         self.fusion = nn.Sequential(
-            # Spatial mixing (3x3 depthwise) to capture local high-frequency geometry
             nn.Conv2d(dim * 4, dim * 4, kernel_size=3, padding=1, groups=dim * 4),
             nn.GELU(),
         )
@@ -188,7 +208,7 @@ class FrequencyDisentangledMamba(nn.Module):
         beta: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Apply FiLM modulation with gamma clamped to (−1, +1).
+        FiLM modulation with gamma clamped to (−1, +1).
 
         The clamp prevents the degenerate case where gamma → −1 zeroes out
         all high-frequency content, causing blur-only reconstructions at high

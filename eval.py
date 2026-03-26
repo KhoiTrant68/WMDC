@@ -72,6 +72,7 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
       - 'max_entropy_bits'         : float, log2(dict_num)
       - 'assignment_maps'          : list of (H_lat, W_lat) int tensors (top-1 token)
       - 'entropy_maps'             : list of (H_lat, W_lat) float tensors (local H)
+      - 'row_mass_maps'            : list of (H_lat, W_lat) float tensors (unbalanced only)
     """
     x_pad, _, _ = pad_image(x.to(device).float(), p=64)
 
@@ -98,8 +99,15 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
     per_slice_util: list[float] = []
     assignment_maps: list = []
     entropy_maps: list = []
+    row_mass_maps: list = []
 
-    for P in all_probs:
+    # Collect per-slice row mass maps if available (unbalanced mode).
+    all_row_masses = []
+    for attn in model.eot_attentions:
+        rm = getattr(attn, "last_row_mass", None)
+        all_row_masses.append(rm)
+
+    for s_idx, P in enumerate(all_probs):
         # P: (1, HW, N)  — already detached
         B, HW, N = P.shape
 
@@ -115,15 +123,26 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
         except RuntimeError:
             assignment_maps.append(None)
             entropy_maps.append(None)
+            row_mass_maps.append(None)
             continue
 
-        # Top-1 assignment map (which dict token each spatial position prefers)
+        # Top-1 assignment map
         assignment_maps.append(P_sp.argmax(dim=-1).cpu())  # (H, W) int
 
-        # Per-pixel entropy map (how uncertain the routing is at each location)
+        # Per-pixel entropy map
         p_norm = P_sp / P_sp.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         H_pixel = -(p_norm * p_norm.clamp(1e-8).log2()).sum(dim=-1)
         entropy_maps.append(H_pixel.cpu())  # (H, W) float
+
+        # Row mass map (unbalanced OT spatial gating signal).
+        rm = all_row_masses[s_idx] if s_idx < len(all_row_masses) else None
+        if rm is not None:
+            try:
+                row_mass_maps.append(rm[0].view(H_lat_y, W_lat_y).cpu())
+            except RuntimeError:
+                row_mass_maps.append(None)
+        else:
+            row_mass_maps.append(None)
 
     return {
         "per_slice_utilisation_pct": per_slice_util,
@@ -131,6 +150,7 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
         "max_entropy_bits": max_ent,
         "assignment_maps": assignment_maps,
         "entropy_maps": entropy_maps,
+        "row_mass_maps": row_mass_maps,
     }
 
 
@@ -156,13 +176,13 @@ def main():
     parser.add_argument(
         "--measure-dict-util",
         action="store_true",
-        help="Record per-slice dictionary utilisation, assignment maps, and "
-        "entropy maps for every image.",
+        help="Record per-slice dictionary utilisation, assignment maps, "
+        "entropy maps, and row-mass maps for every image.",
     )
     parser.add_argument(
         "--save-attn-maps",
         action="store_true",
-        help="Save assignment and entropy map tensors as .pt files "
+        help="Save assignment, entropy, and row-mass map tensors as .pt files "
         "(only effective with --measure-dict-util).",
     )
     args = parser.parse_args()
@@ -253,15 +273,12 @@ def main():
 
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
-            # Include shape overhead in actual BPP calculation
-            bpp_orig = compute_actual_bpp(
-                out_enc["strings"], out_enc["shape"], num_pixels_orig
-            )
-            bpp_pad = compute_actual_bpp(
-                out_enc["strings"], out_enc["shape"], num_pixels_padded
-            )
+            # BPP — two variants (shape metadata excluded, < 0.0002 bpp overhead)
+            bpp_orig = compute_actual_bpp(out_enc["strings"], num_pixels_orig)
+            bpp_pad = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
             pad_oh = bpp_orig - bpp_pad
 
+            # Quality
             mse = F.mse_loss(x, x_hat)
             psnr = -10.0 * math.log10(mse.item()) if mse.item() > 0 else 100.0
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()
@@ -296,8 +313,12 @@ def main():
 
                 if args.save_attn_maps:
                     stem = os.path.splitext(os.path.basename(img_path))[0]
-                    for s_idx, (amap, emap) in enumerate(
-                        zip(util["assignment_maps"], util["entropy_maps"])
+                    for s_idx, (amap, emap, rmap) in enumerate(
+                        zip(
+                            util["assignment_maps"],
+                            util["entropy_maps"],
+                            util["row_mass_maps"],
+                        )
                     ):
                         if amap is not None:
                             torch.save(
@@ -311,6 +332,13 @@ def main():
                                 emap,
                                 os.path.join(
                                     attn_dir, f"{stem}_slice{s_idx}_entropy.pt"
+                                ),
+                            )
+                        if rmap is not None:
+                            torch.save(
+                                rmap,
+                                os.path.join(
+                                    attn_dir, f"{stem}_slice{s_idx}_rowmass.pt"
                                 ),
                             )
 
