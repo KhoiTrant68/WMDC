@@ -84,7 +84,7 @@ def main():
         # We detach and move to CPU immediately to save VRAM
         attn_maps.append(module.attn_probs.detach().cpu())
 
-    hook = model.eot_attention.register_forward_hook(hook_fn)
+    hook = model.eot_attentions.register_forward_hook(hook_fn)
 
     # 3. Discover Images
     img_files = sorted(
