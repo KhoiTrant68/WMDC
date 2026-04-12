@@ -36,19 +36,52 @@ class DWT_2D(nn.Module):
         super().__init__()
         w = pywt.Wavelet(wave)
 
+        # Helper to strip PyWavelet's artificial padding zeros (length 10 -> 9 and 7)
+        def _trim_zeros(f: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            idx = torch.where(torch.abs(f) > eps)[0]
+            return f[idx[0] : idx[-1] + 1] if len(idx) > 0 else f
+
         # [::-1].copy() converts from pywt correlation convention to
         # convolution convention so F.conv2d (cross-correlation) gives the
         # same result as the mathematical convolution in the DWT definition.
-        dec_lo = torch.tensor(w.dec_lo[::-1].copy(), dtype=torch.float32)
-        dec_hi = torch.tensor(w.dec_hi[::-1].copy(), dtype=torch.float32)
+        dec_lo = _trim_zeros(torch.tensor(w.dec_lo[::-1].copy(), dtype=torch.float32))
+        dec_hi = _trim_zeros(torch.tensor(w.dec_hi[::-1].copy(), dtype=torch.float32))
 
         self.register_buffer("dec_lo", dec_lo)
         self.register_buffer("dec_hi", dec_hi)
 
-        # Per-filter half-point symmetric padding.
+        # Per-filter half-point symmetric padding based on the TRIMMED lengths.
         # bior4.4: dec_lo→9 taps → lo_pad=4; dec_hi→7 taps → hi_pad=3
-        self.lo_pad = (len(w.dec_lo) - 1) // 2
-        self.hi_pad = (len(w.dec_hi) - 1) // 2
+        self.lo_pad = (len(self.dec_lo) - 1) // 2
+        self.hi_pad = (len(self.dec_hi) - 1) // 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Hook to safely load older checkpoints containing untrimmed length-10 filters
+        for suffix in ["dec_lo", "dec_hi"]:
+            key = prefix + suffix
+            if key in state_dict:
+                f = state_dict[key]
+                idx = torch.where(torch.abs(f) > 1e-6)[0]
+                if len(idx) > 0:
+                    state_dict[key] = f[idx[0] : idx[-1] + 1]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _conv1d(
         self, x: torch.Tensor, filt: torch.Tensor, pad: int, dim: int
@@ -58,15 +91,6 @@ class DWT_2D(nn.Module):
 
         Formula: output_size = input_size + 2*pad - len(filt) + 1
         For odd-length filt with pad = (len-1)//2:  output_size = input_size ✓
-
-        Args:
-            x    : (B, C, H, W)
-            filt : 1D tensor of length L (must be odd)
-            pad  : symmetric padding = (L-1) // 2
-            dim  : 2 for height axis, 3 for width axis
-
-        Returns:
-            (B, C, H, W)  — same spatial size as input (before downsampling)
         """
         B, C, H, W = x.shape
         assert filt.shape[0] % 2 == 1, (
@@ -129,37 +153,56 @@ class IDWT_2D(nn.Module):
 
     IMPORTANT: rec_lo/rec_hi for bior4.4 are symmetric filters, so
     NOT reversing them before F.conv2d (cross-correlation) gives the same
-    result as the true convolution synthesis formula.  For non-symmetric
-    wavelets this class would need `[::-1]` applied to rec_lo/rec_hi.
-
-    Synthesis boundary extension:
-        F.pad(zero_inserted, mode='reflect') on the upsampled (zero-inserted)
-        signal applies half-point symmetric extension.  For symmetric filters
-        (bior4.4), this is consistent with the analysis half-point symmetric
-        extension and guarantees perfect reconstruction (PR).
-
-        Verification: test_dwt_idwt() checks max |x - IDWT(DWT(x))| < 1e-4.
-
-    Input channel order: [LL | LH | HL | HH] (matches DWT_2D output).
-    Input shape:  (B, 4*C, H/2, W/2)
-    Output shape: (B, C, H, W)
+    result as the true convolution synthesis formula.
     """
 
     def __init__(self, wave: str = "bior4.4"):
         super().__init__()
         w = pywt.Wavelet(wave)
 
+        def _trim_zeros(f: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            idx = torch.where(torch.abs(f) > eps)[0]
+            return f[idx[0] : idx[-1] + 1] if len(idx) > 0 else f
+
         # Synthesis filters — NOT reversed because bior4.4 rec_lo/rec_hi
-        # are symmetric (flip = identity), so cross-correlation = convolution.
-        rec_lo = torch.tensor(w.rec_lo, dtype=torch.float32)
-        rec_hi = torch.tensor(w.rec_hi, dtype=torch.float32)
+        # are symmetric (flip = identity). Trim artificial zeros.
+        rec_lo = _trim_zeros(torch.tensor(w.rec_lo, dtype=torch.float32))
+        rec_hi = _trim_zeros(torch.tensor(w.rec_hi, dtype=torch.float32))
 
         self.register_buffer("rec_lo", rec_lo)
         self.register_buffer("rec_hi", rec_hi)
 
         # bior4.4: rec_lo→7 taps → lo_pad=3; rec_hi→9 taps → hi_pad=4
-        self.lo_pad = (len(w.rec_lo) - 1) // 2
-        self.hi_pad = (len(w.rec_hi) - 1) // 2
+        self.lo_pad = (len(self.rec_lo) - 1) // 2
+        self.hi_pad = (len(self.rec_hi) - 1) // 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Hook to safely load older checkpoints containing untrimmed length-10 filters
+        for suffix in ["rec_lo", "rec_hi"]:
+            key = prefix + suffix
+            if key in state_dict:
+                f = state_dict[key]
+                idx = torch.where(torch.abs(f) > 1e-6)[0]
+                if len(idx) > 0:
+                    state_dict[key] = f[idx[0] : idx[-1] + 1]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _upsample_conv1d(
         self,
@@ -172,24 +215,6 @@ class IDWT_2D(nn.Module):
     ) -> torch.Tensor:
         """
         Upsample by 2 (zero-insert) then convolve — inverse of downsample+filter.
-
-        Args:
-            x           : (B, C, H, W) — small (half-size) input
-            filt        : synthesis filter (rec_lo or rec_hi)
-            pad         : (len(filt) - 1) // 2
-            dim         : 2 = upsample height, 3 = upsample width
-            offset      : 0 = signal at even positions [0::2]  (lo branch)
-                          1 = signal at odd  positions [1::2]  (hi branch)
-            target_size : output spatial size = 2 × input spatial size
-
-        Boundary handling:
-            F.pad with mode='reflect' on the zero-inserted signal applies
-            half-point symmetric extension.  For bior4.4 (symmetric synthesis
-            filters) this is consistent with the analysis extension, ensuring PR.
-
-        Size check (bior4.4 example, target_size=128):
-            lo (rec_lo=7 taps, pad=3):  128+6=134 → conv→134-7+1=128 ✓
-            hi (rec_hi=9 taps, pad=4):  128+8=136 → conv→136-9+1=128 ✓
         """
         B, C, H, W = x.shape
 
@@ -392,16 +417,16 @@ class FrequencyDisentangledMamba(nn.Module):
     -------------
     1. CDF 9/7 DWT decomposes features → LL, LH, HL, HH subbands.
     2. LL passes through VSSBlock (Mamba) → global structural context.
-    3. Mamba-enriched LL predicts per-subband FiLM parameters (γ, β).
-    4. Each HF subband modulated: f(x, γ, β) = x · softplus(γ+offset) + β
+    3. Mamba-enriched LL predicts per-subband FiLM parameters (γ).
+    4. Each HF subband modulated: f(x, γ) = x · softplus(γ+offset)
        where offset = log(e−1) ≈ 0.5413 ensures scale = 1.0 at init.
     5. Fused subbands reconstructed via IDWT.
 
     FiLM predictor init:
-        Final conv is zero-initialized → γ=0, β=0 at epoch 0.
+        Final conv is zero-initialized → γ=0 at epoch 0.
         softplus(0 + log(e−1)) = softplus(0.5413) = log(1 + e^0.5413)
                                 = log(1 + (e−1)) = log(e) = 1.0  ✓
-        So the initial transform is the identity: f(x,0,0) = x · 1.0 + 0 = x. ✓
+        So the initial transform is the identity: f(x,0) = x · 1.0 = x. ✓
     """
 
     def __init__(self, dim: int, drop_path: float = 0.1):
@@ -417,10 +442,11 @@ class FrequencyDisentangledMamba(nn.Module):
             net = nn.Sequential(
                 nn.Conv2d(in_dim, in_dim * 2, kernel_size=3, padding=1),
                 nn.GELU(),
-                nn.Conv2d(in_dim * 2, out_dim * 2, kernel_size=1),
-                # out_dim*2: first half → γ, second half → β
+                # out_dim output: predicts ONLY gamma (scale).
+                # Predicting beta (bias) in HF wavelet bands causes severe spatial aliasing.
+                nn.Conv2d(in_dim * 2, out_dim, kernel_size=1),
             )
-            # Zero-init final layer: γ=0, β=0 → identity at epoch 0
+            # Zero-init final layer: γ=0 → identity at epoch 0
             nn.init.zeros_(net[-1].weight)
             nn.init.zeros_(net[-1].bias)
             return net
@@ -439,23 +465,23 @@ class FrequencyDisentangledMamba(nn.Module):
     def _apply_film(
         x_hf: torch.Tensor,
         gamma: torch.Tensor,
-        beta: torch.Tensor,
     ) -> torch.Tensor:
         r"""
         FiLM modulation with Softplus scaling — identity at init.
 
         Formulation:
-            f(x, γ, β) = x · softplus(γ + log(e−1)) + β
+            f(x, γ) = x · softplus(γ + log(e−1))
 
         Properties:
             scale at γ=0: softplus(log(e−1)) = log(1+(e−1)) = log(e) = 1.0  ✓
             scale > 0  ∀ γ ∈ ℝ  (never flips phase)                          ✓
             scale unbounded above  (can amplify strongly)                      ✓
             ∂scale/∂γ = σ(γ + log(e−1)) > 0  (gradient never dies)           ✓
+            No DC bias addition (prevents grid aliasing in IDWT)             ✓
         """
         _SOFTPLUS_OFFSET = math.log(math.e - 1)  # ≈ 0.5413
         scale = F.softplus(gamma + _SOFTPLUS_OFFSET)
-        return x_hf * scale + beta
+        return x_hf * scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -479,15 +505,15 @@ class FrequencyDisentangledMamba(nn.Module):
         # 2. Mamba: global context from LL subband
         x_ll_out = self.ll_mamba(x_ll)
 
-        # 3. FiLM: LL-predicted parameters for each HF subband
-        gamma_lh, beta_lh = self.film_lh(x_ll_out).chunk(2, dim=1)
-        gamma_hl, beta_hl = self.film_hl(x_ll_out).chunk(2, dim=1)
-        gamma_hh, beta_hh = self.film_hh(x_ll_out).chunk(2, dim=1)
+        # 3. FiLM: LL-predicted parameters (gamma ONLY) for each HF subband
+        gamma_lh = self.film_lh(x_ll_out)
+        gamma_hl = self.film_hl(x_ll_out)
+        gamma_hh = self.film_hh(x_ll_out)
 
         # 4. Modulate HF subbands (identity at epoch 0)
-        x_lh_mod = self._apply_film(x_lh, gamma_lh, beta_lh)
-        x_hl_mod = self._apply_film(x_hl, gamma_hl, beta_hl)
-        x_hh_mod = self._apply_film(x_hh, gamma_hh, beta_hh)
+        x_lh_mod = self._apply_film(x_lh, gamma_lh)
+        x_hl_mod = self._apply_film(x_hl, gamma_hl)
+        x_hh_mod = self._apply_film(x_hh, gamma_hh)
 
         # 5. Depthwise fusion + skip, then IDWT
         merged = torch.cat([x_ll_out, x_lh_mod, x_hl_mod, x_hh_mod], dim=1)
