@@ -619,12 +619,12 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
-        # if epoch >= args.epochs - 50:
-        #     accelerator.unwrap_model(model).use_ste = True
-        #     if accelerator.is_main_process and epoch == args.epochs - 50:
-        #         print("Turning on STE for the last 50 epochs.")
-        # else:
-        #     accelerator.unwrap_model(model).use_ste = False
+        if epoch >= args.epochs - 2:
+            accelerator.unwrap_model(model).use_ste = True
+            if accelerator.is_main_process and epoch == args.epochs - 2:
+                print("Turning on STE for the last 2 epochs.")
+        else:
+            accelerator.unwrap_model(model).use_ste = False
         train_one_epoch(
             model,
             criterion,
