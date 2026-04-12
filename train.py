@@ -467,7 +467,7 @@ def parse_args():
     p.add_argument("--disp-weight", type=float, default=0.1)
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--sinkhorn-iters", type=int, default=20)
-    p.add_argument("--lr-milestones", type=int, nargs="+", default=[3, 4])
+    p.add_argument("--lr-milestones", type=int, nargs="+", default=[360, 380])
     p.add_argument("--lr-gamma", type=float, default=0.1)
     p.add_argument(
         "--gap-check-interval",
@@ -619,10 +619,10 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
-        if epoch >= args.epochs - 2:
+        if epoch >= args.epochs - 20:
             accelerator.unwrap_model(model).use_ste = True
-            if accelerator.is_main_process and epoch == args.epochs - 2:
-                print("Turning on STE for the last 2 epochs.")
+            if accelerator.is_main_process and epoch == args.epochs - 20:
+                print("Turning on STE for the last 20 epochs.")
         else:
             accelerator.unwrap_model(model).use_ste = False
         train_one_epoch(
