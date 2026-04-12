@@ -40,9 +40,7 @@ class DWT_2D(nn.Module):
             idx = torch.where(torch.abs(f) > eps)[0]
             return f[idx[0] : idx[-1] + 1] if len(idx) > 0 else f
 
-        # [::-1].copy() converts from pywt correlation convention to
-        # convolution convention so F.conv2d (cross-correlation) gives the
-        # same result as the mathematical convolution in the DWT definition.
+        # [::-1].copy() converts to convolution convention, then trim
         dec_lo = _trim_zeros(torch.tensor(w.dec_lo[::-1].copy(), dtype=torch.float32))
         dec_hi = _trim_zeros(torch.tensor(w.dec_hi[::-1].copy(), dtype=torch.float32))
 
@@ -51,8 +49,36 @@ class DWT_2D(nn.Module):
 
         # Per-filter half-point symmetric padding.
         # bior4.4: dec_lo→9 taps → lo_pad=4; dec_hi→7 taps → hi_pad=3
-        self.lo_pad = (len(w.dec_lo) - 1) // 2
-        self.hi_pad = (len(w.dec_hi) - 1) // 2
+        self.lo_pad = (len(self.dec_lo) - 1) // 2
+        self.hi_pad = (len(self.dec_hi) - 1) // 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Hook to safely load older checkpoints containing untrimmed length-10 filters
+        for suffix in ["dec_lo", "dec_hi"]:
+            key = prefix + suffix
+            if key in state_dict:
+                f = state_dict[key]
+                idx = torch.where(torch.abs(f) > 1e-6)[0]
+                if len(idx) > 0:
+                    state_dict[key] = f[idx[0] : idx[-1] + 1]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _conv1d(
         self, x: torch.Tensor, filt: torch.Tensor, pad: int, dim: int
@@ -157,8 +183,7 @@ class IDWT_2D(nn.Module):
             idx = torch.where(torch.abs(f) > eps)[0]
             return f[idx[0] : idx[-1] + 1] if len(idx) > 0 else f
 
-        # Synthesis filters — NOT reversed because bior4.4 rec_lo/rec_hi
-        # are symmetric (flip = identity), so cross-correlation = convolution.
+        # Synthesis filters - trim artificial zeros
         rec_lo = _trim_zeros(torch.tensor(w.rec_lo, dtype=torch.float32))
         rec_hi = _trim_zeros(torch.tensor(w.rec_hi, dtype=torch.float32))
 
@@ -168,6 +193,34 @@ class IDWT_2D(nn.Module):
         # bior4.4: rec_lo→7 taps → lo_pad=3; rec_hi→9 taps → hi_pad=4
         self.lo_pad = (len(w.rec_lo) - 1) // 2
         self.hi_pad = (len(w.rec_hi) - 1) // 2
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Hook to safely load older checkpoints containing untrimmed length-10 filters
+        for suffix in ["rec_lo", "rec_hi"]:
+            key = prefix + suffix
+            if key in state_dict:
+                f = state_dict[key]
+                idx = torch.where(torch.abs(f) > 1e-6)[0]
+                if len(idx) > 0:
+                    state_dict[key] = f[idx[0] : idx[-1] + 1]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _upsample_conv1d(
         self,
