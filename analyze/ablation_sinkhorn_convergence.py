@@ -53,20 +53,20 @@ def measure_convergence(model, x_padded, max_iters: int, device: str):
         B, _, H, W = query.shape
         HW = H * W
 
-        # Build cost matrix once (independent of iters).
-        C_mat = model.eot_attention._cost_matrix(query, k_dict, H, W)
+        # Build cost matrix once (independent of iters). Access eot_attentions[0]
+        C_mat = model.eot_attentions[0]._cost_matrix(query, k_dict, H, W)
         rho_flat = rho_spatial.view(B, HW).clamp(min=0.01)
 
     iter_counts = list(range(1, max_iters + 1))
     costs = []
 
-    # Temporarily swap iters inside the module.
-    original_iters = model.eot_attention.iters
+    # Temporarily swap iters inside the module. Access eot_attentions[0]
+    original_iters = model.eot_attentions[0].iters
 
     for n_iters in iter_counts:
-        model.eot_attention.iters = n_iters
+        model.eot_attentions[0].iters = n_iters
         with torch.no_grad():
-            P = model.eot_attention._route_unbalanced_eot(C_mat, rho_flat)
+            P = model.eot_attentions[0]._route_unbalanced_eot(C_mat, rho_flat)
 
             # 1. Linear Transport Cost
             transport_cost = (C_mat * P).sum(dim=(1, 2))
@@ -80,26 +80,29 @@ def measure_convergence(model, x_padded, max_iters: int, device: str):
             beta = 1.0 / C_mat.size(-1)
 
             # D_KL(u || v) = u log(u/v) - u + v
-            kl_row = (P_row_sum * torch.log(P_row_sum / alpha) - P_row_sum + alpha).sum(
-                dim=1
+            # FIX: Compute kl_row PER PIXEL (shape: B, HW)
+            kl_row_per_pixel = (
+                P_row_sum * torch.log(P_row_sum / alpha) - P_row_sum + alpha
             )
+
+            # kl_col can be summed entirely (shape: B)
             kl_col = (P_col_sum * torch.log(P_col_sum / beta) - P_col_sum + beta).sum(
                 dim=1
             )
 
-            # Spatial Rho applies to rows, uniform epsilon to cols (as per your derivation)
-            rho_penalty = (rho_flat * kl_row).sum(dim=1)  # (B)
+            # Spatial Rho applies to rows per-pixel, uniform epsilon to cols
+            rho_penalty = (rho_flat * kl_row_per_pixel).sum(dim=1)  # (B)
 
             # Total Unbalanced Primal Objective
             total_cost = (
-                (transport_cost + rho_penalty + model.eot_attention.ot_eps * kl_col)
+                (transport_cost + rho_penalty + model.eot_attentions[0].ot_eps * kl_col)
                 .mean()
                 .item()
             )
 
         costs.append(total_cost)
 
-    model.eot_attention.iters = original_iters
+    model.eot_attentions[0].iters = original_iters
     return iter_counts, costs
 
 
