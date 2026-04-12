@@ -298,7 +298,6 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
 
     Returns: psnr_forward - psnr_quantised  (positive = forward is optimistic)
     """
-    model.eval()
     d = batch.to(device).float()
 
     with torch.no_grad():
@@ -306,12 +305,14 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
         model.update(force=True)
 
         # Forward pass (noise relaxation)
+        model.train()
         out_fwd = model(d)
         x_hat_fwd = out_fwd["x_hat"].clamp(0, 1)
         mse_fwd = F.mse_loss(d, x_hat_fwd)
         psnr_fwd = -10.0 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
 
         # Compress / decompress (hard quantisation)
+        model.eval()
         _sync()
         out_enc = model.compress(d)
         _sync()
@@ -381,7 +382,6 @@ def test_epoch(
             if "dispersion_bonus" in out_criterion:
                 disp_meter.update(out_criterion["dispersion_bonus"].item(), d.size(0))
 
-            # FIX: Safely gather metrics dropping DDP padded samples
             local = torch.tensor(
                 [psnr_val, bpp_val, loss_val], device=accelerator.device
             )
@@ -568,15 +568,30 @@ def main():
     lr_scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=args.lr_milestones, gamma=args.lr_gamma
     )
+    aux_scheduler = optim.lr_scheduler.MultiStepLR(
+        aux_optimizer, milestones=args.lr_milestones, gamma=args.lr_gamma
+    )
 
     criterion = RateDistortionLoss(
         lmbda=args.lmbda, metric=args.metric, disp_weight=args.disp_weight
     ).to(accelerator.device)
 
-    model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler = (
-        accelerator.prepare(
-            model, optimizer, aux_optimizer, train_loader, test_loader, lr_scheduler
-        )
+    (
+        model,
+        optimizer,
+        aux_optimizer,
+        train_loader,
+        test_loader,
+        lr_scheduler,
+        aux_scheduler,
+    ) = accelerator.prepare(
+        model,
+        optimizer,
+        aux_optimizer,
+        train_loader,
+        test_loader,
+        lr_scheduler,
+        aux_scheduler,
     )
 
     start_epoch = 0
@@ -632,6 +647,7 @@ def main():
             gap_check=run_gap,
         )
         lr_scheduler.step()
+        aux_scheduler.step()
 
         if accelerator.is_main_process:
             state = {

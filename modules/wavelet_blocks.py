@@ -214,8 +214,8 @@ class FrequencyDisentangledMamba(nn.Module):
         all high-frequency content, causing blur-only reconstructions at high
         lambda / low bitrate.
         """
-        gamma_clamped = gamma.clamp(-1.0, 1.0)
-        return x_hf * (1.0 + gamma_clamped) + beta
+        scale = F.softplus(gamma + 1.0)
+        return x_hf * scale + beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dim = self.dim
