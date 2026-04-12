@@ -384,8 +384,6 @@ class UnifiedDictionaryAttention(nn.Module):
         # ── Dispersion loss (bits, training only) ─────────────────────────────
         if calc_disp:
             disp_loss = self._dispersion_loss(P) + tv_loss
-            if self.training and self.tv_weight > 0.0:
-                disp_loss = disp_loss + self._spatial_tv(P, H, W) * self.tv_weight
         else:
             disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
