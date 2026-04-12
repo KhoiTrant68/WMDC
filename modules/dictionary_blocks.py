@@ -119,7 +119,6 @@ class UnifiedDictionaryAttention(nn.Module):
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
         self.out_proj = nn.Sequential(
             nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
-            nn.GroupNorm(1, dict_dim),
             nn.GELU(),
             nn.Conv2d(dict_dim, output_dim, 1),
         )
