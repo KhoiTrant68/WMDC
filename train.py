@@ -467,7 +467,7 @@ def parse_args():
     p.add_argument("--disp-weight", type=float, default=0.1)
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--sinkhorn-iters", type=int, default=20)
-    p.add_argument("--lr-milestones", type=int, nargs="+", default=[60, 85])
+    p.add_argument("--lr-milestones", type=int, nargs="+", default=[3, 4])
     p.add_argument("--lr-gamma", type=float, default=0.1)
     p.add_argument(
         "--gap-check-interval",
