@@ -284,7 +284,12 @@ class WMDC(CompressionModel):
         y = self.g_a(x)
         z = self.h_a(y)
 
-        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        z_hat_soft, z_likelihoods = self.entropy_bottleneck(z)
+        if self.training and getattr(self, "use_ste", False):
+            z_hat = torch.round(z) - z.detach() + z
+        else:
+            z_hat = z_hat_soft
+
         dt = self.hyper_to_dict(z_hat)
 
         latent_scales = self.h_scale_s(z_hat)
