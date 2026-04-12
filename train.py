@@ -470,6 +470,13 @@ def parse_args():
     p.add_argument("--lr-milestones", type=int, nargs="+", default=[360, 380])
     p.add_argument("--lr-gamma", type=float, default=0.1)
     p.add_argument(
+        "--last-epochs-with-ste",
+        type=int,
+        default=20,
+        help="Number of final epochs to train with STE instead of noise relaxation.  "
+        "Set to 0 to disable and train with noise relaxation for the entire schedule.",
+    )
+    p.add_argument(
         "--gap-check-interval",
         type=int,
         default=10,
@@ -619,10 +626,10 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
-        if epoch >= args.epochs - 20:
+        if epoch >= args.epochs - args.last_epochs_with_ste:
             accelerator.unwrap_model(model).use_ste = True
-            if accelerator.is_main_process and epoch == args.epochs - 20:
-                print("Turning on STE for the last 20 epochs.")
+            if accelerator.is_main_process and epoch == args.epochs - args.last_epochs_with_ste:
+                print(f"Turning on STE for the last {args.last_epochs_with_ste} epochs.")
         else:
             accelerator.unwrap_model(model).use_ste = False
         train_one_epoch(
