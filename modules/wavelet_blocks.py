@@ -36,11 +36,15 @@ class DWT_2D(nn.Module):
         super().__init__()
         w = pywt.Wavelet(wave)
 
+        def _trim_zeros(f: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            idx = torch.where(torch.abs(f) > eps)[0]
+            return f[idx[0] : idx[-1] + 1] if len(idx) > 0 else f
+
         # [::-1].copy() converts from pywt correlation convention to
         # convolution convention so F.conv2d (cross-correlation) gives the
         # same result as the mathematical convolution in the DWT definition.
-        dec_lo = torch.tensor(w.dec_lo[::-1].copy(), dtype=torch.float32)
-        dec_hi = torch.tensor(w.dec_hi[::-1].copy(), dtype=torch.float32)
+        dec_lo = _trim_zeros(torch.tensor(w.dec_lo[::-1].copy(), dtype=torch.float32))
+        dec_hi = _trim_zeros(torch.tensor(w.dec_hi[::-1].copy(), dtype=torch.float32))
 
         self.register_buffer("dec_lo", dec_lo)
         self.register_buffer("dec_hi", dec_hi)
@@ -149,10 +153,14 @@ class IDWT_2D(nn.Module):
         super().__init__()
         w = pywt.Wavelet(wave)
 
+        def _trim_zeros(f: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            idx = torch.where(torch.abs(f) > eps)[0]
+            return f[idx[0] : idx[-1] + 1] if len(idx) > 0 else f
+
         # Synthesis filters — NOT reversed because bior4.4 rec_lo/rec_hi
         # are symmetric (flip = identity), so cross-correlation = convolution.
-        rec_lo = torch.tensor(w.rec_lo, dtype=torch.float32)
-        rec_hi = torch.tensor(w.rec_hi, dtype=torch.float32)
+        rec_lo = _trim_zeros(torch.tensor(w.rec_lo, dtype=torch.float32))
+        rec_hi = _trim_zeros(torch.tensor(w.rec_hi, dtype=torch.float32))
 
         self.register_buffer("rec_lo", rec_lo)
         self.register_buffer("rec_hi", rec_hi)
