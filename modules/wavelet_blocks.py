@@ -121,7 +121,7 @@ class IDWT_2D(nn.Module):
 
 
 class GatedMemoryUpdater(nn.Module):
-    """
+    r"""
     Mamba-based Memory Updater for Autoregressive Slicing.
 
     Mathematical Proof of Mamba Global Receptive Field superiority:
@@ -166,9 +166,8 @@ class GatedMemoryUpdater(nn.Module):
             nn.Tanh(),
         )
 
-        # Zero-init guarantees Identity routing at iteration 0
-        nn.init.zeros_(self.gate[-1].weight)
-        nn.init.zeros_(self.gate[-1].bias)
+        nn.init.zeros_(self.gate[-2].weight)
+        nn.init.zeros_(self.gate[-2].bias)
 
     def forward(self, memory: torch.Tensor, new_info: torch.Tensor) -> torch.Tensor:
         # 1. Feature fusion
@@ -189,7 +188,7 @@ class GatedMemoryUpdater(nn.Module):
 
 
 class FrequencyDisentangledMamba(nn.Module):
-    """
+    r"""
     Cross-Frequency Mamba Modulation.
 
     Architecture:
@@ -235,18 +234,8 @@ class FrequencyDisentangledMamba(nn.Module):
         gamma: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        r"""
         FiLM Modulation with strictly positive Softplus scaling.
-
-        Mathematical Proof of Dead-Gradient Degeneracy in Linear Clamping:
-        ------------------------------------------------------------------
-        Previous formulation: f(x, \gamma) = x \cdot (1 + \text{clamp}(\gamma, -1, 1)) + \beta
-        If the network decides to suppress a high-frequency band to save bitrate, it pushes
-        \gamma \le -1. At this regime, \text{clamp}(\gamma, -1, 1) = -1.
-        The derivative \partial f / \partial \gamma = 0 for all \gamma \le -1.
-        This completely destroys the gradient pathway flowing back to the LL-predictor,
-        trapping the sub-band in a permanent "dead" state.
-
         Formulation (Softplus):
         ----------------------------
         New formulation: f(x, \gamma) = x \cdot \text{Softplus}(\gamma + 1) + \beta
