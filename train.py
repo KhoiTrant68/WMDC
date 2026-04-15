@@ -448,7 +448,7 @@ def parse_args():
     )
     p.add_argument("-d", "--dataset", type=str, required=True)
     p.add_argument("--save_path", type=str, default="checkpoints")
-    p.add_argument("-e", "--epochs", type=int, default=100)
+    p.add_argument("-e", "--epochs", type=int, default=400)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     p.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
