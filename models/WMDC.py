@@ -119,23 +119,27 @@ class WMDC(CompressionModel):
         # ── Spatially-Adaptive KL Mass Penalty Predictor (per-slice) ──────
         # Slice gets its own rho predictor conditioned on the growing
         # context (hyper_prior + accumulated reconstruction so far).
-        # Slice i sees hyper_prior (2*M) + i decoded slices (i * slice_ch).
-        self.rho_predictors = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(2 * M + i * self.slice_ch, 32, 1),
-                    nn.GELU(),
-                    nn.Conv2d(32, 1, 1),
-                )
-                for i in range(num_slices)
-            ]
-        )
-        # Bias init: softplus(2.0) ≈ 2.13 → rho starts moderately large,
-        # meaning the OT starts close to the balanced (hard-constraint) regime
-        # and can relax as training progresses.
-        for predictor in self.rho_predictors:
-            nn.init.zeros_(predictor[-1].weight)
-            nn.init.constant_(predictor[-1].bias, 2.0)
+        # Slice i sees hyper_prior (2*M) + i decoded slices (i * slice_ch)
+        # UPDATED: Conditional initialization for cleaner DDP graphs
+        if self.routing_mode == "unbalanced_eot":
+            self.rho_predictors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv2d(2 * M + i * self.slice_ch, 32, 1),
+                        nn.GELU(),
+                        nn.Conv2d(32, 1, 1),
+                    )
+                    for i in range(num_slices)
+                ]
+            )
+            # Bias init: softplus(2.0) ≈ 2.13 → rho starts moderately large,
+            # meaning the OT starts close to the balanced (hard-constraint) regime
+            # and can relax as training progresses.
+            for predictor in self.rho_predictors:
+                nn.init.zeros_(predictor[-1].weight)
+                nn.init.constant_(predictor[-1].bias, 2.0)
+        else:
+            self.rho_predictors = None
 
         # ── Bootstrap memory state ─────────────────────────────────────────
         self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=3, padding=1)
@@ -223,6 +227,14 @@ class WMDC(CompressionModel):
             nn.init.zeros_(transform[-1].weight)
             nn.init.zeros_(transform[-1].bias)
 
+        # Learnable softplus gating for Latent Residual Prediction (LRP)
+        self.lrp_scales = nn.ParameterList(
+            [
+                nn.Parameter(torch.zeros(1, self.slice_ch, 1, 1))
+                for _ in range(num_slices)
+            ]
+        )
+
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
@@ -243,7 +255,7 @@ class WMDC(CompressionModel):
 
     def _compute_rho_spatial(
         self, slice_idx: int, hyper_prior: torch.Tensor, decoded_slices: list
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """
         Compute spatially-varying KL mass-conservation strength ρ(x) for a
         given slice.  The predictor for slice i is conditioned on the global
@@ -260,6 +272,9 @@ class WMDC(CompressionModel):
         Returns:
             rho : (B, H, W)  strictly positive
         """
+        if getattr(self, "rho_predictors", None) is None:
+            return None
+
         if slice_idx == 0:
             context = hyper_prior
         else:
@@ -278,7 +293,7 @@ class WMDC(CompressionModel):
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
             raise ValueError(f"Input must be divisible by 64. Got {x.shape}")
 
-        # Clear per-slice attention storage (populated in eval mode below).
+        # Clear per-slice attention storage
         self.slice_attn_probs.clear()
 
         y = self.g_a(x)
@@ -319,8 +334,7 @@ class WMDC(CompressionModel):
             dict_info, disp_loss = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=True
             )
-            if self.routing_mode != "unbalanced_eot" and self.training:
-                disp_loss = disp_loss + 0.0 * rho_spatial.sum()
+
             total_dispersion = total_dispersion + disp_loss / self.num_slices
 
             if not self.training and self.eot_attentions[i].attn_probs is not None:
@@ -343,11 +357,11 @@ class WMDC(CompressionModel):
                 y_hat_for_lrp = y_hat_slice
 
             lrp_support = torch.cat([support, y_hat_for_lrp], dim=1)
-            y_hat_slice_lrp = y_hat_for_lrp + 0.5 * torch.tanh(
-                self.lrp_transforms[i](lrp_support)
-            )
 
-            # Append the LRP-corrected slice for downstream context and output.
+            residual = self.lrp_transforms[i](lrp_support)
+            lrp_gate = F.softplus(self.lrp_scales[i])
+            y_hat_slice_lrp = y_hat_for_lrp + lrp_gate * residual
+
             y_hat_slices.append(y_hat_slice_lrp)
             y_likelihood.append(y_slice_likelihood)
 
@@ -425,9 +439,11 @@ class WMDC(CompressionModel):
             )
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
-            y_hat_slice_lrp = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transforms[i](lrp_support)
-            )
+
+            residual = self.lrp_transforms[i](lrp_support)
+            lrp_gate = F.softplus(self.lrp_scales[i])
+            y_hat_slice_lrp = y_hat_slice + lrp_gate * residual
+
             y_hat_slices.append(y_hat_slice_lrp)
 
             if i < self.num_slices - 1:
@@ -484,9 +500,11 @@ class WMDC(CompressionModel):
             )
 
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
-            y_hat_slice_lrp = y_hat_slice + 0.5 * torch.tanh(
-                self.lrp_transforms[i](lrp_support)
-            )
+
+            residual = self.lrp_transforms[i](lrp_support)
+            lrp_gate = F.softplus(self.lrp_scales[i])
+            y_hat_slice_lrp = y_hat_slice + lrp_gate * residual
+
             y_hat_slices.append(y_hat_slice_lrp)
 
             if i < self.num_slices - 1:

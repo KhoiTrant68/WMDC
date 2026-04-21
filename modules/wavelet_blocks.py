@@ -330,7 +330,8 @@ class FrequencyDisentangledMamba(nn.Module):
         self.idwt = IDWT_2D(wave="bior4.4")
         self.dim = dim
 
-        self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
+        self.pre_mamba_proj = nn.Conv2d(dim * 4, dim, kernel_size=1)
+        self.mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
 
         def _make_film_predictor(in_dim: int, out_dim: int) -> nn.Sequential:
             net = nn.Sequential(
@@ -352,10 +353,7 @@ class FrequencyDisentangledMamba(nn.Module):
         )
 
     @staticmethod
-    def _apply_film(
-        x_hf: torch.Tensor,
-        gamma: torch.Tensor,
-    ) -> torch.Tensor:
+    def _apply_film(x_hf: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
         _SOFTPLUS_OFFSET = math.log(math.e - 1)  # ≈ 0.5413
         scale = F.softplus(gamma + _SOFTPLUS_OFFSET)
         return x_hf * scale
@@ -369,17 +367,19 @@ class FrequencyDisentangledMamba(nn.Module):
         x_hl = x_dwt[:, 2 * dim : 3 * dim]
         x_hh = x_dwt[:, 3 * dim :]
 
-        x_ll_out = self.ll_mamba(x_ll)
+        x_all = torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
+        mamba_in = self.pre_mamba_proj(x_all)
+        mamba_out = self.mamba(mamba_in)
 
-        gamma_lh = self.film_lh(x_ll_out)
-        gamma_hl = self.film_hl(x_ll_out)
-        gamma_hh = self.film_hh(x_ll_out)
+        gamma_lh = self.film_lh(mamba_out)
+        gamma_hl = self.film_hl(mamba_out)
+        gamma_hh = self.film_hh(mamba_out)
 
         x_lh_mod = self._apply_film(x_lh, gamma_lh)
         x_hl_mod = self._apply_film(x_hl, gamma_hl)
         x_hh_mod = self._apply_film(x_hh, gamma_hh)
 
-        merged = torch.cat([x_ll_out, x_lh_mod, x_hl_mod, x_hh_mod], dim=1)
+        merged = torch.cat([mamba_out, x_lh_mod, x_hl_mod, x_hh_mod], dim=1)
         fused = self.fusion(merged) + merged
         return self.idwt(fused)
 

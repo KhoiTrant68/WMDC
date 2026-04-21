@@ -132,7 +132,7 @@ class RateDistortionLoss(nn.Module):
 
         if self.metric == "mse":
             out["mse_loss"] = self.mse(output["x_hat"], target)
-            distortion = 255.0**2 * out["mse_loss"]
+            distortion = out["mse_loss"]
         else:
             out["ms_ssim_loss"] = 1 - ms_ssim(output["x_hat"], target, data_range=1.0)
             distortion = out["ms_ssim_loss"]
@@ -628,8 +628,13 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         if epoch >= args.epochs - args.last_epochs_with_ste:
             accelerator.unwrap_model(model).use_ste = True
-            if accelerator.is_main_process and epoch == args.epochs - args.last_epochs_with_ste:
-                print(f"Turning on STE for the last {args.last_epochs_with_ste} epochs.")
+            if (
+                accelerator.is_main_process
+                and epoch == args.epochs - args.last_epochs_with_ste
+            ):
+                print(
+                    f"Turning on STE for the last {args.last_epochs_with_ste} epochs."
+                )
         else:
             accelerator.unwrap_model(model).use_ste = False
         train_one_epoch(
