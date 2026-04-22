@@ -111,9 +111,11 @@ class UnifiedDictionaryAttention(nn.Module):
         self.iters = iters
         self.tv_weight = tv_weight
 
-        self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
-        self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
+        # Store base floats for fallback usage
+        self.tau_float = tau
+        self.ot_eps_float = ot_eps
 
+        # Safe truncated backprop threshold
         self.n_grad_iters = max(5, iters // 3)
         self.n_nograd_iters = max(0, iters - self.n_grad_iters)
 
@@ -121,6 +123,11 @@ class UnifiedDictionaryAttention(nn.Module):
         if routing_mode not in valid:
             raise ValueError(f"routing_mode must be one of {valid}")
         self.routing_mode = routing_mode
+
+        if self.routing_mode == "softmax":
+            self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
+        else:
+            self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
 
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
         self.out_proj = nn.Sequential(
@@ -206,12 +213,12 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.training and self.n_nograd_iters > 0:
             with torch.no_grad():
                 for _ in range(self.n_nograd_iters):
-                    # Column update first (Algorithm 1, Séjourné et al. 2019)
+                    # Column update first
                     log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
                     log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
 
         for _ in range(self.n_grad_iters if self.training else self.iters):
-            # Column update first (Algorithm 1, Séjourné et al. 2019)
+            # Column update first
             log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
             # Row update:
             log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
@@ -224,10 +231,8 @@ class UnifiedDictionaryAttention(nn.Module):
 
             warnings.warn("Sinkhorn diverged, falling back to softmax")
             return self._route_softmax(C_mat)
-
         # exp(-60) ≈ 1e-26, contributing negligibly to row sums.
-        P = torch.exp(log_P.clamp(min=-60.0))
-        return P
+        return torch.exp(log_P.clamp(min=-60.0))
 
     # -----------------------------------------------------------------------
     # KL-unbalanced Sinkhorn with spatially-varying ρ (log-domain)
@@ -237,7 +242,7 @@ class UnifiedDictionaryAttention(nn.Module):
         self, C_mat: torch.Tensor, rho_flat: torch.Tensor
     ) -> torch.Tensor:
         """
-        KL-unbalanced Sinkhorn OT (Séjourné et al. 2019, §3.2 and §4.7.2).
+        KL-unbalanced Sinkhorn OT
 
         Row marginal strength: per-pixel ρ_i  (spatially varying).
         Col marginal strength: mean(ρ) shared across all dictionary tokens.
@@ -300,7 +305,11 @@ class UnifiedDictionaryAttention(nn.Module):
     # -----------------------------------------------------------------------
 
     def _route_softmax(self, C_mat: torch.Tensor) -> torch.Tensor:
-        tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
+        # If called as fallback from Sinkhorn, log_tau won't exist. Use fixed tau.
+        if hasattr(self, "log_tau"):
+            tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
+        else:
+            tau = self.tau_float
         return F.softmax(-C_mat / tau, dim=-1)
 
     # -----------------------------------------------------------------------
@@ -354,10 +363,9 @@ class UnifiedDictionaryAttention(nn.Module):
             P = self._route_unbalanced_eot(C_mat, rho_flat)
             # Scale by HW as in the balanced case.  Row sums are NOT forced to
             # 1 here — unbalanced OT intentionally relaxes the row marginal
-            # constraint (Séjourné et al. §4.7.2).  Low-confidence pixels
-            # (no good dictionary match) yield row sums < 1, attenuating the
-            # aggregated feature (spatial gating).  High-affinity pixels may
-            # exceed 1.
+            # constraint. Low-confidence pixels (no good dictionary match)
+            # yield row sums < 1, attenuating the aggregated feature
+            # (spatial gating). High-affinity pixels may exceed 1.
             P = P * HW
 
             # Store raw row mass in eval mode for ablation analysis.
@@ -380,7 +388,7 @@ class UnifiedDictionaryAttention(nn.Module):
         else:
             self.attn_probs = None
 
-        # ── Spatial TV regularisation (optional, training only) ───────────────
+        # ── Spatial TV regularisation ─────────────────────────────────────────
         tv_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if self.training and self.tv_weight > 0.0:
             tv_loss = self._spatial_tv(P, H, W) * self.tv_weight
@@ -390,7 +398,7 @@ class UnifiedDictionaryAttention(nn.Module):
         # P: (B, HW, N)   v_norm: (B, N, dict_dim)
         out = torch.bmm(P, v_norm).transpose(1, 2).contiguous().view(B, -1, H, W)
 
-        # ── Dispersion loss (bits, training only) ─────────────────────────────
+        # ── Dispersion loss ───────────────────────────────────────────────────
         if calc_disp:
             disp_loss = self._dispersion_loss(P) + tv_loss
         else:

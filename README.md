@@ -1,6 +1,13 @@
 # WMDC
-## Installation
 
+**Wavelet-Mamba Dictionary Compression (WMDC)** is a state-of-the-art learned image compression model that combines wavelet transforms, Visual State Space (VSS) modules, and dictionary-based coding with entropic optimal transport. The model achieves superior rate-distortion performance through three key innovations:
+
+1. **Frequency-Disentangled Mamba (FDM)**: Efficiently captures long-range dependencies while preserving high-frequency details
+2. **Spatially-Adaptive EOT Dictionary Attention**: Dynamically adapts dictionary utilization using unbalanced optimal transport
+3. **Markovian Slice-Based Context Model**: Autoregressive entropy modeling with latent residual prediction
+
+## Installation
+    
 ### Prerequisites
 - Python 3.11
 - CUDA 11.8+ (for GPU support)
@@ -146,6 +153,29 @@ python analyze/visualize_patches.py \
 Rate-distortion plot:
 ```bash
 python plot_rd.py --checkpoint /path/to/checkpoint.pth --dataset /path/to/dataset
+```
+
+Profile model performance:
+```bash
+python analyze/profile_model.py \
+    --checkpoint /path/to/checkpoint.pth \
+    --input_size 256 \
+    --cuda
+```
+
+Analyze bit allocation:
+```bash
+python analyze/analysis_bit_allocation.py \
+    --checkpoint /path/to/checkpoint.pth \
+    --dataset /path/to/dataset \
+    --output bit_analysis_results
+```
+
+Plot bitrate-distortion latency:
+```bash
+python analyze/plot_bd_latency.py \
+    --results_dir /path/to/results \
+    --output bd_latency_plot.png
 ```
 
 ## Dataset Preparation
