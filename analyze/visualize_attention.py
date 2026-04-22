@@ -38,9 +38,10 @@ def main():
         "--mode",
         type=str,
         default="top_tokens",
-        choices=["top_tokens", "slice_evolution"],
-        help="'top_tokens' shows the 4 most active tokens for a single slice. "
-        "'slice_evolution' tracks a single token across all 5 slices.",
+        choices=["top_tokens", "slice_evolution", "spatial_gating"],
+        help="'top_tokens' shows the 4 most active tokens. "
+        "'slice_evolution' tracks a token across slices. "
+        "'spatial_gating' shows the row mass gating mechanism.",
     )
     parser.add_argument(
         "--slice",
@@ -217,6 +218,29 @@ def main():
                 ax_map.axis("off")
                 if row_idx == 0:
                     ax_map.set_title(f"Slice {s} (Token {target})", fontsize=14, pad=10)
+
+        # --- MODE 3: Spatial Gating ---
+        elif args.mode == "spatial_gating":
+            for s in range(5):
+                # Fetch row mass directly from the attention block
+                row_mass = model.eot_attentions[s].last_row_mass.cpu()  # (1, HW)
+                row_mass = row_mass.view(1, 1, latent_h, latent_w)
+
+                mass_resized = F.interpolate(
+                    row_mass,
+                    size=(padded_h, padded_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                mass_np = mass_resized[:, :, :H, :W].squeeze().numpy()
+
+                ax_map = axes[row_idx][s + 1]
+                ax_map.imshow(orig_np)
+                # 'magma' colormap emphasizes intensity variations well
+                ax_map.imshow(mass_np, cmap="magma", alpha=0.7, vmin=0.0)
+                ax_map.axis("off")
+                if row_idx == 0:
+                    ax_map.set_title(f"Slice {s} Mass", fontsize=14, pad=10)
 
     fig.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)
     plt.close(fig)

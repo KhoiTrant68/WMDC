@@ -63,8 +63,15 @@ def measure_convergence(model, x_padded, max_iters: int, device: str):
     # Temporarily swap iters inside the module. Access eot_attentions[0]
     original_iters = model.eot_attentions[0].iters
 
+    # Calculate effective epsilon dynamically based on learned log_eps
+    eps_val = F.softplus(model.eot_attentions[0].log_eps).item() + 0.01
+
     for n_iters in iter_counts:
         model.eot_attentions[0].iters = n_iters
+        # Make sure gradient iterations adjust alongside max_iters for testing
+        model.eot_attentions[0].n_grad_iters = n_iters
+        model.eot_attentions[0].n_nograd_iters = 0
+
         with torch.no_grad():
             P = model.eot_attentions[0]._route_unbalanced_eot(C_mat, rho_flat)
 
@@ -93,12 +100,8 @@ def measure_convergence(model, x_padded, max_iters: int, device: str):
             # Spatial Rho applies to rows per-pixel, uniform epsilon to cols
             rho_penalty = (rho_flat * kl_row_per_pixel).sum(dim=1)  # (B)
 
-            # Total Unbalanced Primal Objective
-            total_cost = (
-                (transport_cost + rho_penalty + model.eot_attentions[0].ot_eps * kl_col)
-                .mean()
-                .item()
-            )
+            # Total Unbalanced Primal Objective (using dynamic eps_val)
+            total_cost = (transport_cost + rho_penalty + eps_val * kl_col).mean().item()
 
         costs.append(total_cost)
 
