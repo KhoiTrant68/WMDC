@@ -307,14 +307,22 @@ class GatedMemoryUpdater(nn.Module):
         )
         self.mamba_context = VSSBlock(hidden_dim=slice_ch, drop_path=0.1)
 
-        self.gate_proj = nn.Conv2d(slice_ch, slice_ch * 2, kernel_size=3, padding=1)
+        # Separate delta and gate projections with asymmetric initialization
+        self.delta_proj = nn.Conv2d(slice_ch, slice_ch, kernel_size=3, padding=1)
+        self.gate_proj = nn.Conv2d(slice_ch, slice_ch, kernel_size=3, padding=1)
+
+        nn.init.zeros_(self.delta_proj.weight)
+        nn.init.zeros_(self.delta_proj.bias)
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
+        # Gate starts nearly closed (-2.0) giving a robust gradient signal compared to 0
+        nn.init.constant_(self.gate_proj.bias, -2.0)
 
     def forward(self, memory: torch.Tensor, new_info: torch.Tensor) -> torch.Tensor:
         x = self.fuse(torch.cat([memory, new_info], dim=1))
         context = self.mamba_context(x)
-        delta, gate = self.gate_proj(context).chunk(2, dim=1)
+
+        delta = self.delta_proj(context)
+        gate = self.gate_proj(context)
         return memory + delta * torch.sigmoid(gate)
 
 
@@ -330,22 +338,33 @@ class FrequencyDisentangledMamba(nn.Module):
         self.idwt = IDWT_2D(wave="bior4.4")
         self.dim = dim
 
-        self.pre_mamba_proj = nn.Conv2d(dim * 4, dim, kernel_size=1)
-        self.mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
+        # 1. Main path for the LL band (preserves Wavelet structural physics)
+        self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
 
-        def _make_film_predictor(in_dim: int, out_dim: int) -> nn.Sequential:
+        # 2. Context path (sees all frequencies to build modulation context)
+        self.pre_context_proj = nn.Conv2d(dim * 4, dim, kernel_size=1)
+        self.context_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
+
+        # Create Affine FiLM predictors (Scale + Shift)
+        def _make_affine_film_predictor(in_dim: int, out_dim: int) -> nn.Sequential:
             net = nn.Sequential(
                 nn.Conv2d(in_dim, in_dim * 2, kernel_size=3, padding=1),
                 nn.GELU(),
-                nn.Conv2d(in_dim * 2, out_dim, kernel_size=1),
+                nn.Conv2d(
+                    in_dim * 2, out_dim * 2, kernel_size=1
+                ),  # x2 for scale & shift
             )
             nn.init.zeros_(net[-1].weight)
-            nn.init.zeros_(net[-1].bias)
+            # Scale init to 1 (softplus offset), Shift init to 0
+            nn.init.constant_(net[-1].bias[:out_dim], math.log(math.e - 1))
+            nn.init.zeros_(net[-1].bias[out_dim:])
             return net
 
-        self.film_lh = _make_film_predictor(dim, dim)
-        self.film_hl = _make_film_predictor(dim, dim)
-        self.film_hh = _make_film_predictor(dim, dim)
+        # Added LL modulation
+        self.film_ll = _make_affine_film_predictor(dim, dim)
+        self.film_lh = _make_affine_film_predictor(dim, dim)
+        self.film_hl = _make_affine_film_predictor(dim, dim)
+        self.film_hh = _make_affine_film_predictor(dim, dim)
 
         self.fusion = nn.Sequential(
             nn.Conv2d(dim * 4, dim * 4, kernel_size=3, padding=1, groups=dim * 4),
@@ -353,10 +372,14 @@ class FrequencyDisentangledMamba(nn.Module):
         )
 
     @staticmethod
-    def _apply_film(x_hf: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
-        _SOFTPLUS_OFFSET = math.log(math.e - 1)  # ≈ 0.5413
+    def _apply_affine_film(
+        x_target: torch.Tensor, params: torch.Tensor
+    ) -> torch.Tensor:
+        C = x_target.shape[1]
+        gamma, beta = params[:, :C], params[:, C:]
+        _SOFTPLUS_OFFSET = math.log(math.e - 1)
         scale = F.softplus(gamma + _SOFTPLUS_OFFSET)
-        return x_hf * scale
+        return x_target * scale + beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dim = self.dim
@@ -367,19 +390,27 @@ class FrequencyDisentangledMamba(nn.Module):
         x_hl = x_dwt[:, 2 * dim : 3 * dim]
         x_hh = x_dwt[:, 3 * dim :]
 
-        x_all = torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
-        mamba_in = self.pre_mamba_proj(x_all)
-        mamba_out = self.mamba(mamba_in)
+        # 1. Process the main low-frequency structure
+        x_ll_out = self.ll_mamba(x_ll)
 
-        gamma_lh = self.film_lh(mamba_out)
-        gamma_hl = self.film_hl(mamba_out)
-        gamma_hh = self.film_hh(mamba_out)
+        # 2. Build global context from ALL bands (using processed LL and raw HF)
+        x_all = torch.cat([x_ll_out, x_lh, x_hl, x_hh], dim=1)
+        mamba_context = self.context_mamba(self.pre_context_proj(x_all))
 
-        x_lh_mod = self._apply_film(x_lh, gamma_lh)
-        x_hl_mod = self._apply_film(x_hl, gamma_hl)
-        x_hh_mod = self._apply_film(x_hh, gamma_hh)
+        # 3. Use the global context to predict Affine modulation parameters
+        gamma_ll = self.film_ll(mamba_context)
+        gamma_lh = self.film_lh(mamba_context)
+        gamma_hl = self.film_hl(mamba_context)
+        gamma_hh = self.film_hh(mamba_context)
 
-        merged = torch.cat([mamba_out, x_lh_mod, x_hl_mod, x_hh_mod], dim=1)
+        # 4. Modulate all subbands
+        x_ll_mod = self._apply_affine_film(x_ll_out, gamma_ll)
+        x_lh_mod = self._apply_affine_film(x_lh, gamma_lh)
+        x_hl_mod = self._apply_affine_film(x_hl, gamma_hl)
+        x_hh_mod = self._apply_affine_film(x_hh, gamma_hh)
+
+        # 5. Final fusion and synthesis
+        merged = torch.cat([x_ll_mod, x_lh_mod, x_hl_mod, x_hh_mod], dim=1)
         fused = self.fusion(merged) + merged
         return self.idwt(fused)
 

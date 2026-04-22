@@ -56,7 +56,9 @@ class QueryDictionaryGenerator(nn.Module):
         queries = self.dict_queries.expand(B, -1, -1)  # (B, N, C)
         attn_out, _ = self.cross_attn(query=queries, key=context, value=context)
         out = self.norm(queries + attn_out)
-        return self.proj(out)  # (B, N, dict_dim)
+
+        projected = self.proj(out)  # (B, N, dict_dim)
+        return F.normalize(projected, p=2, dim=-1) * math.sqrt(self.dict_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +108,14 @@ class UnifiedDictionaryAttention(nn.Module):
         super().__init__()
         self.dict_num = dict_num
         self.dict_dim = dict_dim
-        self.tau = tau
-        self.ot_eps = ot_eps
         self.iters = iters
         self.tv_weight = tv_weight
+
+        self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
+        self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
+
+        self.n_grad_iters = max(5, iters // 3)
+        self.n_nograd_iters = max(0, iters - self.n_grad_iters)
 
         valid = {"softmax", "balanced_eot", "unbalanced_eot"}
         if routing_mode not in valid:
@@ -186,13 +192,9 @@ class UnifiedDictionaryAttention(nn.Module):
         Iteration order follows Algorithm 1 of Séjourné et al. 2019:
         column potential (g) is updated first, then row potential (f).
         This is correct — the paper initialises f=0 and runs g first.
-
-        Truncated backprop: the first (iters - 5) iterations run under
-        torch.no_grad() to reduce peak memory; gradients flow through
-        the last 5 iterations only.
         """
         B, HW, N = C_mat.shape
-        eps = self.ot_eps
+        eps = F.softplus(self.log_eps) + 0.01
         log_a = -math.log(HW)  # log of uniform row marginal
         log_b = -math.log(N)  # log of uniform col marginal
 
@@ -201,24 +203,27 @@ class UnifiedDictionaryAttention(nn.Module):
         log_f = C_mat.new_zeros(B, HW, 1)  # (B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)  # (B,  1, N)
 
-        # Truncated backpropagation to prevent OOM / unstable gradients
-        n_grad_iters = 5
-        n_nograd_iters = max(0, self.iters - n_grad_iters)
-
-        if self.training and n_nograd_iters > 0:
+        if self.training and self.n_nograd_iters > 0:
             with torch.no_grad():
-                for _ in range(n_nograd_iters):
+                for _ in range(self.n_nograd_iters):
                     # Column update first (Algorithm 1, Séjourné et al. 2019)
                     log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
                     log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
 
-        for _ in range(n_grad_iters if self.training else self.iters):
+        for _ in range(self.n_grad_iters if self.training else self.iters):
             # Column update first (Algorithm 1, Séjourné et al. 2019)
             log_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
             # Row update:
             log_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
 
         log_P = log_f + log_g - M  # (B, HW, N)
+
+        # NaN Safeguard
+        if self.training and torch.isnan(log_P).any():
+            import warnings
+
+            warnings.warn("Sinkhorn diverged, falling back to softmax")
+            return self._route_softmax(C_mat)
 
         # exp(-60) ≈ 1e-26, contributing negligibly to row sums.
         P = torch.exp(log_P.clamp(min=-60.0))
@@ -244,7 +249,7 @@ class UnifiedDictionaryAttention(nn.Module):
         row (f) update.  Truncated backprop as in the balanced path.
         """
         B, HW, N = C_mat.shape
-        eps = self.ot_eps
+        eps = F.softplus(self.log_eps) + 0.01
         log_a = -math.log(HW)
         log_b = -math.log(N)
 
@@ -256,33 +261,37 @@ class UnifiedDictionaryAttention(nn.Module):
         shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
 
         # Shared column shrinkage from mean row strength.
-        rho_mean = rho_flat.mean(dim=1, keepdim=True)  # (B, 1)
+        rho_mean = rho_flat.mean(dim=1, keepdim=True).detach()  # (B, 1)
         shrink_col = (rho_mean / (rho_mean + eps)).unsqueeze(2)  # (B, 1, 1)
 
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
-        # Truncated backpropagation
-        n_grad_iters = 5
-        n_nograd_iters = max(0, self.iters - n_grad_iters)
-
-        if self.training and n_nograd_iters > 0:
+        if self.training and self.n_nograd_iters > 0:
             with torch.no_grad():
-                for _ in range(n_nograd_iters):
-                    # Column update first (Algorithm 1, Séjourné et al. 2019)
+                for _ in range(self.n_nograd_iters):
+                    # Column update first
                     raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
                     log_g = shrink_col * raw_g
                     raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
                     log_f = shrink_row * raw_f
 
-        for _ in range(n_grad_iters if self.training else self.iters):
-            # Column update first (Algorithm 1, Séjourné et al. 2019)
+        for _ in range(self.n_grad_iters if self.training else self.iters):
+            # Column update first
             raw_g = log_b - torch.logsumexp(log_f - M, dim=1, keepdim=True)
             log_g = shrink_col * raw_g
             raw_f = log_a - torch.logsumexp(log_g - M, dim=2, keepdim=True)
             log_f = shrink_row * raw_f
 
         log_P = log_f + log_g - M  # (B, HW, N)
+
+        # NaN Safeguard
+        if self.training and torch.isnan(log_P).any():
+            import warnings
+
+            warnings.warn("Sinkhorn diverged, falling back to softmax")
+            return self._route_softmax(C_mat)
+
         P = torch.exp(log_P.clamp(min=-60.0))
         return P
 
@@ -291,7 +300,8 @@ class UnifiedDictionaryAttention(nn.Module):
     # -----------------------------------------------------------------------
 
     def _route_softmax(self, C_mat: torch.Tensor) -> torch.Tensor:
-        return F.softmax(-C_mat / self.tau, dim=-1)
+        tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
+        return F.softmax(-C_mat / tau, dim=-1)
 
     # -----------------------------------------------------------------------
     # Dispersion loss  (returns −H in BITS)
@@ -347,8 +357,7 @@ class UnifiedDictionaryAttention(nn.Module):
             # constraint (Séjourné et al. §4.7.2).  Low-confidence pixels
             # (no good dictionary match) yield row sums < 1, attenuating the
             # aggregated feature (spatial gating).  High-affinity pixels may
-            # exceed 1.  The GroupNorm in out_proj stabilises the resulting
-            # magnitude variation before the final projection.
+            # exceed 1.
             P = P * HW
 
             # Store raw row mass in eval mode for ablation analysis.
@@ -377,8 +386,9 @@ class UnifiedDictionaryAttention(nn.Module):
             tv_loss = self._spatial_tv(P, H, W) * self.tv_weight
 
         # ── Value aggregation ─────────────────────────────────────────────────
-        # P: (B, HW, N)   v: (B, N, dict_dim)
-        out = torch.bmm(P, v).transpose(1, 2).contiguous().view(B, -1, H, W)
+        v_norm = F.normalize(v, p=2, dim=-1) * math.sqrt(self.dict_dim)
+        # P: (B, HW, N)   v_norm: (B, N, dict_dim)
+        out = torch.bmm(P, v_norm).transpose(1, 2).contiguous().view(B, -1, H, W)
 
         # ── Dispersion loss (bits, training only) ─────────────────────────────
         if calc_disp:

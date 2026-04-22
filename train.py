@@ -132,7 +132,7 @@ class RateDistortionLoss(nn.Module):
 
         if self.metric == "mse":
             out["mse_loss"] = self.mse(output["x_hat"], target)
-            distortion = out["mse_loss"]
+            distortion = 255.0**2 * out["mse_loss"]
         else:
             out["ms_ssim_loss"] = 1 - ms_ssim(output["x_hat"], target, data_range=1.0)
             distortion = out["ms_ssim_loss"]
@@ -166,7 +166,9 @@ class RateDistortionLoss(nn.Module):
                 ema_bpp_hat = self.ema_bpp / bc
                 ema_disp_hat = self.ema_disp / bc
 
-                scale = (ema_bpp_hat / (ema_disp_hat + 1e-8)).clamp(0.01, 10.0)
+                # Clamp ratio conservatively to max 2.0 to prevent dispersion
+                # overriding BPP loss at low bitrates.
+                scale = (ema_bpp_hat / (ema_disp_hat + 1e-8)).clamp(0.01, 2.0)
                 effective = float(self.disp_weight * scale.item())
                 self.effective_disp_coeff = effective
             else:
@@ -262,7 +264,6 @@ def train_one_epoch(
 
         pbar.set_postfix(
             rd=f"{rd_meter.avg:.4f}",
-            # aux=f"{aux_meter.avg:.5f}",
             bpp=f"{bpp_meter.avg:.4f}",
             H=f"{disp_meter.avg:.3f}",
         )
@@ -300,19 +301,21 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
     """
     d = batch.to(device).float()
 
+    # Always eval to disable dropout masking disparities
+    model.eval()
+    model.use_ste = True
+
     with torch.no_grad():
         # Rebuild entropy tables BEFORE codec calls.
         model.update(force=True)
 
-        # Forward pass (noise relaxation)
-        model.train()
+        # Forward pass with STE (mimicking hard quantisation)
         out_fwd = model(d)
         x_hat_fwd = out_fwd["x_hat"].clamp(0, 1)
         mse_fwd = F.mse_loss(d, x_hat_fwd)
         psnr_fwd = -10.0 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
 
-        # Compress / decompress (hard quantisation)
-        model.eval()
+        # Compress / decompress (true hard quantisation)
         _sync()
         out_enc = model.compress(d)
         _sync()
@@ -321,6 +324,7 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
         mse_dec = F.mse_loss(d, x_hat_dec)
         psnr_dec = -10.0 * math.log10(mse_dec.item()) if mse_dec.item() > 0 else 100.0
 
+    model.use_ste = False
     model.train()
     return psnr_fwd - psnr_dec
 
@@ -355,60 +359,62 @@ def test_epoch(
     if gap_check:
         accelerator.unwrap_model(model).update(force=True)
 
-    with torch.no_grad():
-        for i, d in tqdm(
-            enumerate(test_dataloader),
-            total=len(test_dataloader),
-            desc=f"Val Epoch {epoch}",
-            disable=not accelerator.is_local_main_process,
-        ):
-            out_net = model(d)
-            out_criterion = criterion(out_net, d)
-            x_hat = out_net["x_hat"].clamp_(0, 1)
+    # Use try-finally to ensure criterion restores correctly
+    try:
+        with torch.no_grad():
+            for i, d in tqdm(
+                enumerate(test_dataloader),
+                total=len(test_dataloader),
+                desc=f"Val Epoch {epoch}",
+                disable=not accelerator.is_local_main_process,
+            ):
+                out_net = model(d)
+                out_criterion = criterion(out_net, d)
+                x_hat = out_net["x_hat"].clamp_(0, 1)
 
-            if i == 0 and accelerator.is_main_process and writer is not None:
-                n = min(d.size(0), 4)
-                cmp = torch.cat([d[:n], x_hat[:n]])
-                grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
-                writer.add_image("Val/Reconstruction", grid, epoch)
+                if i == 0 and accelerator.is_main_process and writer is not None:
+                    n = min(d.size(0), 4)
+                    cmp = torch.cat([d[:n], x_hat[:n]])
+                    grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
+                    writer.add_image("Val/Reconstruction", grid, epoch)
 
-            mse_val = F.mse_loss(x_hat, d)
-            psnr_val = (
-                -10.0 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
-            )
-            bpp_val = out_criterion["bpp_loss"].item()
-            loss_val = out_criterion["loss"].item()
+                mse_val = F.mse_loss(x_hat, d)
+                psnr_val = (
+                    -10.0 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
+                )
+                bpp_val = out_criterion["bpp_loss"].item()
+                loss_val = out_criterion["loss"].item()
 
-            if "dispersion_bonus" in out_criterion:
-                disp_meter.update(out_criterion["dispersion_bonus"].item(), d.size(0))
+                if "dispersion_bonus" in out_criterion:
+                    disp_meter.update(
+                        out_criterion["dispersion_bonus"].item(), d.size(0)
+                    )
 
-            local = torch.tensor(
-                [psnr_val, bpp_val, loss_val], device=accelerator.device
-            )
-            local_batch = local.unsqueeze(0).repeat(d.size(0), 1)
-            gathered = accelerator.gather_for_metrics(local_batch)
+                local = torch.tensor(
+                    [psnr_val, bpp_val, loss_val], device=accelerator.device
+                )
+                local_batch = local.unsqueeze(0).repeat(d.size(0), 1)
+                gathered = accelerator.gather_for_metrics(local_batch)
 
-            psnr_meter.update(gathered[:, 0].mean().item(), gathered.size(0))
-            bpp_meter.update(gathered[:, 1].mean().item(), gathered.size(0))
-            loss_meter.update(gathered[:, 2].mean().item(), gathered.size(0))
+                psnr_meter.update(gathered[:, 0].mean().item(), gathered.size(0))
+                bpp_meter.update(gathered[:, 1].mean().item(), gathered.size(0))
+                loss_meter.update(gathered[:, 2].mean().item(), gathered.size(0))
 
-    criterion.train()
+        if gap_check and accelerator.is_main_process:
+            try:
+                # Safely use the last processed batch to avoid breaking DDP samplers
+                sample = d[:1]
+                gap_psnr = measure_train_inference_gap(
+                    accelerator.unwrap_model(model),
+                    sample,
+                    device=str(accelerator.device),
+                )
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Gap check failed: {e}")
 
-    if gap_check and accelerator.is_main_process:
-        try:
-            # Safely use the last processed batch to avoid breaking DDP samplers
-            sample = d[:1]
-            gap_psnr = measure_train_inference_gap(
-                accelerator.unwrap_model(model),
-                sample,
-                device=str(accelerator.device),
-            )
-        except Exception as e:
-            if logger:
-                logger.warning(f"Gap check failed: {e}")
-        finally:
-            accelerator.unwrap_model(model).train()
-            model.train()
+    finally:
+        criterion.train()
 
     if accelerator.is_main_process:
         gap_str = (

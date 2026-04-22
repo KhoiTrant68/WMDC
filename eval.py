@@ -62,9 +62,12 @@ def _sync(device: str):
 # ---------------------------------------------------------------------------
 
 
-def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
+def compute_util_from_saved(
+    all_probs: list, all_row_masses: list, shape: tuple, dict_num: int
+) -> dict:
     """
-    Run a single forward pass and extract per-slice utilisation metrics.
+    Compute per-slice utilisation metrics from saved attention maps.
+    FIX A1: Avoids redundant compress() calls by taking cloned tensors.
 
     Returns a dict with:
       - 'per_slice_utilisation_pct': list[float], one per slice
@@ -74,41 +77,27 @@ def measure_dict_utilisation(model, x: torch.Tensor, device: str) -> dict:
       - 'entropy_maps'             : list of (H_lat, W_lat) float tensors (local H)
       - 'row_mass_maps'            : list of (H_lat, W_lat) float tensors (unbalanced only)
     """
-    x_pad, _, _ = pad_image(x.to(device).float(), p=64)
-
-    model.eval()
-    with torch.no_grad():
-        out_enc = model.compress(x_pad)  # populates model.slice_attn_probs
-
-    # Retrieve all-slice attention from the model.
-    all_probs = model.slice_attn_probs  # list of (1, HW, N)
     if not all_probs:
         return {
             "error": "No attention maps collected. Check routing_mode != 'softmax'."
         }
 
     # Infer spatial dims from z shape.
-    H_lat = out_enc["shape"][0]
-    W_lat = out_enc["shape"][1]
+    H_lat = shape[0]
+    W_lat = shape[1]
     # latent y is 4× the z spatial dims (h_a applies 4× downsampling overall)
     H_lat_y = H_lat * 4
     W_lat_y = W_lat * 4
 
-    max_ent = math.log2(model.dict_num)
+    max_ent = math.log2(dict_num)
 
     per_slice_util: list[float] = []
     assignment_maps: list = []
     entropy_maps: list = []
     row_mass_maps: list = []
 
-    # Collect per-slice row mass maps if available (unbalanced mode).
-    all_row_masses = []
-    for attn in model.eot_attentions:
-        rm = getattr(attn, "last_row_mass", None)
-        all_row_masses.append(rm)
-
     for s_idx, P in enumerate(all_probs):
-        # P: (1, HW, N)  — already detached
+        # P: (1, HW, N)  — already detached and cloned
         B, HW, N = P.shape
 
         # Column marginal → utilisation entropy in BITS
@@ -255,6 +244,14 @@ def main():
             _sync(device)
             t0 = time.time()
             out_enc = model.compress(x_pad)
+
+            # Save attention maps and row masses immediately after compression
+            saved_attn_probs = [p.clone() for p in model.slice_attn_probs]
+            saved_row_masses = []
+            for a in model.eot_attentions:
+                rm = getattr(a, "last_row_mass", None)
+                saved_row_masses.append(rm.clone() if rm is not None else None)
+
             _sync(device)
             enc_time = time.time() - t0
 
@@ -304,48 +301,55 @@ def main():
             }
 
             if args.measure_dict_util:
-                util = measure_dict_utilisation(model, x, device)
-                row["per_slice_utilisation_pct"] = [
-                    round(v, 2) for v in util["per_slice_utilisation_pct"]
-                ]
-                row["mean_utilisation_pct"] = round(util["mean_utilisation_pct"], 2)
-                per_slice_util_all.append(util["per_slice_utilisation_pct"])
+                # Pass the saved maps to avoid redundant forward/compress calls
+                util = compute_util_from_saved(
+                    saved_attn_probs, saved_row_masses, out_enc["shape"], model.dict_num
+                )
 
-                if args.save_attn_maps:
-                    stem = os.path.splitext(os.path.basename(img_path))[0]
-                    for s_idx, (amap, emap, rmap) in enumerate(
-                        zip(
-                            util["assignment_maps"],
-                            util["entropy_maps"],
-                            util["row_mass_maps"],
-                        )
-                    ):
-                        if amap is not None:
-                            torch.save(
-                                amap,
-                                os.path.join(
-                                    attn_dir, f"{stem}_slice{s_idx}_assign.pt"
-                                ),
+                if "error" not in util:
+                    row["per_slice_utilisation_pct"] = [
+                        round(v, 2) for v in util["per_slice_utilisation_pct"]
+                    ]
+                    row["mean_utilisation_pct"] = round(util["mean_utilisation_pct"], 2)
+                    per_slice_util_all.append(util["per_slice_utilisation_pct"])
+
+                    if args.save_attn_maps:
+                        stem = os.path.splitext(os.path.basename(img_path))[0]
+                        for s_idx, (amap, emap, rmap) in enumerate(
+                            zip(
+                                util["assignment_maps"],
+                                util["entropy_maps"],
+                                util["row_mass_maps"],
                             )
-                        if emap is not None:
-                            torch.save(
-                                emap,
-                                os.path.join(
-                                    attn_dir, f"{stem}_slice{s_idx}_entropy.pt"
-                                ),
-                            )
-                        if rmap is not None:
-                            torch.save(
-                                rmap,
-                                os.path.join(
-                                    attn_dir, f"{stem}_slice{s_idx}_rowmass.pt"
-                                ),
-                            )
+                        ):
+                            if amap is not None:
+                                torch.save(
+                                    amap,
+                                    os.path.join(
+                                        attn_dir, f"{stem}_slice{s_idx}_assign.pt"
+                                    ),
+                                )
+                            if emap is not None:
+                                torch.save(
+                                    emap,
+                                    os.path.join(
+                                        attn_dir, f"{stem}_slice{s_idx}_entropy.pt"
+                                    ),
+                                )
+                            if rmap is not None:
+                                torch.save(
+                                    rmap,
+                                    os.path.join(
+                                        attn_dir, f"{stem}_slice{s_idx}_rowmass.pt"
+                                    ),
+                                )
+                else:
+                    print(f"Warning: {util['error']}")
 
             per_image.append(row)
 
             util_str = ""
-            if args.measure_dict_util:
+            if args.measure_dict_util and "mean_utilisation_pct" in row:
                 slices = row["per_slice_utilisation_pct"]
                 util_str = (
                     f" | Util: ["

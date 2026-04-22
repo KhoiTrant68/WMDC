@@ -132,12 +132,9 @@ class WMDC(CompressionModel):
                     for i in range(num_slices)
                 ]
             )
-            # Bias init: softplus(2.0) ≈ 2.13 → rho starts moderately large,
-            # meaning the OT starts close to the balanced (hard-constraint) regime
-            # and can relax as training progresses.
             for predictor in self.rho_predictors:
                 nn.init.zeros_(predictor[-1].weight)
-                nn.init.constant_(predictor[-1].bias, 2.0)
+                nn.init.constant_(predictor[-1].bias, 0.5)
         else:
             self.rho_predictors = None
 
@@ -230,7 +227,7 @@ class WMDC(CompressionModel):
         # Learnable softplus gating for Latent Residual Prediction (LRP)
         self.lrp_scales = nn.ParameterList(
             [
-                nn.Parameter(torch.zeros(1, self.slice_ch, 1, 1))
+                nn.Parameter(torch.full((1, self.slice_ch, 1, 1), -2.25))
                 for _ in range(num_slices)
             ]
         )
@@ -332,7 +329,7 @@ class WMDC(CompressionModel):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, disp_loss = self.eot_attentions[i](
-                query, k_dict, v_dict, rho_spatial, calc_disp=True
+                query, k_dict, v_dict, rho_spatial, calc_disp=self.training
             )
 
             total_dispersion = total_dispersion + disp_loss / self.num_slices
