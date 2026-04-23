@@ -23,48 +23,39 @@ def main():
     parser = argparse.ArgumentParser(
         description="Visualize EOT Attention Maps (Scientifically Rigorous)"
     )
+
     parser.add_argument(
         "--routing_mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],
     )
+
     parser.add_argument("-d", "--img_dir", type=str, required=True)
     parser.add_argument("-c", "--checkpoint", type=str, required=True)
-    parser.add_argument("-o", "--output", type=str, default="hdda_attention_maps.pdf")
+    parser.add_argument("-o", "--output", type=str, default="attention_maps.pdf")
 
-    # Visualization Modes
     parser.add_argument(
         "--mode",
         type=str,
         default="top_tokens",
-        choices=["top_tokens", "slice_evolution", "spatial_gating"],
-        help="'top_tokens' shows the 4 most active tokens. "
-        "'slice_evolution' tracks a token across slices. "
-        "'spatial_gating' shows the row mass gating mechanism.",
-    )
-    parser.add_argument(
-        "--slice",
-        type=int,
-        default=0,
-        help="Which autoregressive slice to visualise (0-4). Used only in 'top_tokens' mode.",
-    )
-    parser.add_argument(
-        "--target_token",
-        type=int,
-        default=0,
-        help="Specific token to track. Used only in 'slice_evolution' mode.",
+        choices=["top_tokens", "slice_evolution", "spatial_gating", "entropy_map"],
     )
 
-    # Model Hparams
+    parser.add_argument("--slice", type=int, default=0)
+    parser.add_argument("--target_token", type=int, default=0)
+    parser.add_argument("--top_k", type=int, default=4)
+
     parser.add_argument("--ot-eps", type=float, default=0.1)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
+
     parser.add_argument("--cuda", action="store_true")
+
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    # 1. Initialize Model
+    # Model
     model = WMDC(
         N=192,
         M=320,
@@ -74,29 +65,29 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
     ).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
 
-    # 2. Discover Images
+    # Load images
     img_files = sorted(
-        f
-        for f in os.listdir(args.img_dir)
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    )[
-        :4
-    ]  # Limit to 4 images for a clean figure
+        [
+            f
+            for f in os.listdir(args.img_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
+    )[:4]
 
     if not img_files:
-        raise RuntimeError(f"No images found in {args.img_dir}")
+        raise RuntimeError("No images found")
 
     num_images = len(img_files)
 
-    # Determine columns based on mode
+    # Determine columns
     if args.mode == "top_tokens":
-        num_cols = 1 + 4  # Original + 4 Top Tokens
+        num_cols = 1 + args.top_k
     else:
-        num_cols = 1 + 5  # Original + 5 Slices
+        num_cols = 1 + model.num_slices
 
     fig, axes = plt.subplots(
         nrows=num_images,
@@ -104,126 +95,116 @@ def main():
         figsize=(4 * num_cols, 3 * num_images),
     )
 
-    # Standardize axes array structure
-    if num_images == 1 and num_cols == 1:
-        axes = [[axes]]
-    elif num_images == 1:
+    if num_images == 1:
         axes = [axes]
-    elif num_cols == 1:
-        axes = [[ax] for ax in axes]
 
     plt.subplots_adjust(wspace=0.05, hspace=0.05)
 
     for row_idx, img_name in enumerate(img_files):
-        print(f"Processing {img_name}...")
+        print(f"Processing {img_name}")
 
         img_path = os.path.join(args.img_dir, img_name)
         img = Image.open(img_path).convert("RGB")
+
         x = transforms.ToTensor()(img).unsqueeze(0).to(device)
 
-        # Pad to multiple of 64
-        H, W = x.size(2), x.size(3)
+        H, W = x.shape[2:]
         pad_h = (64 - H % 64) % 64
         pad_w = (64 - W % 64) % 64
+
         x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
 
-        # Forward pass
         with torch.no_grad():
             _ = model(x_padded)
 
-        # The WMDC model natively stores the attention maps in eval mode!
-        # Access them directly (Shape: [B, HW, N])
         attn_maps = [p.cpu() for p in model.slice_attn_probs]
 
-        padded_h, padded_w = x_padded.size(2), x_padded.size(3)
-        latent_h, latent_w = (
-            padded_h // 16,
-            padded_w // 16,
-        )  # 4 stride-2 downsamples
+        padded_h, padded_w = x_padded.shape[2:]
+        latent_h, latent_w = padded_h // 16, padded_w // 16
 
-        # Plot original image in column 0
         orig_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+
         ax_img = axes[row_idx][0]
         ax_img.imshow(orig_np)
         ax_img.axis("off")
         if row_idx == 0:
-            ax_img.set_title("Input Image", fontsize=16, pad=10)
+            ax_img.set_title("Input", fontsize=14)
 
-        # --- MODE 1: Top Tokens ---
+        # =========================
+        # MODE 1: TOP TOKENS
+        # =========================
         if args.mode == "top_tokens":
-            probs = attn_maps[args.slice].squeeze(0)  # (HW, N)
-            probs = probs.view(latent_h, latent_w, probs.size(-1))
+            probs = attn_maps[args.slice].squeeze(0)
+            probs = probs.view(latent_h, latent_w, -1)
 
-            # Dynamically find the top 4 most utilized tokens
             token_usage = probs.sum(dim=(0, 1))
-            top_tokens = torch.topk(token_usage, k=4).indices.tolist()
-            print(f"  Top 4 tokens for {img_name} (Slice {args.slice}): {top_tokens}")
+            top_tokens = torch.topk(token_usage, k=args.top_k).indices.tolist()
 
-            # Find global maximum probability for these specific tokens
-            # to normalize the colormap scientifically.
-            global_max_prob = max([probs[:, :, t].max().item() for t in top_tokens])
+            global_max = max([probs[:, :, t].max().item() for t in top_tokens])
 
-            for col_idx, dict_idx in enumerate(top_tokens):
-                attn_map = (
-                    probs[:, :, dict_idx].unsqueeze(0).unsqueeze(0)
-                )  # (1, 1, H_lat, W_lat)
+            for col_idx, t in enumerate(top_tokens):
+                attn = probs[:, :, t].unsqueeze(0).unsqueeze(0)
 
-                # Interpolate back to padded image resolution
                 attn_resized = F.interpolate(
-                    attn_map,
+                    attn,
                     size=(padded_h, padded_w),
                     mode="bilinear",
                     align_corners=False,
                 )
+
                 attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
 
-                ax_map = axes[row_idx][col_idx + 1]
-                ax_map.imshow(orig_np)
-                ax_map.imshow(
-                    attn_np, cmap="jet", alpha=0.55, vmin=0, vmax=global_max_prob
-                )
-                ax_map.axis("off")
-                if row_idx == 0:
-                    ax_map.set_title(f"Dict Token {dict_idx}", fontsize=14, pad=10)
+                ax = axes[row_idx][col_idx + 1]
+                ax.imshow(orig_np)
+                ax.imshow(attn_np, cmap="viridis", alpha=0.6, vmin=0, vmax=global_max)
+                ax.axis("off")
 
-        # --- MODE 2: Slice Evolution ---
+                if row_idx == 0:
+                    ax.set_title(f"Token {t}")
+
+        # =========================
+        # MODE 2: SLICE EVOLUTION
+        # =========================
         elif args.mode == "slice_evolution":
             target = args.target_token
+            num_slices = len(attn_maps)
 
-            # Collect the map for the target token across all 5 slices
             slice_maps = []
-            for s in range(5):
+
+            for s in range(num_slices):
                 probs = attn_maps[s].squeeze(0).view(latent_h, latent_w, -1)
                 slice_maps.append(probs[:, :, target])
 
-            # Find global maximum across all slices for accurate comparison
-            global_max_prob = max([sm.max().item() for sm in slice_maps])
+            global_max = max([m.max().item() for m in slice_maps])
 
-            for s in range(5):
-                attn_map = slice_maps[s].unsqueeze(0).unsqueeze(0)
+            for s in range(num_slices):
+                attn = slice_maps[s].unsqueeze(0).unsqueeze(0)
 
                 attn_resized = F.interpolate(
-                    attn_map,
+                    attn,
                     size=(padded_h, padded_w),
                     mode="bilinear",
                     align_corners=False,
                 )
+
                 attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
 
-                ax_map = axes[row_idx][s + 1]
-                ax_map.imshow(orig_np)
-                ax_map.imshow(
-                    attn_np, cmap="jet", alpha=0.55, vmin=0, vmax=global_max_prob
-                )
-                ax_map.axis("off")
-                if row_idx == 0:
-                    ax_map.set_title(f"Slice {s} (Token {target})", fontsize=14, pad=10)
+                ax = axes[row_idx][s + 1]
+                ax.imshow(orig_np)
+                ax.imshow(attn_np, cmap="viridis", alpha=0.6, vmin=0, vmax=global_max)
+                ax.axis("off")
 
-        # --- MODE 3: Spatial Gating ---
+                if row_idx == 0:
+                    ax.set_title(f"Slice {s}")
+
+        # =========================
+        # MODE 3: SPATIAL GATING
+        # =========================
         elif args.mode == "spatial_gating":
-            for s in range(5):
-                # Fetch row mass directly from the attention block
-                row_mass = model.eot_attentions[s].last_row_mass.cpu()  # (1, HW)
+            num_slices = len(attn_maps)
+
+            for s in range(num_slices):
+                row_mass = model.eot_attentions[s].last_row_mass.cpu()
                 row_mass = row_mass.view(1, 1, latent_h, latent_w)
 
                 mass_resized = F.interpolate(
@@ -232,19 +213,59 @@ def main():
                     mode="bilinear",
                     align_corners=False,
                 )
+
                 mass_np = mass_resized[:, :, :H, :W].squeeze().numpy()
 
-                ax_map = axes[row_idx][s + 1]
-                ax_map.imshow(orig_np)
-                # 'magma' colormap emphasizes intensity variations well
-                ax_map.imshow(mass_np, cmap="magma", alpha=0.7, vmin=0.0)
-                ax_map.axis("off")
-                if row_idx == 0:
-                    ax_map.set_title(f"Slice {s} Mass", fontsize=14, pad=10)
+                ax = axes[row_idx][s + 1]
+                ax.imshow(orig_np)
+                ax.imshow(mass_np, cmap="inferno", alpha=0.7)
+                ax.axis("off")
 
-    fig.savefig(args.output, format="pdf", bbox_inches="tight", dpi=300)
+                if row_idx == 0:
+                    ax.set_title(f"Slice {s}")
+
+        # =========================
+        # MODE 4: ENTROPY MAP 🔥
+        # =========================
+        elif args.mode == "entropy_map":
+            num_slices = len(attn_maps)
+            entropy_maps = []
+
+            for s in range(num_slices):
+                probs = attn_maps[s].squeeze(0)
+                probs = probs.view(latent_h, latent_w, -1)
+
+                eps = 1e-8
+                entropy = -(probs * torch.log(probs + eps)).sum(dim=-1)
+
+                entropy_maps.append(entropy)
+
+            global_max = max([e.max().item() for e in entropy_maps])
+
+            for s in range(num_slices):
+                attn = entropy_maps[s].unsqueeze(0).unsqueeze(0)
+
+                attn_resized = F.interpolate(
+                    attn,
+                    size=(padded_h, padded_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                attn_np = attn_resized[:, :, :H, :W].squeeze().numpy()
+
+                ax = axes[row_idx][s + 1]
+                ax.imshow(orig_np)
+                ax.imshow(attn_np, cmap="inferno", alpha=0.7, vmin=0, vmax=global_max)
+                ax.axis("off")
+
+                if row_idx == 0:
+                    ax.set_title(f"Slice {s}")
+
+    fig.savefig(args.output, bbox_inches="tight", dpi=300)
     plt.close(fig)
-    print(f"\nSaved attention maps to {args.output}")
+
+    print(f"Saved to {args.output}")
 
 
 if __name__ == "__main__":
