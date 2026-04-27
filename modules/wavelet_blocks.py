@@ -400,8 +400,8 @@ class GatedMemoryUpdater(nn.Module):
         context = self.mamba_context(x)
 
         delta = self.delta_proj(context)
-        gate = self.gate_proj(context)
-        return memory + delta * torch.sigmoid(gate)
+        gate = torch.sigmoid(self.gate_proj(context))
+        return memory * (1.0 - gate) + delta * gate
 
 
 # ==============================================================================

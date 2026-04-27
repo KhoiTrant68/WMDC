@@ -186,7 +186,11 @@ class WMDC(CompressionModel):
             deconv(192, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.0),
         )
-        self.h_scale_head = deconv(N, M, kernel_size=5, stride=2)
+        self.h_scale_head = nn.Sequential(
+            conv(N, N, kernel_size=3, stride=1),
+            nn.GELU(),
+            deconv(N, M, kernel_size=5, stride=2),
+        )
         self.h_mean_head = deconv(N, M, kernel_size=5, stride=2)
 
         # ── Entropy models ────────────────────────────────────────────────────
@@ -462,17 +466,16 @@ class WMDC(CompressionModel):
             z_hat = z_hat_soft
 
         # ── Hyper-prior ───────────────────────────────────────────────────────
-        dt = self.hyper_to_dict(z_hat)  # (B, N, dict_dim)
+        dt, dict_penalty = self.hyper_to_dict(z_hat)
         latent_scales, latent_means = self._hyper_decode(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)  # (B, 2M, H, W)
 
-        # ── Autoregressive slice loop ──────────────────────────────────────────
         y_slices = y.chunk(self.num_slices, dim=1)
         y_hat_slices: list[torch.Tensor] = []
         y_likelihood: list[torch.Tensor] = []
 
         memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
-        total_dispersion = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        total_dispersion = dict_penalty * 10.0
 
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
@@ -582,7 +585,7 @@ class WMDC(CompressionModel):
         # Immediately decode to get the same z_hat as decompress() will use
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-        dt = self.hyper_to_dict(z_hat)
+        dt, _ = self.hyper_to_dict(z_hat)
         latent_scales, latent_means = self._hyper_decode(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
@@ -658,7 +661,7 @@ class WMDC(CompressionModel):
 
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
 
-        dt = self.hyper_to_dict(z_hat)
+        dt, _ = self.hyper_to_dict(z_hat)
         latent_scales, latent_means = self._hyper_decode(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 

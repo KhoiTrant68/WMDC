@@ -386,16 +386,15 @@ def test_epoch(
 
                 mse_per_image = F.mse_loss(x_hat, d, reduction="none").mean(
                     dim=(1, 2, 3)
-                )  # (B,)
+                )
                 psnr_per_image = torch.where(
                     mse_per_image > 0,
                     -10.0 * mse_per_image.log10(),
                     torch.full_like(mse_per_image, 100.0),
-                )  # (B,)
+                )
 
                 bpp_val = out_criterion["bpp_loss"].item()
                 loss_val = out_criterion["loss"].item()
-
                 if "dispersion_bonus" in out_criterion:
                     disp_meter.update(
                         out_criterion["dispersion_bonus"].item(), d.size(0)
@@ -403,16 +402,14 @@ def test_epoch(
 
                 per_image_metrics = torch.stack(
                     [
-                        psnr_per_image,  # (B,) real
-                        torch.full_like(psnr_per_image, bpp_val),  # (B,) replicated
-                        torch.full_like(psnr_per_image, loss_val),  # (B,) replicated
+                        psnr_per_image,
+                        torch.full_like(psnr_per_image, bpp_val),
+                        torch.full_like(psnr_per_image, loss_val),
                     ],
                     dim=1,
-                )  # (B, 3)
+                )
 
                 gathered = accelerator.gather_for_metrics(per_image_metrics)
-                # gathered: (total_images_this_batch_across_ranks, 3)
-
                 psnr_meter.update(gathered[:, 0].mean().item(), gathered.size(0))
                 bpp_meter.update(gathered[:, 1].mean().item(), gathered.size(0))
                 loss_meter.update(gathered[:, 2].mean().item(), gathered.size(0))
@@ -440,9 +437,7 @@ def test_epoch(
         )
         if logger:
             logger.info(
-                f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | "
-                f"PSNR: {psnr_meter.avg:.2f} dB | "
-                f"BPP: {bpp_meter.avg:.4f}{gap_str}"
+                f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f} dB | BPP: {bpp_meter.avg:.4f}{gap_str}"
             )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)

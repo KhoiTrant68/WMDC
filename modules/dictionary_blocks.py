@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# QueryDictionaryGenerator  (unchanged from original)
+# QueryDictionaryGenerator
 # ---------------------------------------------------------------------------
 
 
@@ -49,17 +49,26 @@ class QueryDictionaryGenerator(nn.Module):
             nn.Linear(dict_dim, dict_dim),
         )
 
-    def forward(self, z_hat: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_hat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, C, H, W = z_hat.shape
         context = z_hat + self.pos_enc(z_hat)
-        context = context.view(B, C, H * W).transpose(1, 2)  # (B, HW, C)
+        context = context.view(B, C, H * W).transpose(1, 2)
 
-        queries = self.dict_queries.expand(B, -1, -1)  # (B, N, C)
+        queries = self.dict_queries.expand(B, -1, -1)
         attn_out, _ = self.cross_attn(query=queries, key=context, value=context)
         out = self.norm(queries + attn_out)
 
-        projected = self.proj(out)  # (B, N, dict_dim)
-        return F.normalize(projected, p=2, dim=-1) * math.sqrt(self.dict_dim)
+        projected = self.proj(out)
+        dt = F.normalize(projected, p=2, dim=-1)
+
+        penalty = torch.tensor(0.0, device=z_hat.device, dtype=z_hat.dtype)
+        if self.training:
+            sim_matrix = torch.bmm(dt, dt.transpose(1, 2))
+            I = torch.eye(self.dict_num, device=dt.device).unsqueeze(0)
+            sim_off_diag = sim_matrix - I
+            penalty = F.relu(sim_off_diag).pow(2).mean()
+
+        return dt * math.sqrt(self.dict_dim), penalty
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +90,7 @@ class UnifiedDictionaryAttention(nn.Module):
                        After Sinkhorn, P is scaled by HW so row sums ≈ 1,
                        matching the softmax normalisation convention.
 
-    'unbalanced_eot' — KL-unbalanced Sinkhorn (Séjourné et al. 2019, §4.7.2)
+    'unbalanced_eot' — KL-unbalanced Sinkhorn
                        with spatially-varying row marginal strength ρ(x).
 
                         log_g_new = log_b  −  shrink_col * logsumexp(log_f − M, rows)
@@ -227,8 +236,6 @@ class UnifiedDictionaryAttention(nn.Module):
         Balanced entropic OT in log-domain.
 
         Marginals: uniform row a = 1/HW, uniform col b = 1/N.
-
-        Update rule (Séjourné et al. 2019, Algorithm 1):
             log_g ← log_b − logsumexp(log_f − M, dim=rows)   [column update]
             log_f ← log_a − logsumexp(log_g − M, dim=cols)   [row update]
 
@@ -245,14 +252,10 @@ class UnifiedDictionaryAttention(nn.Module):
         P : (B, HW, N)  transport plan (NOT yet scaled by HW)
         """
         B, HW, N = C_mat.shape
-        eps = F.softplus(self.log_eps) + 0.01  # strictly positive
-        log_a = -math.log(HW)  # scalar: log of 1/HW
-        log_b = -math.log(N)  # scalar: log of 1/N
-
-        M = C_mat.float() / eps  # (B, HW, N)
-
-        log_f = C_mat.new_zeros(B, HW, 1)  # (B, HW, 1)
-        log_g = C_mat.new_zeros(B, 1, N)  # (B,  1, N)
+        eps = F.softplus(self.log_eps) + 0.01
+        log_a, log_b = -math.log(HW), -math.log(N)
+        M = C_mat.float() / eps
+        log_f, log_g = C_mat.new_zeros(B, HW, 1), C_mat.new_zeros(B, 1, N)
 
         if self.training and self.n_nograd_iters > 0:
             with torch.no_grad():
