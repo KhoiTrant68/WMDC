@@ -142,11 +142,8 @@ class UnifiedDictionaryAttention(nn.Module):
         self.routing_mode = routing_mode
 
         # Learnable log-scale parameters so ε / τ stay positive during training
-        if self.routing_mode == "softmax":
-            self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
-        else:
-            # Shared by both balanced and unbalanced paths
-            self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
+        self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
+        self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
 
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
         self.out_proj = nn.Sequential(

@@ -20,7 +20,7 @@ from models.WMDC import WMDC
 
 
 def _byte_size(obj) -> int:
-    """Recursively sum the byte-lengths of all byte-strings in a nested structure."""
+    """Recursively sum byte-lengths of all byte-strings in a nested structure."""
     if isinstance(obj, bytes):
         return len(obj)
     if isinstance(obj, (list, tuple)):
@@ -57,37 +57,67 @@ def _sync(device: str):
         torch.cuda.synchronize()
 
 
+def probe_y_to_z_ratio(model: WMDC, device: str) -> tuple[int, int]:
+    """
+    Probe the model with a minimal dummy input to measure the exact spatial
+    downsampling ratio between the latent y (output of g_a) and the hyper-
+    latent z (output of h_a).
+
+    This ratio is used in compute_util_from_saved() to reshape the flattened
+    attention maps back to 2-D spatial grids.
+
+    Returns
+    -------
+    (ratio_h, ratio_w) — integer scale factors, typically (4, 4) for the
+    default architecture where h_a applies 2× stride twice.
+    """
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, 64, 64, device=device)
+        dummy_y = model.g_a(dummy)  # (1, M, H/16, W/16)
+        dummy_z = model.h_a(dummy_y)  # (1, 192, H/64, W/64)
+    rh = dummy_y.shape[2] // dummy_z.shape[2]
+    rw = dummy_y.shape[3] // dummy_z.shape[3]
+    return rh, rw
+
+
 # ---------------------------------------------------------------------------
 # Dictionary utilisation (all slices)
 # ---------------------------------------------------------------------------
 
 
 def compute_util_from_saved(
-    all_probs: list, all_row_masses: list, shape: tuple, dict_num: int
+    all_probs: list,
+    all_row_masses: list,
+    shape: tuple,
+    dict_num: int,
+    y_to_z_ratio: tuple[int, int],
 ) -> dict:
     """
     Compute per-slice utilisation metrics from saved attention maps.
-    FIX A1: Avoids redundant compress() calls by taking cloned tensors.
 
-    Returns a dict with:
-      - 'per_slice_utilisation_pct': list[float], one per slice
-      - 'mean_utilisation_pct'     : float, average over slices
-      - 'max_entropy_bits'         : float, log2(dict_num)
-      - 'assignment_maps'          : list of (H_lat, W_lat) int tensors (top-1 token)
-      - 'entropy_maps'             : list of (H_lat, W_lat) float tensors (local H)
-      - 'row_mass_maps'            : list of (H_lat, W_lat) float tensors (unbalanced only)
+    Parameters
+    ----------
+    all_probs      : list of (1, HW, N) tensors — one per slice
+    all_row_masses : list of (1, HW) tensors or None — unbalanced OT only
+    shape          : (H_z, W_z) from compress() output
+    dict_num       : number of dictionary tokens N
+    y_to_z_ratio   : (ratio_h, ratio_w) from probe_y_to_z_ratio()  [FIX-M1]
+
+    Returns dict with:
+      - per_slice_utilisation_pct : list[float]
+      - mean_utilisation_pct      : float
+      - max_entropy_bits          : float = log2(dict_num)
+      - assignment_maps           : list of (H_lat, W_lat) int tensors
+      - entropy_maps              : list of (H_lat, W_lat) float tensors
+      - row_mass_maps             : list of (H_lat, W_lat) float | None
     """
     if not all_probs:
         return {
             "error": "No attention maps collected. Check routing_mode != 'softmax'."
         }
 
-    # Infer spatial dims from z shape.
-    H_lat = shape[0]
-    W_lat = shape[1]
-    # latent y is 4× the z spatial dims (h_a applies 4× downsampling overall)
-    H_lat_y = H_lat * 4
-    W_lat_y = W_lat * 4
+    H_lat_y = shape[0] * y_to_z_ratio[0]
+    W_lat_y = shape[1] * y_to_z_ratio[1]
 
     max_ent = math.log2(dict_num)
 
@@ -97,7 +127,7 @@ def compute_util_from_saved(
     row_mass_maps: list = []
 
     for s_idx, P in enumerate(all_probs):
-        # P: (1, HW, N)  — already detached and cloned
+        # P: (1, HW, N) — detached and cloned
         B, HW, N = P.shape
 
         # Column marginal → utilisation entropy in BITS
@@ -123,7 +153,7 @@ def compute_util_from_saved(
         H_pixel = -(p_norm * p_norm.clamp(1e-8).log2()).sum(dim=-1)
         entropy_maps.append(H_pixel.cpu())  # (H, W) float
 
-        # Row mass map (unbalanced OT spatial gating signal).
+        # Row mass map (unbalanced OT spatial gating signal)
         rm = all_row_masses[s_idx] if s_idx < len(all_row_masses) else None
         if rm is not None:
             try:
@@ -199,6 +229,9 @@ def main():
     model.eval()
     model.update(force=True)
 
+    y_to_z_ratio = probe_y_to_z_ratio(model, device)
+    print(f"Probed y-to-z spatial ratio: {y_to_z_ratio}")
+
     # ── Image list ───────────────────────────────────────────────────────────
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
     image_paths = sorted(
@@ -245,7 +278,7 @@ def main():
             t0 = time.time()
             out_enc = model.compress(x_pad)
 
-            # Save attention maps and row masses immediately after compression
+            # Clone attention maps immediately so decompress() can reuse them
             saved_attn_probs = [p.clone() for p in model.slice_attn_probs]
             saved_row_masses = []
             for a in model.eot_attentions:
@@ -270,7 +303,7 @@ def main():
 
             save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
 
-            # BPP — two variants (shape metadata excluded, < 0.0002 bpp overhead)
+            # BPP — two variants
             bpp_orig = compute_actual_bpp(out_enc["strings"], num_pixels_orig)
             bpp_pad = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
             pad_oh = bpp_orig - bpp_pad
@@ -301,9 +334,12 @@ def main():
             }
 
             if args.measure_dict_util:
-                # Pass the saved maps to avoid redundant forward/compress calls
                 util = compute_util_from_saved(
-                    saved_attn_probs, saved_row_masses, out_enc["shape"], model.dict_num
+                    saved_attn_probs,
+                    saved_row_masses,
+                    out_enc["shape"],
+                    model.dict_num,
+                    y_to_z_ratio,  # FIX-M1: pass probed ratio
                 )
 
                 if "error" not in util:
@@ -352,7 +388,7 @@ def main():
             if args.measure_dict_util and "mean_utilisation_pct" in row:
                 slices = row["per_slice_utilisation_pct"]
                 util_str = (
-                    f" | Util: ["
+                    " | Util: ["
                     + ", ".join(f"{v:.1f}%" for v in slices)
                     + f"] mean={row['mean_utilisation_pct']:.1f}%"
                 )
@@ -412,6 +448,7 @@ def main():
         "average": avg,
         "per_image": per_image,
         "args": vars(args),
+        "y_to_z_ratio": list(y_to_z_ratio),
     }
     report_path = os.path.join(args.output, "RD_report.json")
     with open(report_path, "w") as f:

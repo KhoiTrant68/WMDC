@@ -24,12 +24,13 @@ from modules.wavelet_blocks import FrequencyDisentangledMamba, GatedMemoryUpdate
 def ste_mode(model: "WMDC"):
     """
     Temporarily enable straight-through estimation, restoring the previous
-    state on exit — even if an exception is raised.
+    state on exit — even if an exception is raised inside the block.
 
-    Usage::
+    Usage:
 
         with ste_mode(accelerator.unwrap_model(model)) as m:
-            out = m(batch)
+            out_fwd  = m(batch)
+            out_enc  = m.compress(batch)      # safe even if this raises
     """
     prev = model.use_ste
     model.use_ste = True
@@ -37,6 +38,54 @@ def ste_mode(model: "WMDC"):
         yield model
     finally:
         model.use_ste = prev
+
+
+# ---------------------------------------------------------------------------
+# Legacy checkpoint migration helper  (FIX-N1)
+# ---------------------------------------------------------------------------
+
+
+def load_legacy_checkpoint(
+    model: "WMDC", ckpt_path: str, device: str = "cpu"
+) -> "WMDC":
+    """
+    Load a checkpoint saved with the old hyper-decoder layout
+    (h_scale_s / h_mean_s) into a model that uses the new shared-trunk
+    layout (h_trunk / h_scale_head / h_mean_head).
+        h_trunk.0.*    →  deconv (shared, mirrors old h_scale_s.0)
+        h_trunk.1.*    →  VSSBlock (shared, mirrors old h_scale_s.1)
+        h_scale_head.* →  deconv (mirrors old h_scale_s.2)
+        h_mean_head.*  →  deconv (mirrors old h_mean_s.2)
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sd = ckpt.get("state_dict", ckpt)
+
+    remap: dict = {}
+    for k, v in sd.items():
+        if k.startswith("h_scale_s."):
+            suffix = k[len("h_scale_s.") :]  # e.g. "0.weight" or "2.bias"
+            idx = int(suffix.split(".")[0])
+            rest = suffix[len(str(idx)) + 1 :]  # e.g. "weight"
+            if idx < 2:
+                remap[f"h_trunk.{idx}.{rest}"] = v
+            else:
+                remap[f"h_scale_head.{rest}"] = v
+        elif k.startswith("h_mean_s."):
+            suffix = k[len("h_mean_s.") :]
+            idx = int(suffix.split(".")[0])
+            rest = suffix[len(str(idx)) + 1 :]
+            if idx == 2:
+                remap[f"h_mean_head.{rest}"] = v
+            # idx 0,1 discarded (trunk initialised from h_scale_s above)
+        else:
+            remap[k] = v
+
+    missing, unexpected = model.load_state_dict(remap, strict=False)
+    if missing:
+        print(f"[load_legacy_checkpoint] Missing keys: {missing}")
+    if unexpected:
+        print(f"[load_legacy_checkpoint] Unexpected keys: {unexpected}")
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -50,28 +99,28 @@ class WMDC(CompressionModel):
 
     Architecture overview
     ----------------------
-    Encoder  g_a : image → latent y        (4× stride, 4 FreqDisentMamba blocks)
-    Hyper    h_a : y → z                   (2× stride, 1 VSSBlock)
-    Hyper-dec:    z_hat → scales, means    (shared trunk, split heads)
-                  z_hat → dictionary dt    (QueryDictionaryGenerator)
+    Encoder  g_a : image → latent y          (4× stride, 4 FreqDisentMamba blocks)
+    Hyper    h_a : y → z                     (2× stride, 1 VSSBlock)
+    Hyper-dec:    z_hat → scales, means      (shared trunk h_trunk, split heads)
+                  z_hat → dictionary dt      (QueryDictionaryGenerator)
     Slice loop:   num_slices autoregressive slices
                   - per-slice GatedMemoryUpdater
                   - per-slice UnifiedDictionaryAttention (EOT / softmax)
                   - cc_mean / cc_scale transforms
                   - Latent Residual Prediction (LRP) with softplus gate
-    Decoder  g_s : y_hat → image           (4× stride, 4 FreqDisentMamba blocks)
+    Decoder  g_s : y_hat → image             (4× stride, 4 FreqDisentMamba blocks)
 
     Parameters
     ----------
     N              : channels in hyper-encoder/decoder
-    M              : total latent channels  (split into num_slices equal slices)
+    M              : total latent channels (split into num_slices equal slices)
     num_slices     : number of autoregressive channel slices
     dict_head_num  : dict_dim = 32 × dict_head_num
     dict_num       : number of dictionary tokens
     routing_mode   : {'softmax', 'balanced_eot', 'unbalanced_eot'}
-    ot_eps         : Sinkhorn entropic regularisation ε  (match train value at eval)
-    sinkhorn_iters : total Sinkhorn iterations  (≥ 20 recommended for ε = 0.1)
-    tv_weight      : spatial TV weight on transport plan P  (0 = disabled)
+    ot_eps         : Sinkhorn entropic regularisation ε
+    sinkhorn_iters : total Sinkhorn iterations (≥ 20 recommended for ε = 0.1)
+    tv_weight      : spatial TV weight on transport plan P (0 = disabled)
     """
 
     def __init__(
@@ -95,12 +144,10 @@ class WMDC(CompressionModel):
         self.dict_dim = 32 * dict_head_num
         self.routing_mode = routing_mode
 
-        # use_ste as a bool buffer so it is saved in state_dict and
-        # automatically synchronised across DDP ranks via checkpoint loading.
+        # DDP-safe, never silently reset on checkpoint resume.
         self.register_buffer("_use_ste_flag", torch.zeros(1, dtype=torch.bool))
 
-        # Populated during eval forward/compress/decompress for analysis.
-        # Each entry is a (B, HW, N) tensor for the corresponding slice.
+        # Per-slice attention maps: populated in eval/compress/decompress.
         self.slice_attn_probs: list[torch.Tensor] = []
 
         # ── Encoder ───────────────────────────────────────────────────────────
@@ -132,11 +179,9 @@ class WMDC(CompressionModel):
             conv(N, 192, kernel_size=5, stride=2),
         )
 
-        # ── Hyper-decoder (scale and mean share a trunk) ───────────────────────
-        # Shared trunk processes z_hat once; two independent heads predict
-        # latent_scales and latent_means respectively.  This halves the number
-        # of VSSBlock parameters in the hyper-decoder and forces both predictors
-        # to operate from the same representation, improving consistency.
+        # ── Hyper-decoder: shared trunk + two independent prediction heads ────
+        # Sharing the trunk halves VSSBlock parameters and forces both the
+        # scale and mean predictors to operate from the same representation.
         self.h_trunk = nn.Sequential(
             deconv(192, N, kernel_size=5, stride=2),
             VSSBlock(hidden_dim=N, drop_path=0.0),
@@ -156,19 +201,8 @@ class WMDC(CompressionModel):
             num_heads=4,
         )
 
-        # ── Spatially-adaptive KL mass strength predictors (per-slice) ────────
-        #
-        # ALWAYS register rho_predictors as an nn.ModuleList so that
-        # state_dict keys are identical regardless of routing_mode.  This allows
-        # any checkpoint to be loaded with strict=True under any routing mode.
-        #
-        # Slice i is conditioned on:
-        #   hyper_prior  (2*M channels)
-        #   + i decoded slices  (i * slice_ch channels)
-        #
-        # _compute_rho_spatial() returns None at runtime when
-        # routing_mode != 'unbalanced_eot', so the eot_attention modules
-        # simply ignore rho in those modes.
+        # ── Spatially-adaptive KL mass predictors ────────
+
         self.rho_predictors = nn.ModuleList(
             [
                 nn.Sequential(
@@ -370,19 +404,24 @@ class WMDC(CompressionModel):
 
         Returns
         -------
-        rho : (B, H, W)  strictly positive, or None
+        rho_raw * 0  : in non-unbalanced modes — zero value, live grad_fn
+        rho          : (B, H, W) strictly positive — in unbalanced mode
         """
+        context = (
+            hyper_prior
+            if slice_idx == 0
+            else torch.cat([hyper_prior] + decoded_slices, dim=1)
+        )
+
+        # Always execute rho_predictors
+        rho_raw = self.rho_predictors[slice_idx](context)  # (B, 1, H, W)
+
         if self.routing_mode != "unbalanced_eot":
-            return None
+            # Return a zero-valued tensor in the backward graph.
+            # The caller multiplies this into total_dispersion to satisfy DDP.
+            return rho_raw * 0.0
 
-        if slice_idx == 0:
-            context = hyper_prior
-        else:
-            context = torch.cat([hyper_prior] + decoded_slices, dim=1)
-
-        # (B, 1, H, W) → softplus keeps rho positive, clamp enforces lower bound
-        rho = F.softplus(self.rho_predictors[slice_idx](context))
-        rho = rho.clamp(min=0.05) + 1e-4  # strictly positive
+        rho = F.softplus(rho_raw).clamp(min=0.05) + 1e-4
         return rho.squeeze(1)  # (B, H, W)
 
     # =========================================================================
@@ -436,10 +475,16 @@ class WMDC(CompressionModel):
         total_dispersion = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
-            # ρ always computed; returns None for non-unbalanced modes.
-            # This keeps rho_predictors in the gradient graph on all ranks
-            # so DDP never encounters unused parameters (find_unused=False safe).
-            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+            rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+
+            if self.routing_mode != "unbalanced_eot":
+                # Add zero contribution to keep rho_predictors in the backward
+                # graph for DDP correctness with find_unused_parameters=False.
+                if self.training:
+                    total_dispersion = total_dispersion + rho_out.sum()
+                rho_spatial = None  # attention routing unchanged
+            else:
+                rho_spatial = rho_out
 
             k_dict = self.k_projs[i](dt)  # (B, N, dict_dim)
             v_dict = self.v_projs[i](dt)  # (B, N, dict_dim)
@@ -448,11 +493,7 @@ class WMDC(CompressionModel):
             query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, disp_loss = self.eot_attentions[i](
-                query,
-                k_dict,
-                v_dict,
-                rho_spatial,
-                calc_disp=self.training,
+                query, k_dict, v_dict, rho_spatial, calc_disp=self.training
             )
             total_dispersion = total_dispersion + disp_loss / self.num_slices
 
@@ -548,11 +589,11 @@ class WMDC(CompressionModel):
         y_slices = y.chunk(self.num_slices, dim=1)
         y_hat_slices: list[torch.Tensor] = []
         y_strings: list = []
-
         memory_state = self.init_memory(hyper_prior)
 
         for i, y_slice in enumerate(y_slices):
-            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+            rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+            rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
 
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
@@ -592,10 +633,7 @@ class WMDC(CompressionModel):
             if i < self.num_slices - 1:
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
-        return {
-            "strings": [y_strings, z_strings],
-            "shape": z.size()[-2:],
-        }
+        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
 
     # =========================================================================
     # Decompress
@@ -628,7 +666,8 @@ class WMDC(CompressionModel):
         memory_state = self.init_memory(hyper_prior)
 
         for i in range(self.num_slices):
-            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+            rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
+            rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
 
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)

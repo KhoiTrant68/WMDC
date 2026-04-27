@@ -4,6 +4,7 @@ import math
 import os
 import random
 import sys
+import warnings
 from datetime import datetime
 
 import numpy as np
@@ -22,7 +23,7 @@ from torchvision import transforms
 from torchvision.utils import make_grid
 from tqdm import tqdm
 
-from models.WMDC import WMDC
+from models.WMDC import WMDC, ste_mode
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -81,24 +82,15 @@ class RateDistortionLoss(nn.Module):
 
         L = λ · distortion + bpp  −  effective · H(m)
 
-    where H(m) is the Shannon entropy of the column-marginal distribution of
-    the transport plan (high H → diverse codebook usage).  We SUBTRACT the
-    entropy bonus so that minimising L maximises H.
+    where H(m) is the Shannon entropy of the column-marginal of the transport
+    plan.  We SUBTRACT the entropy bonus so minimising L maximises H
+    (uniform dictionary usage).
 
-    Sign convention (unambiguous):
+    Sign convention:
       - model.forward() returns  dispersion_loss = −H   (negative entropy)
-      - here we compute  dispersion_bonus = −dispersion_loss = H  (positive)
-      - we subtract: loss = RD − effective * H
-      → minimising loss maximises dictionary entropy
+      - here:  dispersion_bonus = −dispersion_loss = H  (positive)
+      - loss = RD − effective * H
 
-    EMA buffers track the running MAGNITUDE of bpp and the entropy bonus so
-    that `scale` auto-normalises their relative contribution.  Both quantities
-    are always positive, making the EMA well-behaved.
-
-    DDP note:
-        The criterion is NOT wrapped by accelerate.prepare().  EMA buffers are
-        synchronised across ranks via explicit all_reduce BEFORE the lerp update,
-        so every rank sees the same EMA value after each step.
     """
 
     def __init__(
@@ -113,15 +105,31 @@ class RateDistortionLoss(nn.Module):
         self.metric = metric
         self.disp_weight = disp_weight
 
-        # Initialise EMA accumulators at 0 and track step
-        # count for bias correction.  The correction factor is
-        #   1 - α^t  (α = 0.99, lerp weight = 0.01)
-        # which approaches 1 after ~300 steps, eliminating the warm-up bias.
+        if metric == "ms-ssim" and lmbda < 1.0:
+            warnings.warn(
+                f"λ={lmbda:.4f} is very small for metric='ms-ssim'. "
+                "MS-SSIM distortion is in [0, 1], so tiny λ values cause the "
+                "model to optimise rate only. Recommended λ range: 2.4 – 115.37. "
+                "Did you mean to use --metric mse?",
+                UserWarning,
+                stacklevel=2,
+            )
+        if metric == "mse" and lmbda > 1.0:
+            warnings.warn(
+                f"λ={lmbda:.4f} is unusually large for metric='mse'. "
+                "MSE distortion is scaled by 255²≈65025. "
+                "Recommended λ range: 0.0018 – 0.05.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # EMA for adaptive dispersion coefficient.
+        # Bias correction: 1 - 0.99^t → 1 after ~300 steps.
         self.register_buffer("ema_bpp", torch.tensor(0.0))
         self.register_buffer("ema_disp", torch.tensor(0.0))
         self.register_buffer("ema_steps", torch.tensor(0, dtype=torch.long))
 
-        # Exposed for TensorBoard logging.
+        # Exposed for TensorBoard logging
         self.effective_disp_coeff: float = disp_weight
 
     def forward(self, output: dict, target: torch.Tensor) -> dict:
@@ -140,7 +148,7 @@ class RateDistortionLoss(nn.Module):
         out["loss"] = self.lmbda * distortion + bpp_loss
 
         if "dispersion_loss" in output:
-            disp_bonus = -output["dispersion_loss"]  # H ≥ 0  (bits)
+            disp_bonus = -output["dispersion_loss"]  # H ≥ 0 (bits)
             out["dispersion_bonus"] = disp_bonus
 
             if self.training:
@@ -156,24 +164,15 @@ class RateDistortionLoss(nn.Module):
                     self.ema_bpp.lerp_(b_val.squeeze(), weight=0.01)
                     self.ema_disp.lerp_(d_val.squeeze(), weight=0.01)
 
-                # Adam-style bias correction.
-                # Without this, the scale ratio is corrupted for the first
-                # ~300 steps because ema_bpp / ema_disp starts at 0/0 = NaN,
-                # then trends toward the wrong ratio before stabilising.
                 t = float(self.ema_steps.item())
-                bc = 1.0 - 0.99**t  # correction factor → 1 as t → ∞
-                bc = max(bc, 1e-6)
+                bc = max(1.0 - 0.99**t, 1e-6)  # bias correction
                 ema_bpp_hat = self.ema_bpp / bc
                 ema_disp_hat = self.ema_disp / bc
 
-                # Clamp ratio conservatively to max 2.0 to prevent dispersion
-                # overriding BPP loss at low bitrates.
                 scale = (ema_bpp_hat / (ema_disp_hat + 1e-8)).clamp(0.01, 2.0)
                 effective = float(self.disp_weight * scale.item())
                 self.effective_disp_coeff = effective
             else:
-                # In eval mode, use the current (already bias-corrected)
-                # effective coefficient without updating EMA.
                 effective = self.effective_disp_coeff
 
             out["loss"] = out["loss"] - effective * disp_bonus
@@ -242,7 +241,7 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
-        # ── Pass 1: RD loss ───────────────────────────────────────────────
+        # ── Pass 1: RD loss ────────────────────────────────────────────────
         accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
             main_params = [
@@ -251,7 +250,7 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
         optimizer.step()
 
-        # ── Pass 2: aux loss (entropy bottleneck CDF) ─────────────────────
+        # ── Pass 2: aux loss (entropy bottleneck CDF) ──────────────────────
         accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
 
@@ -276,7 +275,9 @@ def train_one_epoch(
                 writer.add_scalar("Train/Bpp", bpp_meter.avg, step)
                 writer.add_scalar("Train/Dict_Entropy_H", disp_meter.avg, step)
                 writer.add_scalar(
-                    "Train/Disp_eff_coeff", criterion.effective_disp_coeff, step
+                    "Train/Disp_eff_coeff",
+                    criterion.effective_disp_coeff,
+                    step,
                 )
 
     return rd_meter.avg
@@ -294,38 +295,46 @@ def _sync():
 
 def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> float:
     """
-    Measure PSNR gap between forward() (noise relaxation) and
-    compress→decompress (true quantisation) on the same image patch.
+    Measure PSNR gap between forward() (noise relaxation / STE) and
+    compress→decompress (true hard quantisation) on the same image patch.
 
-    Returns: psnr_forward - psnr_quantised  (positive = forward is optimistic)
+    Returns: psnr_forward − psnr_quantised  (positive → forward is optimistic)
     """
     d = batch.to(device).float()
 
-    # Always eval to disable dropout masking disparities
+    prev_training = model.training
     model.eval()
-    model.use_ste = True
 
-    with torch.no_grad():
-        # Rebuild entropy tables BEFORE codec calls.
-        model.update(force=True)
+    try:
+        # model.use_ste is restored to its prior value on exit, even
+        # if an exception is raised inside the block.
+        with torch.no_grad(), ste_mode(model) as m:
+            # Rebuild entropy tables BEFORE codec calls
+            m.update(force=True)
 
-        # Forward pass with STE (mimicking hard quantisation)
-        out_fwd = model(d)
-        x_hat_fwd = out_fwd["x_hat"].clamp(0, 1)
-        mse_fwd = F.mse_loss(d, x_hat_fwd)
-        psnr_fwd = -10.0 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
+            # Forward pass with STE (hard rounding approximation)
+            out_fwd = m(d)
+            x_hat_fwd = out_fwd["x_hat"].clamp(0, 1)
+            mse_fwd = F.mse_loss(d, x_hat_fwd)
+            psnr_fwd = (
+                -10.0 * math.log10(mse_fwd.item()) if mse_fwd.item() > 0 else 100.0
+            )
 
-        # Compress / decompress (true hard quantisation)
-        _sync()
-        out_enc = model.compress(d)
-        _sync()
-        out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
-        x_hat_dec = out_dec["x_hat"].clamp(0, 1)
-        mse_dec = F.mse_loss(d, x_hat_dec)
-        psnr_dec = -10.0 * math.log10(mse_dec.item()) if mse_dec.item() > 0 else 100.0
+            # Compress / decompress (true hard quantisation via arithmetic coding)
+            _sync()
+            out_enc = m.compress(d)
+            _sync()
+            out_dec = m.decompress(out_enc["strings"], out_enc["shape"])
+            x_hat_dec = out_dec["x_hat"].clamp(0, 1)
+            mse_dec = F.mse_loss(d, x_hat_dec)
+            psnr_dec = (
+                -10.0 * math.log10(mse_dec.item()) if mse_dec.item() > 0 else 100.0
+            )
 
-    model.use_ste = False
-    model.train()
+    finally:
+        # Always restore original training state
+        model.train(prev_training)
+
     return psnr_fwd - psnr_dec
 
 
@@ -345,8 +354,6 @@ def test_epoch(
     gap_check: bool = False,
 ):
     model.eval()
-    # Put criterion in eval mode so EMA is not updated from val
-    # data, and so train / val losses use identical computation paths.
     criterion.eval()
 
     psnr_meter = AverageMeter()
@@ -355,11 +362,10 @@ def test_epoch(
     disp_meter = AverageMeter()
     gap_psnr: float = float("nan")
 
-    # Sync tables on all ranks safely BEFORE eval loop to prevent NCCL desyncs
+    # Sync entropy tables on all ranks before eval loop
     if gap_check:
         accelerator.unwrap_model(model).update(force=True)
 
-    # Use try-finally to ensure criterion restores correctly
     try:
         with torch.no_grad():
             for i, d in tqdm(
@@ -378,10 +384,15 @@ def test_epoch(
                     grid = make_grid(cmp, nrow=n, normalize=True, value_range=(0, 1))
                     writer.add_image("Val/Reconstruction", grid, epoch)
 
-                mse_val = F.mse_loss(x_hat, d)
-                psnr_val = (
-                    -10.0 * math.log10(mse_val.item()) if mse_val.item() > 0 else 100.0
-                )
+                mse_per_image = F.mse_loss(x_hat, d, reduction="none").mean(
+                    dim=(1, 2, 3)
+                )  # (B,)
+                psnr_per_image = torch.where(
+                    mse_per_image > 0,
+                    -10.0 * mse_per_image.log10(),
+                    torch.full_like(mse_per_image, 100.0),
+                )  # (B,)
+
                 bpp_val = out_criterion["bpp_loss"].item()
                 loss_val = out_criterion["loss"].item()
 
@@ -390,11 +401,17 @@ def test_epoch(
                         out_criterion["dispersion_bonus"].item(), d.size(0)
                     )
 
-                local = torch.tensor(
-                    [psnr_val, bpp_val, loss_val], device=accelerator.device
-                )
-                local_batch = local.unsqueeze(0).repeat(d.size(0), 1)
-                gathered = accelerator.gather_for_metrics(local_batch)
+                per_image_metrics = torch.stack(
+                    [
+                        psnr_per_image,  # (B,) real
+                        torch.full_like(psnr_per_image, bpp_val),  # (B,) replicated
+                        torch.full_like(psnr_per_image, loss_val),  # (B,) replicated
+                    ],
+                    dim=1,
+                )  # (B, 3)
+
+                gathered = accelerator.gather_for_metrics(per_image_metrics)
+                # gathered: (total_images_this_batch_across_ranks, 3)
 
                 psnr_meter.update(gathered[:, 0].mean().item(), gathered.size(0))
                 bpp_meter.update(gathered[:, 1].mean().item(), gathered.size(0))
@@ -402,7 +419,6 @@ def test_epoch(
 
         if gap_check and accelerator.is_main_process:
             try:
-                # Safely use the last processed batch to avoid breaking DDP samplers
                 sample = d[:1]
                 gap_psnr = measure_train_inference_gap(
                     accelerator.unwrap_model(model),
@@ -463,13 +479,22 @@ def parse_args():
         dest="lmbda",
         type=float,
         required=True,
-        help="RD tradeoff λ.  MSE: 0.0018, 0.0035, 0.013, 0.05.  "
-        "MS-SSIM: 2.4, 4.58, 8.73, 16.64, 31.73, 115.37",
+        help=(
+            "RD tradeoff λ.\n"
+            "  MSE    (--metric mse)    : 0.0018, 0.0035, 0.013, 0.05\n"
+            "  MS-SSIM (--metric ms-ssim): 2.4, 4.58, 8.73, 16.64, 31.73, 115.37\n"
+            "WARNING: using a wrong λ range silently trains a broken model."
+        ),
     )
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--metric", type=str, default="mse", choices=["mse", "ms-ssim"])
+    p.add_argument(
+        "--metric",
+        type=str,
+        default="mse",
+        choices=["mse", "ms-ssim"],
+    )
     p.add_argument("--disp-weight", type=float, default=0.1)
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--sinkhorn-iters", type=int, default=20)
@@ -479,14 +504,13 @@ def parse_args():
         "--last-epochs-with-ste",
         type=int,
         default=20,
-        help="Number of final epochs to train with STE instead of noise relaxation.  "
-        "Set to 0 to disable and train with noise relaxation for the entire schedule.",
+        help="Final epochs to train with STE instead of noise relaxation. 0=disabled.",
     )
     p.add_argument(
         "--gap-check-interval",
         type=int,
         default=10,
-        help="Measure train/infer PSNR gap every N epochs. 0 = disabled.",
+        help="Measure train/infer PSNR gap every N epochs. 0=disabled.",
     )
     p.add_argument("--seed", type=int, default=2026)
     return p.parse_args()
@@ -626,23 +650,24 @@ def main():
                 f"Resumed from epoch {start_epoch - 1} (best_loss={best_loss:.4f})"
             )
 
-    # ── Per-lambda summary (for final paper table) ────────────────────────────
+    # ── Per-lambda summary ─────────────────────────────────────────────────────
     summary_path = os.path.join(save_dir, "training_summary.json")
     summary: dict = {}
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
-        if epoch >= args.epochs - args.last_epochs_with_ste:
-            accelerator.unwrap_model(model).use_ste = True
-            if (
-                accelerator.is_main_process
-                and epoch == args.epochs - args.last_epochs_with_ste
-            ):
-                print(
-                    f"Turning on STE for the last {args.last_epochs_with_ste} epochs."
-                )
-        else:
-            accelerator.unwrap_model(model).use_ste = False
+        ste_active = epoch >= args.epochs - args.last_epochs_with_ste
+        accelerator.unwrap_model(model).use_ste = ste_active
+        if (
+            accelerator.is_main_process
+            and ste_active
+            and epoch == args.epochs - args.last_epochs_with_ste
+        ):
+            print(
+                f"Turning on STE for the last {args.last_epochs_with_ste} epochs "
+                f"(epoch {epoch} → {args.epochs - 1})."
+            )
+
         train_one_epoch(
             model,
             criterion,
@@ -693,15 +718,14 @@ def main():
                 if logger:
                     logger.info(f"New best at epoch {epoch}: loss={best_loss:.4f}")
 
-            # Update the per-lambda summary with the latest gap measurement.
             if run_gap and not math.isnan(gap_psnr):
                 summary[f"epoch_{epoch}"] = {
                     "test_loss": round(test_loss, 4),
                     "gap_psnr_db": round(gap_psnr, 3),
                 }
-                with open(summary_path, "w") as f:
-                    import json
+                import json
 
+                with open(summary_path, "w") as f:
                     json.dump(
                         {
                             "lambda": args.lmbda,
