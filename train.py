@@ -540,7 +540,7 @@ def main():
             f"--patch-size must be a multiple of 64, got {args.patch_size}."
         )
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
 
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
