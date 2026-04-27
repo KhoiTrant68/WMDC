@@ -277,7 +277,10 @@ class UnifiedDictionaryAttention(nn.Module):
                 f"(eps={eps.item():.4f}, count={self.sinkhorn_divergence_count}). "
                 "Falling back to softmax. Consider increasing ot_eps."
             )
-            return self._route_softmax(C_mat)
+            fallback_P = self._route_softmax(C_mat)
+            if self.training:
+                fallback_P = fallback_P + self.log_eps * 0.0
+            return fallback_P
 
         # exp(-60) ≈ 1e-26 — negligible contribution to row sums
         return torch.exp(log_P.clamp(min=-60.0))
@@ -391,7 +394,10 @@ class UnifiedDictionaryAttention(nn.Module):
                 f"count={self.sinkhorn_divergence_count}). "
                 "Falling back to softmax. Consider increasing ot_eps."
             )
-            return self._route_softmax(C_mat)
+            fallback_P = self._route_softmax(C_mat)
+            if self.training:
+                fallback_P = fallback_P + (rho_flat * 0.0).sum() + self.log_eps * 0.0
+            return fallback_P
 
         return torch.exp(log_P.clamp(min=-60.0))
 
@@ -541,6 +547,11 @@ class UnifiedDictionaryAttention(nn.Module):
         # ── Dispersion loss ───────────────────────────────────────────────────
         if calc_disp:
             disp_loss = self._dispersion_loss(P) + tv_loss
+            if self.training:
+                if self.routing_mode != "softmax" and hasattr(self, "log_tau"):
+                    disp_loss = disp_loss + self.log_tau * 0.0
+                if self.routing_mode == "softmax" and hasattr(self, "log_eps"):
+                    disp_loss = disp_loss + self.log_eps * 0.0
         else:
             disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
