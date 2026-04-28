@@ -78,19 +78,32 @@ def compute_bpp(out_net: dict, num_pixels: int) -> torch.Tensor:
 
 class RateDistortionLoss(nn.Module):
     """
-    Rate-distortion loss with adaptive entropy-dispersion bonus.
+    Rate-distortion loss with adaptive entropy-dispersion bonus AND a
+    separate, fixed-weight dictionary diversity penalty.
 
-        L = λ · distortion + bpp  −  effective · H(m)
+        L =  λ · distortion
+           + bpp
+           − effective · H(m)
+           + dict_penalty_weight · dict_penalty
 
-    where H(m) is the Shannon entropy of the column-marginal of the transport
-    plan.  We SUBTRACT the entropy bonus so minimising L maximises H
-    (uniform dictionary usage).
+    where
+      H(m)         is Shannon entropy (bits) of the column-marginal of the
+                   transport plan — maximised → uniform dictionary usage.
+      dict_penalty is the off-diagonal cosine-similarity penalty on the
+                   dictionary tokens (≥ 0) — minimised → diverse tokens.
 
-    Sign convention:
+    Sign convention for the entropy bonus:
       - model.forward() returns  dispersion_loss = −H   (negative entropy)
       - here:  dispersion_bonus = −dispersion_loss = H  (positive)
-      - loss = RD − effective * H
+      - loss = RD − effective · H
 
+    Why dict_penalty is handled separately from dispersion_loss
+    -----------------------------------------------------------
+    Earlier versions packed `dict_penalty * 10` into `dispersion_loss`,
+    so the EMA-based adaptive scale had to track a mixed signal whose sign
+    can flip during training (H − 10·dict_penalty).  With a fixed weight on
+    dict_penalty and EMA only over the routing-entropy term, both signals
+    have well-defined gradient directions and the EMA is no longer noisy.
     """
 
     def __init__(
@@ -98,12 +111,14 @@ class RateDistortionLoss(nn.Module):
         lmbda: float = 1e-2,
         metric: str = "mse",
         disp_weight: float = 0.1,
+        dict_penalty_weight: float = 1.0,
     ):
         super().__init__()
         self.mse = nn.MSELoss()
         self.lmbda = lmbda
         self.metric = metric
         self.disp_weight = disp_weight
+        self.dict_penalty_weight = dict_penalty_weight
 
         if metric == "ms-ssim" and lmbda < 1.0:
             warnings.warn(
@@ -147,6 +162,7 @@ class RateDistortionLoss(nn.Module):
 
         out["loss"] = self.lmbda * distortion + bpp_loss
 
+        # ── Routing entropy bonus  (−effective · H) ─────────────────────────
         if "dispersion_loss" in output:
             disp_bonus = -output["dispersion_loss"]  # H ≥ 0 (bits)
             out["dispersion_bonus"] = disp_bonus
@@ -176,6 +192,17 @@ class RateDistortionLoss(nn.Module):
                 effective = self.effective_disp_coeff
 
             out["loss"] = out["loss"] - effective * disp_bonus
+
+        # ── Dictionary diversity penalty  (+ fixed_w · dict_penalty) ─────────
+        # Always added with a constant weight: dict_penalty is already bounded
+        # in [0, 1] by construction (squared ReLU on cosine similarities), so
+        # no adaptive scaling is needed.  Only contributes during training,
+        # since QueryDictionaryGenerator returns 0.0 in eval mode.
+        if "dict_penalty" in output:
+            dp = output["dict_penalty"]
+            out["dict_penalty"] = dp
+            if self.training:
+                out["loss"] = out["loss"] + self.dict_penalty_weight * dp
 
         return out
 
@@ -226,6 +253,7 @@ def train_one_epoch(
     aux_meter = AverageMeter()
     bpp_meter = AverageMeter()
     disp_meter = AverageMeter()
+    dict_pen_meter = AverageMeter()
 
     pbar = tqdm(
         enumerate(train_dataloader),
@@ -260,11 +288,14 @@ def train_one_epoch(
 
         if "dispersion_bonus" in out_criterion:
             disp_meter.update(out_criterion["dispersion_bonus"].item())
+        if "dict_penalty" in out_criterion:
+            dict_pen_meter.update(out_criterion["dict_penalty"].item())
 
         pbar.set_postfix(
             rd=f"{rd_meter.avg:.4f}",
             bpp=f"{bpp_meter.avg:.4f}",
             H=f"{disp_meter.avg:.3f}",
+            dp=f"{dict_pen_meter.avg:.4f}",
         )
 
         if accelerator.is_main_process and i % 100 == 0:
@@ -274,6 +305,7 @@ def train_one_epoch(
                 writer.add_scalar("Train/Aux_Loss", aux_meter.avg, step)
                 writer.add_scalar("Train/Bpp", bpp_meter.avg, step)
                 writer.add_scalar("Train/Dict_Entropy_H", disp_meter.avg, step)
+                writer.add_scalar("Train/Dict_Penalty", dict_pen_meter.avg, step)
                 writer.add_scalar(
                     "Train/Disp_eff_coeff",
                     criterion.effective_disp_coeff,
@@ -360,6 +392,7 @@ def test_epoch(
     bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
     disp_meter = AverageMeter()
+    dict_pen_meter = AverageMeter()
     gap_psnr: float = float("nan")
 
     # Sync entropy tables on all ranks before eval loop
@@ -398,6 +431,10 @@ def test_epoch(
                 if "dispersion_bonus" in out_criterion:
                     disp_meter.update(
                         out_criterion["dispersion_bonus"].item(), d.size(0)
+                    )
+                if "dict_penalty" in out_criterion:
+                    dict_pen_meter.update(
+                        out_criterion["dict_penalty"].item(), d.size(0)
                     )
 
                 per_image_metrics = torch.stack(
@@ -444,6 +481,7 @@ def test_epoch(
             writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
             writer.add_scalar("Val/Bpp", bpp_meter.avg, epoch)
             writer.add_scalar("Val/Dict_H", disp_meter.avg, epoch)
+            writer.add_scalar("Val/Dict_Penalty", dict_pen_meter.avg, epoch)
             if not math.isnan(gap_psnr):
                 writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
 
@@ -491,6 +529,15 @@ def parse_args():
         choices=["mse", "ms-ssim"],
     )
     p.add_argument("--disp-weight", type=float, default=0.1)
+    p.add_argument(
+        "--dict-penalty-weight",
+        type=float,
+        default=1.0,
+        help="Fixed weight on the dictionary-token diversity penalty "
+        "(off-diagonal cosine similarity, ≥0).  Bounded in [0,1] so a "
+        "constant weight is sufficient — no EMA scaling needed.  "
+        "Set to 0 to disable.",
+    )
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--sinkhorn-iters", type=int, default=20)
     p.add_argument("--lr-milestones", type=int, nargs="+", default=[360, 380])
@@ -605,7 +652,10 @@ def main():
     )
 
     criterion = RateDistortionLoss(
-        lmbda=args.lmbda, metric=args.metric, disp_weight=args.disp_weight
+        lmbda=args.lmbda,
+        metric=args.metric,
+        disp_weight=args.disp_weight,
+        dict_penalty_weight=args.dict_penalty_weight,
     ).to(accelerator.device)
 
     (

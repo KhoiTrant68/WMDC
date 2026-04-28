@@ -361,9 +361,20 @@ class GatedMemoryUpdater(nn.Module):
       3. Computes a delta (additive update) and a sigmoid gate.
       4. Returns: memory_new = memory + delta * sigmoid(gate)
 
-    The gate starts nearly closed (bias = -2.0) so the memory update is
-    initially small.  This prevents early instability when the delta_proj
-    weights are still random.
+    Design rationale (additive vs. GRU-style)
+    -----------------------------------------
+    We use the ADDITIVE form  m_new = m + δ * gate  rather than the
+    GRU-style  m_new = m * (1 − gate) + δ * gate.
+
+    Reason: the GRU form attenuates the memory by `gate ≈ sigmoid(-2) ≈ 0.119`
+    at every step at init, even though delta is zero-initialised.  After the
+    4 memory updates in a 5-slice loop the memory would be reduced to
+    ≈ 0.881⁴ ≈ 0.60× its original magnitude before the model has learned
+    anything useful.
+
+    The additive form preserves the memory exactly at init (delta=0 → no
+    change) and matches the "start-as-no-op" pattern used elsewhere in the
+    codebase (LRP gate, FiLM, fusion residual, delta_proj zero-init).
     """
 
     def __init__(self, slice_ch: int):
@@ -378,10 +389,12 @@ class GatedMemoryUpdater(nn.Module):
         self.delta_proj = nn.Conv2d(slice_ch, slice_ch, kernel_size=3, padding=1)
         self.gate_proj = nn.Conv2d(slice_ch, slice_ch, kernel_size=3, padding=1)
 
-        # Zero-init delta so updates start at 0
+        # Zero-init delta so additive updates start at 0
         nn.init.zeros_(self.delta_proj.weight)
         nn.init.zeros_(self.delta_proj.bias)
-        # Zero-weight, small negative bias → gate ≈ sigmoid(-2) ≈ 0.12 at init
+        # Zero-weight, small negative bias → gate ≈ sigmoid(-2) ≈ 0.12 at init.
+        # Combined with delta=0, the update term `delta * gate` is exactly 0
+        # at init, so memory passes through unchanged.
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
 
@@ -401,7 +414,8 @@ class GatedMemoryUpdater(nn.Module):
 
         delta = self.delta_proj(context)
         gate = torch.sigmoid(self.gate_proj(context))
-        return memory * (1.0 - gate) + delta * gate
+        # Additive update — preserves memory at init (delta=0).
+        return memory + delta * gate
 
 
 # ==============================================================================

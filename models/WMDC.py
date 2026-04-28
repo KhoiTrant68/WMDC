@@ -49,34 +49,74 @@ def load_legacy_checkpoint(
     model: "WMDC", ckpt_path: str, device: str = "cpu"
 ) -> "WMDC":
     """
-    Load a checkpoint saved with the old hyper-decoder layout
-    (h_scale_s / h_mean_s) into a model that uses the new shared-trunk
-    layout (h_trunk / h_scale_head / h_mean_head).
-        h_trunk.0.*    →  deconv (shared, mirrors old h_scale_s.0)
-        h_trunk.1.*    →  VSSBlock (shared, mirrors old h_scale_s.1)
-        h_scale_head.* →  deconv (mirrors old h_scale_s.2)
-        h_mean_head.*  →  deconv (mirrors old h_mean_s.2)
+    Load a checkpoint from any of three historical state_dict layouts into
+    the current model layout.
+
+    Three layouts handled
+    ---------------------
+    1) ORIGINAL (pre-trunk-share):
+       h_scale_s.{0,1,2}.*  +  h_mean_s.{0,1,2}.*
+
+    2) TRANSITIONAL (shared trunk, symmetric heads):
+       h_trunk.{0,1}.*  +  h_scale_head.{weight,bias}  +  h_mean_head.{weight,bias}
+       (both heads were a single deconv)
+
+    3) CURRENT (shared trunk, asymmetric scale head):
+       h_trunk.{0,1}.*
+       h_scale_head.0.*  (extra Conv 3x3, gives scale a larger receptive field)
+       h_scale_head.2.*  (final deconv)
+       h_mean_head.{weight,bias}  (single deconv, unchanged)
+
+    Mapping rules (layout 1 → layout 3):
+        h_trunk.0.*    ←  h_scale_s.0.*
+        h_trunk.1.*    ←  h_scale_s.1.*
+        h_scale_head.2.*  ←  h_scale_s.2.*       (final deconv slot)
+        h_scale_head.0.*  ←  newly initialised   (no source in old ckpt)
+        h_mean_head.*  ←  h_mean_s.2.*
+        h_mean_s.{0,1}.*  → discarded
+                          (trunk already populated from h_scale_s)
+
+    Mapping rules (layout 2 → layout 3):
+        h_scale_head.weight  →  h_scale_head.2.weight
+        h_scale_head.bias    →  h_scale_head.2.bias
+        (h_scale_head.0.* — the new conv — is left at random init)
+        all other keys pass through unchanged
     """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd = ckpt.get("state_dict", ckpt)
 
     remap: dict = {}
     for k, v in sd.items():
+        # ── Layout 1: original h_scale_s / h_mean_s ──────────────────────
         if k.startswith("h_scale_s."):
             suffix = k[len("h_scale_s.") :]  # e.g. "0.weight" or "2.bias"
-            idx = int(suffix.split(".")[0])
-            rest = suffix[len(str(idx)) + 1 :]  # e.g. "weight"
+            idx_str, _, rest = suffix.partition(".")
+            idx = int(idx_str)
             if idx < 2:
                 remap[f"h_trunk.{idx}.{rest}"] = v
-            else:
-                remap[f"h_scale_head.{rest}"] = v
+            else:  # idx == 2 (final deconv)
+                # In the new layout, scale's final deconv is at index 2 of
+                # the Sequential (Conv → GELU → Deconv).
+                remap[f"h_scale_head.2.{rest}"] = v
         elif k.startswith("h_mean_s."):
             suffix = k[len("h_mean_s.") :]
-            idx = int(suffix.split(".")[0])
-            rest = suffix[len(str(idx)) + 1 :]
+            idx_str, _, rest = suffix.partition(".")
+            idx = int(idx_str)
             if idx == 2:
+                # h_mean_head is a single Deconv (no Sequential wrap).
                 remap[f"h_mean_head.{rest}"] = v
             # idx 0,1 discarded (trunk initialised from h_scale_s above)
+        # ── Layout 2: transitional (h_scale_head as single Deconv) ───────
+        elif k.startswith("h_scale_head."):
+            tail = k[len("h_scale_head.") :]
+            head = tail.split(".", 1)[0]
+            if head in ("weight", "bias"):
+                # Layout 2: the whole key is "h_scale_head.weight" /
+                # "h_scale_head.bias" — no nested index. Migrate to slot 2.
+                remap[f"h_scale_head.2.{tail}"] = v
+            else:
+                # Layout 3 (already current) — pass through untouched.
+                remap[k] = v
         else:
             remap[k] = v
 
@@ -444,7 +484,17 @@ class WMDC(CompressionModel):
             x_hat          : (B, 3, H, W)  reconstructed image
             likelihoods    : {'y': ..., 'z': ...}
             aux_loss       : scalar — entropy bottleneck CDF loss
-            dispersion_loss: scalar — negative dictionary entropy (–H, bits)
+            dispersion_loss: scalar — negative dictionary-routing entropy (−H, bits),
+                             summed over slices and divided by num_slices.
+                             Sign convention: minimising  dispersion_loss
+                             ⟺ maximising H ⟺ uniform dictionary use.
+            dict_penalty   : scalar ≥ 0 — pairwise off-diagonal cosine
+                             similarity penalty on the dictionary tokens
+                             (encourages diverse/orthogonal tokens).
+                             Returned SEPARATELY from dispersion_loss because
+                             the two have different sign conventions and very
+                             different magnitudes; conflating them breaks the
+                             EMA-based adaptive scaling in RateDistortionLoss.
         """
         x = x.float()
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
@@ -475,7 +525,11 @@ class WMDC(CompressionModel):
         y_likelihood: list[torch.Tensor] = []
 
         memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
-        total_dispersion = dict_penalty * 10.0
+
+        # Routing entropy accumulator: ONLY −H from the per-slice attention.
+        # dict_penalty is tracked separately and returned as its own key,
+        # so RateDistortionLoss can apply an independent (non-EMA) weight to it.
+        total_dispersion = torch.zeros((), device=x.device, dtype=x.dtype)
 
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
@@ -483,6 +537,8 @@ class WMDC(CompressionModel):
             if self.routing_mode != "unbalanced_eot":
                 # Add zero contribution to keep rho_predictors in the backward
                 # graph for DDP correctness with find_unused_parameters=False.
+                # rho_out is rho_raw * 0.0 in this branch (see _compute_rho_spatial),
+                # so the numerical contribution is exactly zero.
                 if self.training:
                     total_dispersion = total_dispersion + rho_out.sum()
                 rho_spatial = None  # attention routing unchanged
@@ -548,7 +604,8 @@ class WMDC(CompressionModel):
                 "z": z_likelihoods,
             },
             "aux_loss": self.aux_loss(),
-            "dispersion_loss": total_dispersion,
+            "dispersion_loss": total_dispersion,  # only −H from routing
+            "dict_penalty": dict_penalty,  # ≥ 0, separate signal
         }
 
     # =========================================================================

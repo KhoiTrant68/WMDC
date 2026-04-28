@@ -416,12 +416,11 @@ class UnifiedDictionaryAttention(nn.Module):
         as a safe fallback when Sinkhorn diverges in either EOT mode.
 
         P[b, hw, :] = softmax(−C[b, hw, :] / τ)  — rows sum to 1.
+
+        log_tau is always registered (see __init__ Bug-3 fix), so we can
+        always read it directly.
         """
-        if hasattr(self, "log_tau"):
-            tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
-        else:
-            # Fallback path: called from a Sinkhorn mode that has no log_tau
-            tau = self.tau_float
+        tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
         return F.softmax(-C_mat / tau, dim=-1)
 
     # -----------------------------------------------------------------------
