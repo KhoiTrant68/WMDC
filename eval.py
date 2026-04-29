@@ -181,7 +181,7 @@ def compute_util_from_saved(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--routing_mode",
+        "--routing-mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],

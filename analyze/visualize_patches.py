@@ -24,7 +24,7 @@ def parse_args():
         description="Generate visual comparison patches for WMDC"
     )
     parser.add_argument(
-        "--routing_mode",
+        "--routing-mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],
