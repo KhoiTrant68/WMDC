@@ -12,10 +12,10 @@ CHECKPOINT_ROOT="$HOME/wmdc_runs"
 RESULTS_DIR="$REPO/results"
 
 # ── Training hyperparams ─────────────────────────────────────────────
-EPOCHS=6
+EPOCHS=2
 BATCH_SIZE=4
-LR_MILESTONES="3 4"
-LAST_EPOCHS_STE=2
+LR_MILESTONES="1"
+LAST_EPOCHS_STE=0
 
 # ── Lambdas ──────────────────────────────────────────────────────────
 # LAMBDAS_FULL=(0.0018 0.0036 0.0067 0.013 0.025 0.0483)   # full RD curve
