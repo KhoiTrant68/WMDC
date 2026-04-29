@@ -182,7 +182,7 @@ run_failures() {
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
     $PYTHON analyze/visualize_failure_cases.py \
-        --img_dir "$KODAK_DIR" \
+        --dataset "$KODAK_DIR" \
         --checkpoint "$ck" \
         --routing-mode unbalanced_eot --cuda \
         --output "$VIZ_DIR/failure_cases.pdf"
