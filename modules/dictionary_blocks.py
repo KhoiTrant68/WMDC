@@ -90,20 +90,29 @@ class UnifiedDictionaryAttention(nn.Module):
                        After Sinkhorn, P is scaled by HW so row sums ≈ 1,
                        matching the softmax normalisation convention.
 
-    'unbalanced_eot' — KL-unbalanced Sinkhorn
-                       with spatially-varying row marginal strength ρ(x).
+    'unbalanced_eot' — Unbalanced Sinkhorn with spatially-varying row marginal
+                       strength ρ(x).  The marginal divergence type is set by
+                       `marginal_div`:
 
-                        log_g_new = log_b  −  shrink_col * logsumexp(log_f − M, rows)
-                        log_f_new = log_a  −  shrink_row * logsumexp(log_g − M, cols)
+                       'kl'  (KL divergence, Séjourné et al. 2019):
+                           Aprox_KL(x) = ρ/(ρ+ε) · x   (multiplicative shrinkage)
+                           log_g ← log_b − shrink_col · lse(log_f − M, rows)
+                           log_f ← log_a − shrink_row · lse(log_g − M, cols)
+                           Smooth spatial gating: row sums taper continuously
+                           from 0 (outlier) to 1 (perfect match).
 
-                       This matches KullbackLeibler.aprox(x) = ρ/(ρ+ε)·x
-                       from the reference unbalanced-ot library (Séjourné et al.).
+                       'tv'  (Total Variation divergence, Séjourné et al. 2022):
+                           Aprox_TV(x) = clamp(x, −ρ, +ρ)   (hard clip)
+                           log_g ← log_b − clamp(lse(log_f − M, rows), −ρ/ε, ρ/ε)
+                           log_f ← log_a − clamp(lse(log_g − M, cols), −ρ/ε, ρ/ε)
+                           Sharp spatial gating: pixels either match the dict
+                           (row_sum ≈ 1) or are cleanly suppressed (row_sum ≈ 0),
+                           with no intermediate values.  Recommended for crisp
+                           object / texture boundaries.
 
-                       P is scaled by HW after Sinkhorn.  Row sums are NOT
-                       forced to 1 — unbalanced OT intentionally relaxes the
-                       row marginal.  Low-confidence pixels yield row sums < 1
-                       (spatial gating).  The raw row mass is stored in
-                       `last_row_mass` (eval mode only) for ablation studies.
+                       P is scaled by HW after Sinkhorn.  Row sums are NOT forced
+                       to 1 — unbalanced OT intentionally relaxes the row marginal.
+                       The raw row mass is stored in `last_row_mass` (eval only).
 
     Parameters
     ----------
@@ -115,6 +124,7 @@ class UnifiedDictionaryAttention(nn.Module):
     ot_eps      : initial Sinkhorn entropic regularisation ε
     iters       : total Sinkhorn iterations
     routing_mode: one of {'softmax', 'balanced_eot', 'unbalanced_eot'}
+    marginal_div: divergence for row/col marginals in unbalanced_eot — 'kl' or 'tv'
     tv_weight   : spatial TV weight on P (0 = disabled)
     """
 
@@ -128,6 +138,7 @@ class UnifiedDictionaryAttention(nn.Module):
         ot_eps: float = 0.1,
         iters: int = 20,
         routing_mode: str = "unbalanced_eot",
+        marginal_div: str = "kl",
         tv_weight: float = 0.0,
     ):
         super().__init__()
@@ -149,6 +160,11 @@ class UnifiedDictionaryAttention(nn.Module):
         if routing_mode not in valid:
             raise ValueError(f"routing_mode must be one of {valid}")
         self.routing_mode = routing_mode
+
+        valid_div = {"kl", "tv"}
+        if marginal_div not in valid_div:
+            raise ValueError(f"marginal_div must be one of {valid_div}")
+        self.marginal_div = marginal_div
 
         # Learnable log-scale parameters so ε / τ stay positive during training
         self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
@@ -296,39 +312,24 @@ class UnifiedDictionaryAttention(nn.Module):
         self, C_mat: torch.Tensor, rho_flat: torch.Tensor
     ) -> torch.Tensor:
         """
-        KL-unbalanced entropic OT in log-domain.
+        Unbalanced entropic OT in log-domain.  Supports two marginal divergences
+        controlled by `self.marginal_div`:
 
-        Row marginal strength : per-pixel ρ_i  (spatially varying, (B, HW))
-        Col marginal strength : mean(ρ) across pixels  (B, 1)
+        'kl'  — KL proximity operator (Séjourné et al. 2019):
+                    Aprox_KL(x) = ρ/(ρ+ε) · x
+                    log_g ← log_b − shrink_col · lse(log_f − M, rows)
+                    log_f ← log_a − shrink_row · lse(log_g − M, cols)
+                Smooth spatial gating: row masses taper continuously ∈ (0,1).
 
-        The KL proximity operator is (Séjourné et al. 2019, Table 1):
-            Aprox_ρKL(x) = ρ/(ρ+ε) · x
+        'tv'  — TV proximity operator (Séjourné et al. 2022):
+                    Aprox_TV(x) = clamp(x, −ρ, +ρ)
+                    log_g ← log_b − clamp(lse(log_f − M, rows), −ρ/ε, ρ/ε)
+                    log_f ← log_a − clamp(lse(log_g − M, cols), −ρ/ε, ρ/ε)
+                Sharp spatial gating: pixels either fully match the dictionary
+                (row_sum ≈ 1) or are cleanly suppressed (row_sum ≈ 0).
 
-        Applied to the Sinkhorn potential updates this gives:
-
-                lse_g    = logsumexp(log_f − M, dim=rows)       (B, 1, N)
-                log_g   ← log_b  −  shrink_col * lse_g
-
-                lse_f    = logsumexp(log_g − M, dim=cols)       (B, HW, 1)
-                log_f   ← log_a  −  shrink_row * lse_f
-
-        Derivation sketch:
-            softmin_x(f)  =  ε · logsumexp((f/ε + log_a − C/ε), rows)
-                          =  ε · (log_a + logsumexp(log_f − M, rows))
-            g_new = −Aprox(−softmin_x(f))
-                  = (ρ/(ρ+ε)) · ε · (log_a + logsumexp(log_f−M, rows))
-
-            In absorbed form (potentials already include log_a / log_b):
-                log_g_new = log_b  −  shrink_col · logsumexp(log_f − M, rows)
-
-            The key point: shrinkage multiplies ONLY the logsumexp term,
-            NOT the marginal log_b.  Multiplying log_b by shrink would
-            correspond to applying Aprox to the marginal measure itself,
-            which is mathematically incorrect.
-
-        Numerical bias of the OLD (wrong) formula for typical compression:
-            HW=1536, N=128, ε=0.1, ρ=0.5  →  bias on log_P ≈ +2.03
-            →  P inflated by ≈ 7.6× relative to correct plan
+        In the absorbed form the shrinkage / clamp applies ONLY to the logsumexp
+        term, not to the marginal constants log_a / log_b.
 
         Parameters
         ----------
@@ -343,55 +344,64 @@ class UnifiedDictionaryAttention(nn.Module):
         eps = F.softplus(self.log_eps) + 0.01  # strictly positive
 
         log_a = -math.log(HW)  # scalar
-        log_b = -math.log(N)  # scalar
-
+        log_b = -math.log(N)   # scalar
         M = C_mat.float() / eps  # (B, HW, N)
 
-        # Per-pixel row shrinkage:  s_i = ρ_i / (ρ_i + ε)  ∈ (0, 1)
-        #   ρ → ∞ : s → 1  →  balanced limit (hard row constraint)
-        #   ρ → 0 : s → 0  →  free transport (no row constraint)
-        shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
-
-        # Column shrinkage from mean row strength.
         rho_mean = rho_flat.mean(dim=1, keepdim=True)  # (B, 1)
-        shrink_col = (rho_mean / (rho_mean + eps)).unsqueeze(2)  # (B, 1, 1)
-
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
-        # ── No-grad warm-up (training only) ──────────────────────────────────
-        # During warm-up we detach shrink_{row,col} because the no-grad context
-        # would prevent gradients anyway, but detaching avoids unnecessary
-        # computation in the backward graph of the subsequent grad iterations.
-        if self.training and self.n_nograd_iters > 0:
-            with torch.no_grad():
-                _s_col = shrink_col.detach()
-                _s_row = shrink_row.detach()
-                for _ in range(self.n_nograd_iters):
-                    # Shrink only the logsumexp, NOT log_b/log_a
-                    lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B,1,N)
-                    log_g = log_b - _s_col * lse_g
+        if self.marginal_div == "kl":
+            # Per-pixel row shrinkage: s_i = ρ_i/(ρ_i+ε) ∈ (0,1)
+            #   ρ→∞: s→1 (balanced limit)   ρ→0: s→0 (free transport)
+            shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
+            shrink_col = (rho_mean / (rho_mean + eps)).unsqueeze(2)  # (B, 1, 1)
 
-                    lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B,HW,1)
-                    log_f = log_a - _s_row * lse_f
+            if self.training and self.n_nograd_iters > 0:
+                with torch.no_grad():
+                    _sc, _sr = shrink_col.detach(), shrink_row.detach()
+                    for _ in range(self.n_nograd_iters):
+                        lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
+                        log_g = log_b - _sc * lse_g
+                        lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
+                        log_f = log_a - _sr * lse_f
 
-        # ── Grad iterations ───────────────────────────────────────────────────
-        n_iters = self.n_grad_iters if self.training else self.iters
-        for _ in range(n_iters):
-            # log_g ← log_b  −  shrink_col · logsumexp(log_f − M, rows)
-            lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
-            log_g = log_b - shrink_col * lse_g
+            n_iters = self.n_grad_iters if self.training else self.iters
+            for _ in range(n_iters):
+                lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
+                log_g = log_b - shrink_col * lse_g
+                lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B, HW, 1)
+                log_f = log_a - shrink_row * lse_f
 
-            # log_f ← log_a  −  shrink_row · logsumexp(log_g − M, cols)
-            lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B, HW, 1)
-            log_f = log_a - shrink_row * lse_f
+        else:  # tv
+            # TV clamp bounds in log-space: ρ/ε per pixel (row) and mean ρ/ε (col)
+            #   Large ρ/ε → wide clamp → approaches balanced OT
+            #   Small ρ/ε → narrow clamp → hard binary gating
+            rpe_row = (rho_flat / eps).unsqueeze(2)   # (B, HW, 1)
+            rpe_col = (rho_mean / eps).unsqueeze(2)   # (B, 1,  1)
+
+            if self.training and self.n_nograd_iters > 0:
+                with torch.no_grad():
+                    _rc, _rr = rpe_col.detach(), rpe_row.detach()
+                    for _ in range(self.n_nograd_iters):
+                        lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
+                        log_g = log_b - torch.clamp(lse_g, -_rc, _rc)
+                        lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
+                        log_f = log_a - torch.clamp(lse_f, -_rr, _rr)
+
+            n_iters = self.n_grad_iters if self.training else self.iters
+            for _ in range(n_iters):
+                lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
+                log_g = log_b - torch.clamp(lse_g, -rpe_col, rpe_col)
+                lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B, HW, 1)
+                log_f = log_a - torch.clamp(lse_f, -rpe_row, rpe_row)
 
         log_P = log_f + log_g - M  # (B, HW, N)
 
         if torch.isnan(log_P).any():
             self.sinkhorn_divergence_count += 1
             warnings.warn(
-                f"[UnbalancedEOT] Sinkhorn NaN detected "
+                f"[UnbalancedEOT/{self.marginal_div.upper()}] Sinkhorn NaN detected "
                 f"(eps={eps.item():.4f}, "
                 f"rho_mean={rho_flat.mean().item():.4f}, "
                 f"count={self.sinkhorn_divergence_count}). "

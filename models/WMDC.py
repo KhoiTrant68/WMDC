@@ -173,6 +173,7 @@ class WMDC(CompressionModel):
     dict_head_num  : dict_dim = 32 × dict_head_num
     dict_num       : number of dictionary tokens
     routing_mode   : {'softmax', 'balanced_eot', 'unbalanced_eot'}
+    marginal_div   : divergence for unbalanced_eot row/col marginals — 'kl' or 'tv'
     ot_eps         : Sinkhorn entropic regularisation ε
     sinkhorn_iters : total Sinkhorn iterations (≥ 20 recommended for ε = 0.1)
     tv_weight      : spatial TV weight on transport plan P (0 = disabled)
@@ -186,6 +187,7 @@ class WMDC(CompressionModel):
         dict_head_num: int = 20,
         dict_num: int = 128,
         routing_mode: str = "unbalanced_eot",
+        marginal_div: str = "kl",
         ot_eps: float = 0.1,
         sinkhorn_iters: int = 20,
         tv_weight: float = 0.0,
@@ -201,6 +203,7 @@ class WMDC(CompressionModel):
         self.dict_num = dict_num
         self.dict_dim = 32 * dict_head_num
         self.routing_mode = routing_mode
+        self.marginal_div = marginal_div
         self.use_dense_concat = use_dense_concat
         self.memory_init = memory_init
 
@@ -318,6 +321,7 @@ class WMDC(CompressionModel):
                     ot_eps=ot_eps,
                     iters=sinkhorn_iters,
                     routing_mode=routing_mode,
+                    marginal_div=marginal_div,
                     tv_weight=tv_weight,
                 )
                 for i in range(num_slices)

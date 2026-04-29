@@ -191,6 +191,13 @@ def main():
     parser.add_argument("--output", type=str, default="output")
     parser.add_argument("--ot-eps", type=float, default=0.1)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
+    parser.add_argument(
+        "--marginal-div",
+        type=str,
+        default="kl",
+        choices=["kl", "tv"],
+        help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
+    )
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
@@ -220,6 +227,7 @@ def main():
         M=320,
         num_slices=5,
         routing_mode=args.routing_mode,
+        marginal_div=args.marginal_div,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
     ).to(device)
