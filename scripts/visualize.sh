@@ -163,7 +163,7 @@ run_rho() {
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
     $PYTHON analyze/visualize_rho_heatmap.py \
-        --image "$REF_IMG" \
+        --image-dir "$KODAK_DIR" \
         --checkpoint "$ck" \
         --routing-mode unbalanced_eot --cuda \
         --output "$VIZ_DIR/rho_heatmap.pdf"
