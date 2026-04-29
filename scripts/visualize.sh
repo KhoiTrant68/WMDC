@@ -204,12 +204,12 @@ for cmd in "${CMDS[@]}"; do
         rho)        run_rho ;;
         failures)   run_failures ;;
         all)
-            run_attention
-            run_patches
-            run_latents
-            run_sinkhorn
-            run_dict_util
-            run_rho
+            # run_attention
+            # run_patches
+            # run_latents
+            # run_sinkhorn
+            # run_dict_util
+            # run_rho
             run_failures
             ;;
         *)
