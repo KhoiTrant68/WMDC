@@ -129,7 +129,7 @@ run_dict_util() {
     cd "$REPO"
     mkdir -p "$VIZ_DIR"
 
-    local LAM=0.013
+    local LAM=0.0036
     local ck_with; ck_with="$(ckpt_path "ablation/full" "$LAM")"
     local ck_no;   ck_no="$(ckpt_path "ablation/no_disp_bonus" "$LAM")"
 
@@ -163,7 +163,7 @@ run_rho() {
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
     $PYTHON analyze/visualize_rho_heatmap.py \
-        --image-dir "$KODAK_DIR" \
+        --image "$REF_IMG" \
         --checkpoint "$ck" \
         --routing-mode unbalanced_eot --cuda \
         --output "$VIZ_DIR/rho_heatmap.pdf"
