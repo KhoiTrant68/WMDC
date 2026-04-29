@@ -1,39 +1,77 @@
 #!/usr/bin/env bash
 # scripts/run_ablation.sh
 # =======================
-# Launches all training jobs for the component-removal ablation (Table 4)
-# and the routing ablation (Table 1). Designed for a SLURM cluster but
-# works on a single multi-GPU node (just remove `sbatch` and the SBATCH
-# directives below).
+# Component-removal ablation (Table 4): train & evaluate 7 variants.
 #
 # Usage:
-#   ./scripts/run_ablation.sh launch        # submit all jobs
-#   ./scripts/run_ablation.sh dry-run       # print commands only
-#   ./scripts/run_ablation.sh evaluate      # run evaluation on completed checkpoints
+#   bash scripts/run_ablation.sh train        # train all variants sequentially (Kaggle/single-node)
+#   bash scripts/run_ablation.sh train full   # train one variant only
+#   bash scripts/run_ablation.sh dry-run      # print commands without running
+#   bash scripts/run_ablation.sh launch       # submit to SLURM cluster
+#   bash scripts/run_ablation.sh evaluate     # eval checkpoints + BD-rate table
 #
-# Configuration:
-#   See `configs/ablation_variants.py` for variant definitions.
-#   Edit DATA_DIR, CHECKPOINT_ROOT, WANDB_ENTITY at the top of this file.
+# Configuration: edit scripts/config.sh (paths, epochs, lambdas).
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
-SBATCH="${SBATCH:-sbatch}"   # set SBATCH=echo for dry-run
+SBATCH="${SBATCH:-sbatch}"
 
-# Local aliases for names used in the heredoc below
-DATA_DIR="$TRAIN_DATA"
-LAMBDAS=("${LAMBDAS_ABLATION[@]}")
-
-mkdir -p "$CHECKPOINT_ROOT"
-
-# ── Submit one training job ─────────────────────────────────────────
-submit_train_job() {
+# ── Core training function (used by both train and launch) ───────────
+run_train_job() {
     local variant="$1"
     local lam="$2"
-    local out_dir="$CHECKPOINT_ROOT/${variant}/lam_${lam}"
+    local dry="${3:-0}"
     local extra_flags
     extra_flags="$(variant_flags "$variant")"
+    local out_dir="$CHECKPOINT_ROOT/ablation/$variant/lam_$lam"
+
+    mkdir -p "$out_dir"
+
+    # Build the command
+    local cmd="$LAUNCHER train.py \
+        -d \"$TRAIN_DATA\" \
+        --save_path \"$out_dir\" \
+        --lambda $lam \
+        --metric mse \
+        --epochs $EPOCHS \
+        --batch-size $BATCH_SIZE \
+        --lr-milestones $LR_MILESTONES \
+        --last-epochs-with-ste $LAST_EPOCHS_STE"
+
+    [ -n "$extra_flags" ] && cmd="$cmd $extra_flags"
+
+    if [ "$dry" -eq 1 ]; then
+        echo "[dry-run] $variant @ λ=$lam"
+        echo "  $cmd"
+        echo ""
+        return
+    fi
+
+    echo ""
+    echo "=== Training: $variant  λ=$lam ==="
+    echo "    save_path: $out_dir"
+    [ -n "$extra_flags" ] && echo "    extra: $extra_flags"
+
+    # Resume if latest checkpoint exists
+    local latest="$out_dir/lambda_${lam}_mse/checkpoint_latest.pth.tar"
+    if [ -f "$latest" ]; then
+        echo "    [resume] $latest"
+        cmd="$cmd --checkpoint \"$latest\""
+    fi
+
+    eval "$cmd"
+    echo "[done] $variant @ λ=$lam"
+}
+
+# ── SLURM submission (cluster) ───────────────────────────────────────
+submit_slurm_job() {
+    local variant="$1"
+    local lam="$2"
+    local extra_flags
+    extra_flags="$(variant_flags "$variant")"
+    local out_dir="$CHECKPOINT_ROOT/ablation/$variant/lam_$lam"
 
     mkdir -p "$out_dir"
 
@@ -48,100 +86,136 @@ submit_train_job() {
 
 set -euo pipefail
 source ~/.bashrc
+cd "\$SLURM_SUBMIT_DIR"
 
-cd \$SLURM_SUBMIT_DIR
-$PYTHON train.py \\
-    --dataset "$DATA_DIR" \\
-    --epochs $EPOCHS \\
-    --batch-size $BATCH_SIZE \\
+$LAUNCHER train.py \\
+    -d "$TRAIN_DATA" \\
+    --save_path "$out_dir" \\
     --lambda $lam \\
     --metric mse \\
-    --save_path "$out_dir" \\
+    --epochs $EPOCHS \\
+    --batch-size $BATCH_SIZE \\
+    --lr-milestones $LR_MILESTONES \\
+    --last-epochs-with-ste $LAST_EPOCHS_STE \\
     $extra_flags
 EOF
 
     echo "[submit] $variant @ λ=$lam → $out_dir"
-    if [ "$SBATCH" = "echo" ]; then
-        cat "$out_dir/launch.sbatch"
-    else
-        $SBATCH "$out_dir/launch.sbatch"
-    fi
+    $SBATCH "$out_dir/launch.sbatch"
 }
 
-# ── Submit one evaluation job ───────────────────────────────────────
-submit_eval_jobs() {
-    # Per-variant, build the list of checkpoints (one per lambda) and
-    # call compute_bd_rate.py evaluate.
+# ── Evaluate all variants → RD JSONs + BD-rate table ────────────────
+run_evaluate() {
+    echo ""
+    echo "=== Evaluating ablation variants on Kodak ==="
+    cd "$REPO"
+    mkdir -p "$RESULTS_DIR/bd_rate"
+
     for variant in "${VARIANTS[@]}"; do
-        local rd_json="$CHECKPOINT_ROOT/${variant}/rd_kodak.json"
         local ckpts=()
-        for lam in "${LAMBDAS[@]}"; do
-            local ck="$CHECKPOINT_ROOT/${variant}/lam_${lam}/checkpoint_best.pth.tar"
+        for lam in "${LAMBDAS_ABLATION[@]}"; do
+            local ck; ck="$(ckpt_path "ablation/$variant" "$lam")"
             if [ -f "$ck" ]; then
                 ckpts+=("$ck")
             else
-                echo "[skip-eval] missing $ck"
+                echo "[skip] missing $ck"
             fi
         done
+
         if [ "${#ckpts[@]}" -eq 0 ]; then
-            echo "[no-eval] $variant: no checkpoints"
+            echo "[no-eval] $variant: no checkpoints found"
             continue
         fi
-        echo "[evaluate] $variant → $rd_json"
+
+        local out="$RESULTS_DIR/bd_rate/${variant}.json"
+        echo ""
+        echo "-- $variant (${#ckpts[@]} checkpoints)"
+
         $PYTHON analyze/compute_bd_rate.py evaluate \
             --variant-name "$variant" \
             --checkpoints "${ckpts[@]}" \
             --dataset "$KODAK_DIR" \
-            --output "$rd_json" \
+            --output "$out" \
+            --routing-mode unbalanced_eot \
             --cuda
+
+        echo "[done] $variant → $out"
     done
 
-    # Aggregate BD-rate of all variants vs. the "full" variant as anchor.
-    local anchor="$CHECKPOINT_ROOT/full/rd_kodak.json"
+    # BD-rate table vs. "full" anchor
+    local anchor="$RESULTS_DIR/bd_rate/full.json"
     if [ ! -f "$anchor" ]; then
-        echo "[ERR] anchor RD JSON not found at $anchor; cannot compute BD-rate."
+        echo "[ERR] anchor JSON not found: $anchor (run 'evaluate' after training 'full')"
         return 1
     fi
+
     local var_jsons=()
     for variant in "${VARIANTS[@]}"; do
-        if [ "$variant" != "full" ]; then
-            local rd="$CHECKPOINT_ROOT/${variant}/rd_kodak.json"
-            [ -f "$rd" ] && var_jsons+=("$rd")
-        fi
+        [ "$variant" = "full" ] && continue
+        local f="$RESULTS_DIR/bd_rate/${variant}.json"
+        [ -f "$f" ] && var_jsons+=("$f")
     done
+
+    local table="$RESULTS_DIR/bd_rate/bd_rate_table.json"
     $PYTHON analyze/compute_bd_rate.py bd-rate \
         --anchor-json "$anchor" \
         --variant-jsons "${var_jsons[@]}" \
-        --output "$CHECKPOINT_ROOT/bd_rate_table.json"
-    echo "[done] BD-rate table → $CHECKPOINT_ROOT/bd_rate_table.json"
+        --output "$table" \
+        --method akima
+
+    echo ""
+    echo "[done] BD-rate table → $table"
 }
 
-# ── Main dispatcher ─────────────────────────────────────────────────
-case "${1:-}" in
+# ── Main dispatcher ──────────────────────────────────────────────────
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+    train)
+        # Optional: pass a single variant name as argument
+        TARGET="${1:-all}"
+        for variant in "${VARIANTS[@]}"; do
+            [ "$TARGET" != "all" ] && [ "$TARGET" != "$variant" ] && continue
+            for lam in "${LAMBDAS_ABLATION[@]}"; do
+                run_train_job "$variant" "$lam" 0
+            done
+        done
+        echo ""
+        echo "=== All ablation training done ==="
+        ;;
+
+    dry-run)
+        TARGET="${1:-all}"
+        for variant in "${VARIANTS[@]}"; do
+            [ "$TARGET" != "all" ] && [ "$TARGET" != "$variant" ] && continue
+            for lam in "${LAMBDAS_ABLATION[@]}"; do
+                run_train_job "$variant" "$lam" 1
+            done
+        done
+        ;;
+
     launch)
         for variant in "${VARIANTS[@]}"; do
-            for lam in "${LAMBDAS[@]}"; do
-                submit_train_job "$variant" "$lam"
+            for lam in "${LAMBDAS_ABLATION[@]}"; do
+                submit_slurm_job "$variant" "$lam"
             done
         done
         ;;
-    dry-run)
-        SBATCH=echo
-        for variant in "${VARIANTS[@]}"; do
-            for lam in "${LAMBDAS[@]}"; do
-                submit_train_job "$variant" "$lam"
-            done
-        done
-        ;;
+
     evaluate)
-        submit_eval_jobs
+        run_evaluate
         ;;
+
     *)
-        echo "Usage: $0 {launch|dry-run|evaluate}"
+        echo "Usage: $0 {train|dry-run|launch|evaluate} [variant]"
         echo ""
-        echo "  launch     — submit all training jobs to the cluster"
-        echo "  dry-run    — print the sbatch scripts without submitting"
-        echo "  evaluate   — evaluate completed checkpoints + BD-rate table"
+        echo "  train [variant]  — train all (or one) variant sequentially  ← Kaggle"
+        echo "  dry-run          — print commands without running"
+        echo "  launch           — submit all jobs to SLURM cluster"
+        echo "  evaluate         — eval checkpoints on Kodak + BD-rate table"
+        echo ""
+        echo "Variants: ${VARIANTS[*]}"
         exit 1
         ;;
 esac

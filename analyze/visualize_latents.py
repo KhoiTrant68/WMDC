@@ -32,9 +32,10 @@ def main():
     )
     parser.add_argument("--ot-eps", type=float, default=0.1)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
+    parser.add_argument("--cuda", action="store_true")
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     model = WMDC(
         N=192,
