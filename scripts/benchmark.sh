@@ -26,7 +26,6 @@ run_vram() {
 
     $PYTHON analyze/measure_vram.py \
         --checkpoint "$ck" \
-        --routing-mode unbalanced_eot \
         --cuda \
         --output "$BENCH_DIR/vram_report.json"
 
@@ -40,7 +39,6 @@ run_flops() {
     mkdir -p "$BENCH_DIR"
 
     $PYTHON analyze/benchmark_backbone.py \
-        --routing-mode unbalanced_eot \
         --cuda \
         --output "$BENCH_DIR/flops_report.json"
 
