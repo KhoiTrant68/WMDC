@@ -49,6 +49,14 @@ variant_flags() {
     esac
 }
 
+# ── Helper: backbone name per ablation variant (used at eval time) ───
+variant_backbone() {
+    case "$1" in
+        no_fdm) echo "ss2d" ;;
+        *)      echo "fdm" ;;
+    esac
+}
+
 # ── Helper: checkpoint path for a given variant + lambda ─────────────
 ckpt_path() {
     local dir="$1" lam="$2"

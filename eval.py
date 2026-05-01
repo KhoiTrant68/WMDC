@@ -198,6 +198,9 @@ def main():
         choices=["kl", "tv"],
         help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
     )
+    parser.add_argument("--backbone", type=str, default="fdm",
+                        choices=["fdm", "ss2d", "cnn", "swin", "fdm_reversed"],
+                        help="Backbone variant matching the checkpoint.")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
@@ -230,6 +233,7 @@ def main():
         marginal_div=args.marginal_div,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        backbone=args.backbone,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

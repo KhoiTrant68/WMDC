@@ -81,6 +81,7 @@ def cmd_evaluate(args):
             routing_mode=args.routing_mode,
             ot_eps=args.ot_eps,
             sinkhorn_iters=args.sinkhorn_iters,
+            backbone=args.backbone,
             update_for_inference=True,
             strict_load=False,
         )
@@ -204,6 +205,8 @@ def main():
     p_eval.add_argument("--dataset", type=str, required=True)
     p_eval.add_argument("--output", type=str, required=True)
     p_eval.add_argument("--routing-mode", type=str, default="unbalanced_eot")
+    p_eval.add_argument("--backbone", type=str, default="fdm",
+                        help="Backbone variant matching the checkpoint (e.g. fdm, ss2d, cnn).")
     p_eval.add_argument("--ot-eps", type=float, default=0.1)
     p_eval.add_argument("--sinkhorn-iters", type=int, default=20)
     p_eval.add_argument(

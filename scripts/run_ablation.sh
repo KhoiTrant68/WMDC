@@ -128,6 +128,7 @@ run_evaluate() {
         fi
 
         local out="$RESULTS_DIR/bd_rate/${variant}.json"
+        local backbone; backbone="$(variant_backbone "$variant")"
         echo ""
         echo "-- $variant (${#ckpts[@]} checkpoints)"
 
@@ -137,6 +138,7 @@ run_evaluate() {
             --dataset "$KODAK_DIR" \
             --output "$out" \
             --routing-mode unbalanced_eot \
+            --backbone "$backbone" \
             --cuda
 
         echo "[done] $variant → $out"
