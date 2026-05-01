@@ -49,11 +49,14 @@ variant_flags() {
     esac
 }
 
-# ── Helper: backbone name per ablation variant (used at eval time) ───
-variant_backbone() {
+# ── Helper: eval-time architecture flags per ablation variant ────────
+# Returns only the flags that affect model structure at inference time.
+# Used by eval.sh and run_ablation.sh to match the checkpoint's architecture.
+variant_eval_flags() {
     case "$1" in
-        no_fdm) echo "ss2d" ;;
-        *)      echo "fdm" ;;
+        no_fdm)          echo "--backbone ss2d" ;;
+        no_stateful_mem) echo "--use-dense-concat" ;;
+        *)               echo "" ;;
     esac
 }
 

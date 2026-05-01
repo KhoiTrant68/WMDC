@@ -82,6 +82,7 @@ def cmd_evaluate(args):
             ot_eps=args.ot_eps,
             sinkhorn_iters=args.sinkhorn_iters,
             backbone=args.backbone,
+            use_dense_concat=args.use_dense_concat,
             update_for_inference=True,
             strict_load=False,
         )
@@ -207,6 +208,8 @@ def main():
     p_eval.add_argument("--routing-mode", type=str, default="unbalanced_eot")
     p_eval.add_argument("--backbone", type=str, default="fdm",
                         help="Backbone variant matching the checkpoint (e.g. fdm, ss2d, cnn).")
+    p_eval.add_argument("--use-dense-concat", action="store_true",
+                        help="Build the dense-concat variant (no stateful memory).")
     p_eval.add_argument("--ot-eps", type=float, default=0.1)
     p_eval.add_argument("--sinkhorn-iters", type=int, default=20)
     p_eval.add_argument(

@@ -128,17 +128,18 @@ run_evaluate() {
         fi
 
         local out="$RESULTS_DIR/bd_rate/${variant}.json"
-        local backbone; backbone="$(variant_backbone "$variant")"
+        local eval_flags; eval_flags="$(variant_eval_flags "$variant")"
         echo ""
         echo "-- $variant (${#ckpts[@]} checkpoints)"
 
+        # shellcheck disable=SC2086  # word-split intentional for flags
         $PYTHON analyze/compute_bd_rate.py evaluate \
             --variant-name "$variant" \
             --checkpoints "${ckpts[@]}" \
             --dataset "$KODAK_DIR" \
             --output "$out" \
             --routing-mode unbalanced_eot \
-            --backbone "$backbone" \
+            $eval_flags \
             --cuda
 
         echo "[done] $variant → $out"

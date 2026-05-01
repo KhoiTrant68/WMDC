@@ -201,6 +201,8 @@ def main():
     parser.add_argument("--backbone", type=str, default="fdm",
                         choices=["fdm", "ss2d", "cnn", "swin", "fdm_reversed"],
                         help="Backbone variant matching the checkpoint.")
+    parser.add_argument("--use-dense-concat", action="store_true",
+                        help="Build the dense-concat variant (no stateful memory).")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
@@ -234,6 +236,7 @@ def main():
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
         backbone=args.backbone,
+        use_dense_concat=args.use_dense_concat,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

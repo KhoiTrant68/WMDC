@@ -61,17 +61,18 @@ eval_ablation() {
                 continue
             fi
 
-            local backbone; backbone="$(variant_backbone "$variant")"
+            local eval_flags; eval_flags="$(variant_eval_flags "$variant")"
             echo ""
             echo "-- variant=$variant  λ=$lam"
             mkdir -p "$out"
 
+            # shellcheck disable=SC2086  # word-split intentional for flags
             $PYTHON eval.py \
                 --dataset "$KODAK_DIR" \
                 --checkpoint "$ckpt" \
                 --output "$out" \
                 --routing-mode unbalanced_eot \
-                --backbone "$backbone" \
+                $eval_flags \
                 --cuda \
                 --measure-dict-util
 
