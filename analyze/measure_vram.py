@@ -68,9 +68,18 @@ def _build_model(variant: str, device: str, checkpoint: str | None):
         model = WMDC(**kwargs).to(device)
 
     if checkpoint:
-        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-        sd = ckpt.get("state_dict", ckpt)
-        model.load_state_dict(sd, strict=False)
+        if variant == "dense":
+            # Dense variant has structurally different channel dims (growing per
+            # slice), so a stateful checkpoint is never compatible.  VRAM
+            # measurement only needs a randomly-initialised model.
+            print(
+                "[INFO] Skipping checkpoint load for dense variant "
+                "(incompatible architecture — different _eot_in/cc dims)."
+            )
+        else:
+            ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+            sd = ckpt.get("state_dict", ckpt)
+            model.load_state_dict(sd, strict=False)
 
     return model
 
