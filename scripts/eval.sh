@@ -61,6 +61,7 @@ eval_ablation() {
                 continue
             fi
 
+            local backbone; backbone="$(variant_backbone "$variant")"
             echo ""
             echo "-- variant=$variant  λ=$lam"
             mkdir -p "$out"
@@ -70,6 +71,7 @@ eval_ablation() {
                 --checkpoint "$ckpt" \
                 --output "$out" \
                 --routing-mode unbalanced_eot \
+                --backbone "$backbone" \
                 --cuda \
                 --measure-dict-util
 
