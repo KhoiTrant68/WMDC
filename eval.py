@@ -203,6 +203,9 @@ def main():
                         help="Backbone variant matching the checkpoint.")
     parser.add_argument("--use-dense-concat", action="store_true",
                         help="Build the dense-concat variant (no stateful memory).")
+    parser.add_argument("--memory-init", type=str, default="bootstrap",
+                        choices=["bootstrap", "zero"],
+                        help="Memory initialisation strategy matching the checkpoint.")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
@@ -237,6 +240,7 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
         backbone=args.backbone,
         use_dense_concat=args.use_dense_concat,
+        memory_init=args.memory_init,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

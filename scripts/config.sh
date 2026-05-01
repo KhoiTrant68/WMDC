@@ -56,6 +56,7 @@ variant_eval_flags() {
     case "$1" in
         no_fdm)          echo "--backbone ss2d" ;;
         no_stateful_mem) echo "--use-dense-concat" ;;
+        no_bootstrap_M1) echo "--memory-init zero" ;;
         *)               echo "" ;;
     esac
 }

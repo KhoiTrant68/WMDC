@@ -52,6 +52,7 @@ def load_model(
     num_slices: int = 5,
     backbone: str = "fdm",
     use_dense_concat: bool = False,
+    memory_init: str = "bootstrap",
     update_for_inference: bool = True,
     strict_load: bool = True,
 ) -> WMDC:
@@ -75,6 +76,7 @@ def load_model(
         sinkhorn_iters=sinkhorn_iters,
         backbone=backbone,
         use_dense_concat=use_dense_concat,
+        memory_init=memory_init,
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)

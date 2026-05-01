@@ -83,6 +83,7 @@ def cmd_evaluate(args):
             sinkhorn_iters=args.sinkhorn_iters,
             backbone=args.backbone,
             use_dense_concat=args.use_dense_concat,
+            memory_init=args.memory_init,
             update_for_inference=True,
             strict_load=False,
         )
@@ -210,6 +211,9 @@ def main():
                         help="Backbone variant matching the checkpoint (e.g. fdm, ss2d, cnn).")
     p_eval.add_argument("--use-dense-concat", action="store_true",
                         help="Build the dense-concat variant (no stateful memory).")
+    p_eval.add_argument("--memory-init", type=str, default="bootstrap",
+                        choices=["bootstrap", "zero"],
+                        help="Memory initialisation strategy matching the checkpoint.")
     p_eval.add_argument("--ot-eps", type=float, default=0.1)
     p_eval.add_argument("--sinkhorn-iters", type=int, default=20)
     p_eval.add_argument(
