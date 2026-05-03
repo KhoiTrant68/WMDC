@@ -229,14 +229,20 @@ class UnifiedDictionaryAttention(nn.Module):
 
     def _spatial_tv(self, P: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """
-        Isotropic total-variation on the transport plan, encouraging
+        Isotropic total-variation on the routing distribution, encouraging
         spatially smooth token assignments.
 
         P : (B, HW, N)
         Returns scalar mean TV (mean over batch and token dims).
         """
-        B, HW, N = P.shape
-        P_sp = P.transpose(1, 2).view(B, N, H, W)  # (B, N, H, W)
+        # Normalise by row sums before computing TV so the penalty targets
+        # the routing distribution only, not the spatial gating signal (row
+        # mass). Without this, TV would penalise sharp gating boundaries
+        # in unbalanced_eot, counteracting the intended crisp spatial gating.
+        row_sum = P.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        P_norm = P / row_sum  # (B, HW, N) — row sums = 1
+        B, HW, N = P_norm.shape
+        P_sp = P_norm.transpose(1, 2).view(B, N, H, W)  # (B, N, H, W)
         tv_h = (P_sp[:, :, 1:, :] - P_sp[:, :, :-1, :]).abs().mean()
         tv_w = (P_sp[:, :, :, 1:] - P_sp[:, :, :, :-1]).abs().mean()
         return tv_h + tv_w
@@ -297,7 +303,8 @@ class UnifiedDictionaryAttention(nn.Module):
             fallback_P = self._route_softmax(C_mat)
             if self.training:
                 fallback_P = fallback_P + self.log_eps * 0.0
-            return fallback_P
+            # Softmax row sums = 1; divide by HW so the caller's *HW gives row sums ≈ 1
+            return fallback_P / HW
 
         # exp(-60) ≈ 1e-26 — negligible contribution to row sums
         return torch.exp(log_P.clamp(min=-60.0))
@@ -427,7 +434,8 @@ class UnifiedDictionaryAttention(nn.Module):
             fallback_P = self._route_softmax(C_mat)
             if self.training:
                 fallback_P = fallback_P + (rho_flat * 0.0).sum() + self.log_eps * 0.0
-            return fallback_P
+            # Softmax row sums = 1; divide by HW so the caller's *HW gives row sums ≈ 1
+            return fallback_P / HW
 
         return torch.exp(log_P.clamp(min=-60.0))
 

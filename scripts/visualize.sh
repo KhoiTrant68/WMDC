@@ -190,6 +190,26 @@ run_failures() {
     echo "[done] failure cases → $VIZ_DIR/failure_cases.pdf"
 }
 
+# ── UEOT bitrate-leakage audit ───────────────────────────────────────
+run_audit() {
+    echo ""
+    echo "=== UEOT rate-vs-gating audit (#9 reviewer concern) ==="
+    cd "$REPO"
+    mkdir -p "$VIZ_DIR"
+
+    local ck; ck="$(ckpt_routing "unbalanced_eot")"
+    [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
+
+    $PYTHON analyze/audit_rate_vs_gating.py \
+        --checkpoint "$ck" \
+        --dataset "$KODAK_DIR" \
+        --routing-mode unbalanced_eot \
+        --output-dir "$VIZ_DIR/audit_gating" \
+        --cuda
+
+    echo "[done] audit → $VIZ_DIR/audit_gating/"
+}
+
 # ── dispatcher ───────────────────────────────────────────────────────
 CMDS=("$@")
 [ ${#CMDS[@]} -eq 0 ] && CMDS=(all)
@@ -203,6 +223,7 @@ for cmd in "${CMDS[@]}"; do
         dict_util)  run_dict_util ;;
         rho)        run_rho ;;
         failures)   run_failures ;;
+        audit)      run_audit ;;
         all)
             run_attention
             run_patches
@@ -211,10 +232,11 @@ for cmd in "${CMDS[@]}"; do
             run_dict_util
             run_rho
             run_failures
+            run_audit
             ;;
         *)
             echo "Unknown subcommand: $cmd" >&2
-            echo "Usage: $0 {all|attention|patches|latents|sinkhorn|dict_util|rho|failures}"
+            echo "Usage: $0 {all|attention|patches|latents|sinkhorn|dict_util|rho|failures|audit}"
             exit 1
             ;;
     esac
