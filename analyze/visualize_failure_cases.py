@@ -40,16 +40,18 @@ import math
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from _common import compute_psnr, evaluate_codec, iter_dataset, load_model
 
 
-def _interpolate_psnr(ref_bpp: list[float], ref_psnr: list[float], target_bpp: float) -> float:
+def _interpolate_psnr(
+    ref_bpp: list[float], ref_psnr: list[float], target_bpp: float
+) -> float:
     """Linearly interpolate the reference PSNR at a given bpp."""
     if target_bpp <= ref_bpp[0]:
         return ref_psnr[0]
@@ -66,10 +68,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--dataset", required=True)
-    p.add_argument("--top-k", type=int, default=5,
-                   help="Number of worst-case images to visualise.")
-    p.add_argument("--reference-rd", type=str, default=None,
-                   help="Optional JSON with reference rd_points to compute PSNR-gap-vs-VTM.")
+    p.add_argument(
+        "--top-k", type=int, default=5, help="Number of worst-case images to visualise."
+    )
+    p.add_argument(
+        "--reference-rd",
+        type=str,
+        default=None,
+        help="Optional JSON with reference rd_points to compute PSNR-gap-vs-VTM.",
+    )
     p.add_argument("--routing-mode", type=str, default="unbalanced_eot")
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--sinkhorn-iters", type=int, default=20)
@@ -81,9 +88,12 @@ def main():
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     model = load_model(
-        args.checkpoint, device,
-        routing_mode=args.routing_mode, ot_eps=args.ot_eps,
-        sinkhorn_iters=args.sinkhorn_iters, update_for_inference=True,
+        args.checkpoint,
+        device,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
+        update_for_inference=True,
     )
 
     # Optional reference RD for efficiency gap.
@@ -106,6 +116,7 @@ def main():
         psnr = compute_psnr(x, x_hat)
         # Quick eval of bpp.
         from _common import compute_actual_bpp
+
         bpp = compute_actual_bpp(out_enc["strings"], H * W)
 
         psnr_ref = _interpolate_psnr(ref_bpp, ref_psnr, bpp) if ref_bpp else None
@@ -114,19 +125,23 @@ def main():
         # Error map for visualisation.
         err = (x - x_hat).abs().mean(dim=1, keepdim=True).squeeze().cpu().numpy()
 
-        records.append({
-            "path": path,
-            "name": os.path.basename(path),
-            "x": x.squeeze().permute(1, 2, 0).cpu().numpy(),
-            "x_hat": x_hat.squeeze().permute(1, 2, 0).cpu().numpy(),
-            "err": err,
-            "psnr": psnr,
-            "bpp": bpp,
-            "psnr_ref": psnr_ref,
-            "psnr_gap": psnr_gap,
-        })
+        records.append(
+            {
+                "path": path,
+                "name": os.path.basename(path),
+                "x": x.squeeze().permute(1, 2, 0).cpu().numpy(),
+                "x_hat": x_hat.squeeze().permute(1, 2, 0).cpu().numpy(),
+                "err": err,
+                "psnr": psnr,
+                "bpp": bpp,
+                "psnr_ref": psnr_ref,
+                "psnr_gap": psnr_gap,
+            }
+        )
         gap_str = f", gap = {psnr_gap:+.3f}" if psnr_gap is not None else ""
-        print(f"  {os.path.basename(path):>30s}: psnr={psnr:.3f}  bpp={bpp:.4f}{gap_str}")
+        print(
+            f"  {os.path.basename(path):>30s}: psnr={psnr:.3f}  bpp={bpp:.4f}{gap_str}"
+        )
 
     # ── Pick worst-K ────────────────────────────────────────────────────
     if ref_bpp:
@@ -175,13 +190,15 @@ def main():
         # Strip image arrays before dumping.
         slim = []
         for r in records:
-            slim.append({
-                "name": r["name"],
-                "psnr": r["psnr"],
-                "bpp": r["bpp"],
-                "psnr_ref": r["psnr_ref"],
-                "psnr_gap": r["psnr_gap"],
-            })
+            slim.append(
+                {
+                    "name": r["name"],
+                    "psnr": r["psnr"],
+                    "bpp": r["bpp"],
+                    "psnr_ref": r["psnr_ref"],
+                    "psnr_gap": r["psnr_gap"],
+                }
+            )
         with open(args.json_out, "w") as f:
             json.dump({"records": slim, "ranking_metric": rank_label}, f, indent=2)
         print(f"Saved JSON → {args.json_out}")

@@ -219,10 +219,14 @@ def main():
                 if raw is None:
                     # last_row_mass is only populated for unbalanced_eot.
                     ax.text(
-                        0.5, 0.5,
+                        0.5,
+                        0.5,
                         f"N/A\n(requires\nunbalanced_eot,\ngot {args.routing_mode})",
-                        ha="center", va="center", transform=ax.transAxes,
-                        fontsize=8, color="gray",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                        fontsize=8,
+                        color="gray",
                     )
                     continue
 

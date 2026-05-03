@@ -105,7 +105,9 @@ def pad_to_64(x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
     return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect"), pad_h, pad_w
 
 
-def load_image(image_path: str, device: str = "cuda") -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+def load_image(
+    image_path: str, device: str = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """
     Returns (x, x_padded, H, W).
 

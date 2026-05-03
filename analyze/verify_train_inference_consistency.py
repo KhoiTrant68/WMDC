@@ -43,7 +43,6 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
 from _common import compute_psnr, evaluate_codec, iter_dataset, load_model
 
 
@@ -54,15 +53,17 @@ def evaluate_one(model, dataset_dir: str, device: str) -> List[dict]:
         train_res = evaluate_codec(model, x, x_padded, H, W, use_actual_codec=False)
         # Codec round-trip.
         codec_res = evaluate_codec(model, x, x_padded, H, W, use_actual_codec=True)
-        rows.append({
-            "image": os.path.basename(path),
-            "psnr_train": train_res["psnr"],
-            "psnr_codec": codec_res["psnr"],
-            "bpp_train": train_res["bpp"],
-            "bpp_codec": codec_res["bpp"],
-            "delta_psnr": train_res["psnr"] - codec_res["psnr"],
-            "delta_bpp": train_res["bpp"] - codec_res["bpp"],
-        })
+        rows.append(
+            {
+                "image": os.path.basename(path),
+                "psnr_train": train_res["psnr"],
+                "psnr_codec": codec_res["psnr"],
+                "bpp_train": train_res["bpp"],
+                "bpp_codec": codec_res["bpp"],
+                "delta_psnr": train_res["psnr"] - codec_res["psnr"],
+                "delta_bpp": train_res["bpp"] - codec_res["bpp"],
+            }
+        )
         print(
             f"  {os.path.basename(path):>30s}: "
             f"Δpsnr = {rows[-1]['delta_psnr']:+.4f} dB  "
@@ -79,8 +80,12 @@ def main():
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--sinkhorn-iters", type=int, default=20)
     p.add_argument("--output", type=str, default="consistency_report.json")
-    p.add_argument("--plot", type=str, default=None,
-                   help="Optional PDF path for a Δ histogram per checkpoint.")
+    p.add_argument(
+        "--plot",
+        type=str,
+        default=None,
+        help="Optional PDF path for a Δ histogram per checkpoint.",
+    )
     p.add_argument("--cuda", action="store_true")
     args = p.parse_args()
 
@@ -90,7 +95,8 @@ def main():
     for ckpt in args.checkpoints:
         print(f"\n== Checkpoint: {ckpt} ==")
         model = load_model(
-            ckpt, device,
+            ckpt,
+            device,
             routing_mode=args.routing_mode,
             ot_eps=args.ot_eps,
             sinkhorn_iters=args.sinkhorn_iters,
@@ -121,13 +127,17 @@ def main():
         # Verdict.
         red_flag = []
         if summary["delta_psnr"]["max_abs"] > 0.05:
-            red_flag.append(f"|Δpsnr|_max = {summary['delta_psnr']['max_abs']:.4f} > 0.05 dB")
+            red_flag.append(
+                f"|Δpsnr|_max = {summary['delta_psnr']['max_abs']:.4f} > 0.05 dB"
+            )
         if summary["delta_bpp"]["mean"] > 0.005:
             red_flag.append(f"Δbpp mean = {summary['delta_bpp']['mean']:.5f} > 0.005")
         verdict = "🟢 OK" if not red_flag else "🔴 RED FLAG: " + "; ".join(red_flag)
         summary["verdict"] = verdict
-        print(f"  Summary: Δpsnr={summary['delta_psnr']['mean']:+.4f}±{summary['delta_psnr']['std']:.4f} dB, "
-              f"Δbpp={summary['delta_bpp']['mean']:+.5f}±{summary['delta_bpp']['std']:.5f}")
+        print(
+            f"  Summary: Δpsnr={summary['delta_psnr']['mean']:+.4f}±{summary['delta_psnr']['std']:.4f} dB, "
+            f"Δbpp={summary['delta_bpp']['mean']:+.5f}±{summary['delta_bpp']['std']:.5f}"
+        )
         print(f"  {verdict}")
 
         del model

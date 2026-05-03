@@ -45,16 +45,17 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-
 from _common import load_model
 
 try:
     from fvcore.nn import FlopCountAnalysis
+
     _HAS_FVCORE = True
 except ImportError:
     _HAS_FVCORE = False
     try:
         from thop import profile as thop_profile
+
         _HAS_THOP = True
     except ImportError:
         _HAS_THOP = False
@@ -98,16 +99,19 @@ def _swap_backbones(model: nn.Module, backbone: str) -> None:
     Replace every FrequencyDisentangledMamba submodule in `model` with
     the requested variant. Used when WMDC doesn't accept `backbone=` yet.
     """
-    from modules.wavelet_blocks import FrequencyDisentangledMamba
-
     from ablation_models.backbone_variants import build_backbone
+    from modules.wavelet_blocks import FrequencyDisentangledMamba
 
     replacements: list[tuple[nn.Module, str, nn.Module]] = []
     for parent in model.modules():
         for name, child in list(parent.named_children()):
             if isinstance(child, FrequencyDisentangledMamba):
                 # Inspect dim from the child if possible; default to 192.
-                dim = getattr(child, "dim", None) or getattr(child, "hidden_dim", None) or 192
+                dim = (
+                    getattr(child, "dim", None)
+                    or getattr(child, "hidden_dim", None)
+                    or 192
+                )
                 new_block = build_backbone(backbone, dim=dim)
                 replacements.append((parent, name, new_block))
     for parent, name, new_block in replacements:
@@ -195,7 +199,9 @@ def benchmark_one(backbone: str, args, device: str) -> dict:
         sd = ckpt.get("state_dict", ckpt)
         miss, unexp = model.load_state_dict(sd, strict=False)
         if miss or unexp:
-            print(f"  [load] {len(miss)} missing, {len(unexp)} unexpected (expected for swapped backbones)")
+            print(
+                f"  [load] {len(miss)} missing, {len(unexp)} unexpected (expected for swapped backbones)"
+            )
 
     H, W = args.resolution
     x = torch.randn(1, 3, H, W, device=device)
@@ -211,12 +217,16 @@ def benchmark_one(backbone: str, args, device: str) -> dict:
 
     # Latency: encoder only (g_a + h_a).
     print("  Measuring encoder-only latency...")
+
     def enc_fn():
         with torch.no_grad():
             y = model.g_a(x)
             z = model.h_a(y)
             return z
-    enc_lat = _measure_latency(enc_fn, warmup=args.warmup, iters=args.iters, device=device)
+
+    enc_lat = _measure_latency(
+        enc_fn, warmup=args.warmup, iters=args.iters, device=device
+    )
 
     # GFLOPs (full forward).
     print("  Counting GFLOPs...")
@@ -243,8 +253,12 @@ def main():
     p.add_argument("--resolution", type=int, nargs=2, default=[768, 512])
     p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--iters", type=int, default=200)
-    p.add_argument("--checkpoint", type=str, default=None,
-                   help="Optional: load weights into the model. Latency/FLOPs are weight-independent, but this lets us catch shape mismatches.")
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional: load weights into the model. Latency/FLOPs are weight-independent, but this lets us catch shape mismatches.",
+    )
     p.add_argument("--output", type=str, default="backbone_benchmark.json")
     p.add_argument("--cuda", action="store_true")
     args = p.parse_args()
@@ -265,8 +279,10 @@ def main():
 
     # Pretty-print summary.
     print("\n" + "=" * 80)
-    print(f"{'Backbone':<14} {'Params(M)':>10} {'GFLOPs':>10} "
-          f"{'Full med(ms)':>14} {'Enc med(ms)':>14}")
+    print(
+        f"{'Backbone':<14} {'Params(M)':>10} {'GFLOPs':>10} "
+        f"{'Full med(ms)':>14} {'Enc med(ms)':>14}"
+    )
     print("-" * 80)
     for r in results:
         if "error" in r:

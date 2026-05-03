@@ -34,11 +34,7 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
-from _common import (
-    iter_dataset,
-    load_model,
-)
+from _common import iter_dataset, load_model
 
 # Dictionary size — must match model.QueryDictionaryGenerator.dict_num.
 DICT_NUM = 128
@@ -60,6 +56,7 @@ def collect_routing_plans(model, x_padded: torch.Tensor) -> list[torch.Tensor]:
             # under `attn_probs` (see dictionary_blocks.py).
             if hasattr(module, "attn_probs") and module.attn_probs is not None:
                 plans.append(module.attn_probs.detach().cpu())
+
         return hook_fn
 
     # Register one hook per slice (model.eot_attentions is a ModuleList).
@@ -101,9 +98,9 @@ def per_image_entropy(
     for P in plans:
         B, _, N = P.shape
         # Reshape to spatial grid; padded_HW must equal latent_h_pad * latent_w_pad.
-        assert P.shape[1] == latent_h_pad * latent_w_pad, (
-            f"plan shape {P.shape} != ({latent_h_pad}*{latent_w_pad})"
-        )
+        assert (
+            P.shape[1] == latent_h_pad * latent_w_pad
+        ), f"plan shape {P.shape} != ({latent_h_pad}*{latent_w_pad})"
         P_spatial = P.view(B, latent_h_pad, latent_w_pad, N)
         # Crop padding before marginalising.
         P_cropped = P_spatial[:, :true_h, :true_w, :]
@@ -198,7 +195,9 @@ def main():
     H_norm_with = [r["H_norm_mean"] for r in res_with]
     H_norm_no = [r["H_norm_mean"] for r in res_no]
 
-    print(f"\n=== Summary (probability-normalised entropy, max={MAX_ENTROPY_NATS:.4f}) ===")
+    print(
+        f"\n=== Summary (probability-normalised entropy, max={MAX_ENTROPY_NATS:.4f}) ==="
+    )
     print(
         f"With dispersion:    mean H_norm = {np.mean(H_norm_with):.4f} nats  "
         f"({np.mean(H_norm_with)/MAX_ENTROPY_NATS*100:.1f}% of max)"
@@ -214,9 +213,19 @@ def main():
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     n = max(len(H_norm_with), len(H_norm_no))
     x_axis = np.arange(1, n + 1)
-    axes[0].bar(x_axis - 0.2, H_norm_with, width=0.4, label="With disp.", color="steelblue")
-    axes[0].bar(x_axis + 0.2, H_norm_no, width=0.4, label="Without disp.", color="salmon")
-    axes[0].axhline(MAX_ENTROPY_NATS, color="gray", ls="--", alpha=0.7, label=f"Max H = log({DICT_NUM})")
+    axes[0].bar(
+        x_axis - 0.2, H_norm_with, width=0.4, label="With disp.", color="steelblue"
+    )
+    axes[0].bar(
+        x_axis + 0.2, H_norm_no, width=0.4, label="Without disp.", color="salmon"
+    )
+    axes[0].axhline(
+        MAX_ENTROPY_NATS,
+        color="gray",
+        ls="--",
+        alpha=0.7,
+        label=f"Max H = log({DICT_NUM})",
+    )
     axes[0].set_xlabel("Image index")
     axes[0].set_ylabel("Token-utilisation entropy (nats)")
     axes[0].set_title("Per-image dictionary utilisation")

@@ -560,9 +560,12 @@ class WMDC(CompressionModel):
             memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
         else:
             memory_state = torch.zeros(
-                hyper_prior.size(0), self.slice_ch,
-                hyper_prior.size(2), hyper_prior.size(3),
-                device=hyper_prior.device, dtype=hyper_prior.dtype,
+                hyper_prior.size(0),
+                self.slice_ch,
+                hyper_prior.size(2),
+                hyper_prior.size(3),
+                device=hyper_prior.device,
+                dtype=hyper_prior.dtype,
             )
 
         # Routing entropy accumulator: ONLY −H from the per-slice attention.
@@ -589,7 +592,11 @@ class WMDC(CompressionModel):
 
             # Query = hyper_prior ⊕ context
             if self.use_dense_concat:
-                query = hyper_prior if i == 0 else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                query = (
+                    hyper_prior
+                    if i == 0
+                    else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                )
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
@@ -697,9 +704,12 @@ class WMDC(CompressionModel):
             memory_state = self.init_memory(hyper_prior)
         else:
             memory_state = torch.zeros(
-                hyper_prior.size(0), self.slice_ch,
-                hyper_prior.size(2), hyper_prior.size(3),
-                device=hyper_prior.device, dtype=hyper_prior.dtype,
+                hyper_prior.size(0),
+                self.slice_ch,
+                hyper_prior.size(2),
+                hyper_prior.size(3),
+                device=hyper_prior.device,
+                dtype=hyper_prior.dtype,
             )
 
         for i, y_slice in enumerate(y_slices):
@@ -709,7 +719,11 @@ class WMDC(CompressionModel):
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
             if self.use_dense_concat:
-                query = hyper_prior if i == 0 else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                query = (
+                    hyper_prior
+                    if i == 0
+                    else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                )
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
@@ -784,9 +798,12 @@ class WMDC(CompressionModel):
             memory_state = self.init_memory(hyper_prior)
         else:
             memory_state = torch.zeros(
-                hyper_prior.size(0), self.slice_ch,
-                hyper_prior.size(2), hyper_prior.size(3),
-                device=hyper_prior.device, dtype=hyper_prior.dtype,
+                hyper_prior.size(0),
+                self.slice_ch,
+                hyper_prior.size(2),
+                hyper_prior.size(3),
+                device=hyper_prior.device,
+                dtype=hyper_prior.dtype,
             )
 
         for i in range(self.num_slices):
@@ -796,7 +813,11 @@ class WMDC(CompressionModel):
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
             if self.use_dense_concat:
-                query = hyper_prior if i == 0 else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                query = (
+                    hyper_prior
+                    if i == 0
+                    else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                )
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 

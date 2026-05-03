@@ -42,17 +42,18 @@ import argparse
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from _common import load_image, load_model
 
 try:
     from sklearn.cluster import KMeans
     from sklearn.manifold import TSNE
+
     _HAS_SKLEARN = True
 except ImportError:
     _HAS_SKLEARN = False
@@ -92,12 +93,21 @@ def plot_one(ax, sim: np.ndarray, title: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint-with", required=True,
-                   help="Checkpoint trained WITH dispersion+dict_penalty.")
-    p.add_argument("--checkpoint-without", required=True,
-                   help="Checkpoint trained WITHOUT dispersion or dict_penalty.")
-    p.add_argument("--image", required=True,
-                   help="Reference image used to compute dictionary tokens.")
+    p.add_argument(
+        "--checkpoint-with",
+        required=True,
+        help="Checkpoint trained WITH dispersion+dict_penalty.",
+    )
+    p.add_argument(
+        "--checkpoint-without",
+        required=True,
+        help="Checkpoint trained WITHOUT dispersion or dict_penalty.",
+    )
+    p.add_argument(
+        "--image",
+        required=True,
+        help="Reference image used to compute dictionary tokens.",
+    )
     p.add_argument("--output", type=str, default="dictionary_diversity.pdf")
     p.add_argument("--routing-mode", type=str, default="unbalanced_eot")
     p.add_argument("--ot-eps", type=float, default=0.1)
@@ -108,16 +118,24 @@ def main():
     _x, x_padded, _H, _W = load_image(args.image, device=device)
 
     print(f"== Loading WITH-penalty checkpoint: {args.checkpoint_with}")
-    m_with = load_model(args.checkpoint_with, device,
-                        routing_mode=args.routing_mode, ot_eps=args.ot_eps,
-                        update_for_inference=True)
+    m_with = load_model(
+        args.checkpoint_with,
+        device,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
+        update_for_inference=True,
+    )
     K_with = _get_dict_tokens(m_with, x_padded)
     sim_with = _cosine_matrix(K_with)
 
     print(f"== Loading WITHOUT-penalty checkpoint: {args.checkpoint_without}")
-    m_no = load_model(args.checkpoint_without, device,
-                      routing_mode=args.routing_mode, ot_eps=args.ot_eps,
-                      update_for_inference=True)
+    m_no = load_model(
+        args.checkpoint_without,
+        device,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
+        update_for_inference=True,
+    )
     K_no = _get_dict_tokens(m_no, x_padded)
     sim_no = _cosine_matrix(K_no)
 
@@ -134,12 +152,16 @@ def main():
 
     s_with = _offdiag_stats(sim_with)
     s_no = _offdiag_stats(sim_no)
-    print(f"\nWITH penalty   : max|off|={s_with['max_abs_off']:.3f}  "
-          f"mean|off|={s_with['mean_abs_off']:.3f}  "
-          f"frac(>0.5)={s_with['frac_high_sim']*100:.2f}%")
-    print(f"WITHOUT penalty: max|off|={s_no['max_abs_off']:.3f}  "
-          f"mean|off|={s_no['mean_abs_off']:.3f}  "
-          f"frac(>0.5)={s_no['frac_high_sim']*100:.2f}%")
+    print(
+        f"\nWITH penalty   : max|off|={s_with['max_abs_off']:.3f}  "
+        f"mean|off|={s_with['mean_abs_off']:.3f}  "
+        f"frac(>0.5)={s_with['frac_high_sim']*100:.2f}%"
+    )
+    print(
+        f"WITHOUT penalty: max|off|={s_no['max_abs_off']:.3f}  "
+        f"mean|off|={s_no['mean_abs_off']:.3f}  "
+        f"frac(>0.5)={s_no['frac_high_sim']*100:.2f}%"
+    )
 
     # ── Plot ─────────────────────────────────────────────────────────────
     if _HAS_SKLEARN:
@@ -148,12 +170,18 @@ def main():
         fig, axes = plt.subplots(1, 2, figsize=(11, 5))
         axes = np.array(axes).reshape(1, 2)
 
-    im0 = plot_one(axes[0, 0], sim_with,
-                   f"With penalty\nmax|off|={s_with['max_abs_off']:.2f}, "
-                   f"mean|off|={s_with['mean_abs_off']:.2f}")
-    im1 = plot_one(axes[0, 1], sim_no,
-                   f"Without penalty\nmax|off|={s_no['max_abs_off']:.2f}, "
-                   f"mean|off|={s_no['mean_abs_off']:.2f}")
+    im0 = plot_one(
+        axes[0, 0],
+        sim_with,
+        f"With penalty\nmax|off|={s_with['max_abs_off']:.2f}, "
+        f"mean|off|={s_with['mean_abs_off']:.2f}",
+    )
+    im1 = plot_one(
+        axes[0, 1],
+        sim_no,
+        f"Without penalty\nmax|off|={s_no['max_abs_off']:.2f}, "
+        f"mean|off|={s_no['mean_abs_off']:.2f}",
+    )
     plt.colorbar(im0, ax=axes[0, 0], fraction=0.046)
     plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
 
@@ -165,16 +193,32 @@ def main():
         ]:
             try:
                 emb = TSNE(n_components=2, perplexity=15, random_state=0).fit_transform(
-                    K.numpy())
-                cluster_ids = KMeans(n_clusters=8, n_init=10, random_state=0).fit_predict(
-                    K.numpy())
-                ax.scatter(emb[:, 0], emb[:, 1], c=cluster_ids, cmap="tab10",
-                           s=50, alpha=0.85, edgecolor="black", linewidth=0.5)
+                    K.numpy()
+                )
+                cluster_ids = KMeans(
+                    n_clusters=8, n_init=10, random_state=0
+                ).fit_predict(K.numpy())
+                ax.scatter(
+                    emb[:, 0],
+                    emb[:, 1],
+                    c=cluster_ids,
+                    cmap="tab10",
+                    s=50,
+                    alpha=0.85,
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
                 ax.set_title(f"{label} — t-SNE (k-means k=8)", fontsize=11)
                 ax.grid(alpha=0.3)
             except Exception as e:
-                ax.text(0.5, 0.5, f"t-SNE failed:\n{e}",
-                        ha="center", va="center", transform=ax.transAxes)
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"t-SNE failed:\n{e}",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
 
     fig.tight_layout()
     fig.savefig(args.output, dpi=300, bbox_inches="tight")

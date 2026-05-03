@@ -254,11 +254,18 @@ def cmd_table3(args):
 
     rows = [
         ("dense", r"Dense concatenation, $\mathcal{O}(K^2)$", "0.00\\,\\%"),
-        ("stateful", r"\textbf{Stateful memory, $\mathcal{O}(K)$ (ours)}",
-         _fmt_pct(bd_pct) if bd_pct is not None else "---"),
+        (
+            "stateful",
+            r"\textbf{Stateful memory, $\mathcal{O}(K)$ (ours)}",
+            _fmt_pct(bd_pct) if bd_pct is not None else "---",
+        ),
     ]
     for v_tag, label, bd_str in rows:
-        s1 = np.mean(slice1_by_variant.get(v_tag, [float("nan")])) if slice1_by_variant.get(v_tag) else float("nan")
+        s1 = (
+            np.mean(slice1_by_variant.get(v_tag, [float("nan")]))
+            if slice1_by_variant.get(v_tag)
+            else float("nan")
+        )
         vram_pair = vram_by_variant.get(v_tag, (0, float("nan")))
         line = (
             f"{label} & "
@@ -306,8 +313,12 @@ def cmd_table4(args):
         r"Full WMDC (reference) & 0.00\,\% \\",
     ]
     for tag in [
-        "no_ueot", "no_fdm", "no_stateful_mem", "no_bootstrap_M1",
-        "no_disp_bonus", "no_dict_penalty",
+        "no_ueot",
+        "no_fdm",
+        "no_stateful_mem",
+        "no_bootstrap_M1",
+        "no_disp_bonus",
+        "no_dict_penalty",
     ]:
         r = rows_by_variant.get(tag, {})
         bd_pct = r.get("bd_rate_pct")

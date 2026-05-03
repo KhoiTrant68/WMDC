@@ -34,7 +34,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-
 from _common import load_model
 
 
@@ -117,9 +116,9 @@ def measure_one(
         # Mimic the training loss: distortion + bpp + dispersion bonus.
         x_hat = out["x_hat"]
         mse = F.mse_loss(x_hat, x)
-        bpp = sum(
-            torch.log(lh).sum() for lh in out["likelihoods"].values()
-        ).abs() / (x.numel())
+        bpp = sum(torch.log(lh).sum() for lh in out["likelihoods"].values()).abs() / (
+            x.numel()
+        )
         loss = 0.013 * 65025.0 * mse + bpp
         if "dispersion_loss" in out:
             loss = loss + 0.01 * out["dispersion_loss"]
@@ -155,10 +154,19 @@ def measure_one(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--variants", nargs="+", default=["stateful", "dense"],
-                   choices=["stateful", "dense"])
-    p.add_argument("--resolutions", type=int, nargs="+", default=[256, 512, 768],
-                   help="Square-ish resolutions to test (paired as HxH).")
+    p.add_argument(
+        "--variants",
+        nargs="+",
+        default=["stateful", "dense"],
+        choices=["stateful", "dense"],
+    )
+    p.add_argument(
+        "--resolutions",
+        type=int,
+        nargs="+",
+        default=[256, 512, 768],
+        help="Square-ish resolutions to test (paired as HxH).",
+    )
     p.add_argument("--mode", choices=["forward", "train"], default="train")
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--output", type=str, default="vram_results.json")
@@ -170,21 +178,31 @@ def main():
         print("[WARN] VRAM measurement is meaningless on CPU; output will be 0.")
 
     # Round each resolution to a multiple of 64.
-    res_pairs = [(((r + 63) // 64) * 64, ((r + 63) // 64) * 64) for r in args.resolutions]
+    res_pairs = [
+        (((r + 63) // 64) * 64, ((r + 63) // 64) * 64) for r in args.resolutions
+    ]
 
     rows: list[dict] = []
     for v in args.variants:
         for H, W in res_pairs:
             try:
                 row = measure_one(
-                    v, H, W,
+                    v,
+                    H,
+                    W,
                     device=device,
                     mode=args.mode,
                     checkpoint=args.checkpoint,
                 )
             except torch.cuda.OutOfMemoryError as e:
-                row = {"variant": v, "H": H, "W": W, "mode": args.mode,
-                       "error": "OOM", "details": str(e)[:200]}
+                row = {
+                    "variant": v,
+                    "H": H,
+                    "W": W,
+                    "mode": args.mode,
+                    "error": "OOM",
+                    "details": str(e)[:200],
+                }
                 print(f"  [OOM] {v} at {H}x{W}")
                 if device == "cuda":
                     torch.cuda.empty_cache()
@@ -197,8 +215,10 @@ def main():
         if "error" in r:
             print(f"{r['variant']:<12} {r['H']}x{r['W']:<6} {r['mode']:<8} OOM")
         else:
-            print(f"{r['variant']:<12} {r['H']}x{r['W']:<6} {r['mode']:<8} "
-                  f"{r['peak_vram_GB']:>16.3f}")
+            print(
+                f"{r['variant']:<12} {r['H']}x{r['W']:<6} {r['mode']:<8} "
+                f"{r['peak_vram_GB']:>16.3f}"
+            )
 
     with open(args.output, "w") as f:
         json.dump({"results": rows}, f, indent=2)

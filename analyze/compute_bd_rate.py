@@ -47,7 +47,6 @@ from typing import List
 
 import numpy as np
 import torch
-
 from _common import evaluate_codec, iter_dataset, load_model
 
 # bjontegaard is the standard library used in compression papers.
@@ -96,23 +95,29 @@ def cmd_evaluate(args):
             )
             psnrs.append(res["psnr"])
             bpps.append(res["bpp"])
-            per_image_records.append({
-                "checkpoint": ckpt_path,
-                "image": os.path.basename(path),
-                "psnr": res["psnr"],
-                "bpp": res["bpp"],
-                "mode": res["mode"],
-            })
-            print(f"  {os.path.basename(path):>30s}: psnr={res['psnr']:.3f}  bpp={res['bpp']:.4f}")
+            per_image_records.append(
+                {
+                    "checkpoint": ckpt_path,
+                    "image": os.path.basename(path),
+                    "psnr": res["psnr"],
+                    "bpp": res["bpp"],
+                    "mode": res["mode"],
+                }
+            )
+            print(
+                f"  {os.path.basename(path):>30s}: psnr={res['psnr']:.3f}  bpp={res['bpp']:.4f}"
+            )
 
         mean_psnr = float(np.mean(psnrs))
         mean_bpp = float(np.mean(bpps))
-        rd_points.append({
-            "checkpoint": ckpt_path,
-            "psnr": mean_psnr,
-            "bpp": mean_bpp,
-            "n_images": len(psnrs),
-        })
+        rd_points.append(
+            {
+                "checkpoint": ckpt_path,
+                "psnr": mean_psnr,
+                "bpp": mean_bpp,
+                "n_images": len(psnrs),
+            }
+        )
         print(f"  → dataset mean: psnr={mean_psnr:.3f}  bpp={mean_bpp:.4f}")
 
         del model
@@ -161,7 +166,9 @@ def cmd_bd_rate(args):
     anchor_name = anchor.get("variant", os.path.basename(args.anchor_json))
 
     print(f"=== BD-rate vs. anchor: {anchor_name} ===")
-    print(f"Anchor curve: {len(anchor_bpp)} points, bpp range [{min(anchor_bpp):.3f}, {max(anchor_bpp):.3f}]")
+    print(
+        f"Anchor curve: {len(anchor_bpp)} points, bpp range [{min(anchor_bpp):.3f}, {max(anchor_bpp):.3f}]"
+    )
 
     table_rows: list[dict] = []
     for var_path in args.variant_jsons:
@@ -186,7 +193,9 @@ def cmd_bd_rate(args):
             "n_points": len(v_bpp),
         }
         table_rows.append(row)
-        print(f"  {v_name:>20s}: BD-rate = {bd_rate:+.3f}%   BD-PSNR = {bd_psnr:+.3f} dB")
+        print(
+            f"  {v_name:>20s}: BD-rate = {bd_rate:+.3f}%   BD-PSNR = {bd_psnr:+.3f} dB"
+        )
 
     out = {"anchor": anchor_name, "method": args.method, "rows": table_rows}
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
@@ -207,13 +216,24 @@ def main():
     p_eval.add_argument("--dataset", type=str, required=True)
     p_eval.add_argument("--output", type=str, required=True)
     p_eval.add_argument("--routing-mode", type=str, default="unbalanced_eot")
-    p_eval.add_argument("--backbone", type=str, default="fdm",
-                        help="Backbone variant matching the checkpoint (e.g. fdm, ss2d, cnn).")
-    p_eval.add_argument("--use-dense-concat", action="store_true",
-                        help="Build the dense-concat variant (no stateful memory).")
-    p_eval.add_argument("--memory-init", type=str, default="bootstrap",
-                        choices=["bootstrap", "zero"],
-                        help="Memory initialisation strategy matching the checkpoint.")
+    p_eval.add_argument(
+        "--backbone",
+        type=str,
+        default="fdm",
+        help="Backbone variant matching the checkpoint (e.g. fdm, ss2d, cnn).",
+    )
+    p_eval.add_argument(
+        "--use-dense-concat",
+        action="store_true",
+        help="Build the dense-concat variant (no stateful memory).",
+    )
+    p_eval.add_argument(
+        "--memory-init",
+        type=str,
+        default="bootstrap",
+        choices=["bootstrap", "zero"],
+        help="Memory initialisation strategy matching the checkpoint.",
+    )
     p_eval.add_argument("--ot-eps", type=float, default=0.1)
     p_eval.add_argument("--sinkhorn-iters", type=int, default=20)
     p_eval.add_argument(

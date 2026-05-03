@@ -32,7 +32,6 @@ import json
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-
 from _common import load_image, load_model
 
 
@@ -220,8 +219,10 @@ def main():
         res = measure_convergence(model, x_padded, args.max_iters, eps_value=eps)
         all_results[f"{eps:.4f}"] = res
         costs = res["primal_cost"]
+
         def _cost_at(n: int) -> str:
             return f"{costs[n - 1]:.6f}" if n <= len(costs) else "n/a"
+
         print(
             f"  cost @ iter 3:  {_cost_at(3)}\n"
             f"  cost @ iter 10: {_cost_at(10)}\n"
@@ -236,12 +237,20 @@ def main():
     for idx, (eps_label, res) in enumerate(all_results.items()):
         col = cmap(idx / max(len(all_results) - 1, 1))
         axes[0].plot(
-            res["iter_counts"], res["primal_cost"],
-            "-o", markersize=3, color=col, label=f"ε = {eps_label}",
+            res["iter_counts"],
+            res["primal_cost"],
+            "-o",
+            markersize=3,
+            color=col,
+            label=f"ε = {eps_label}",
         )
         axes[1].plot(
-            res["iter_counts"], res["relative_primal"],
-            "-o", markersize=3, color=col, label=f"ε = {eps_label}",
+            res["iter_counts"],
+            res["relative_primal"],
+            "-o",
+            markersize=3,
+            color=col,
+            label=f"ε = {eps_label}",
         )
 
     for ax in axes:

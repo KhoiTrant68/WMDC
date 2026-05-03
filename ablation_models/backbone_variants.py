@@ -263,6 +263,7 @@ def build_backbone(name: str, dim: int, **kwargs) -> nn.Module:
         return FDMReversedBlock(dim, **kwargs)
     if name == "fdm":
         from modules.wavelet_blocks import FrequencyDisentangledMamba
+
         return FrequencyDisentangledMamba(dim, **kwargs)
     raise ValueError(f"Unknown backbone: {name}")
 

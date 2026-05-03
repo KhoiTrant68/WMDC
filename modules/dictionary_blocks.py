@@ -28,6 +28,7 @@ class QueryDictionaryGenerator(nn.Module):
         super().__init__()
         self.dict_num = dict_num
         self.dict_dim = dict_dim
+        self._sqrt_dict_dim = math.sqrt(dict_dim)
 
         self.dict_queries = nn.Parameter(torch.randn(1, dict_num, in_dim))
 
@@ -68,7 +69,7 @@ class QueryDictionaryGenerator(nn.Module):
             sim_off_diag = sim_matrix - I
             penalty = F.relu(sim_off_diag).pow(2).mean()
 
-        return dt * math.sqrt(self.dict_dim), penalty
+        return dt * self._sqrt_dict_dim, penalty
 
 
 # ---------------------------------------------------------------------------
@@ -144,12 +145,9 @@ class UnifiedDictionaryAttention(nn.Module):
         super().__init__()
         self.dict_num = dict_num
         self.dict_dim = dict_dim
+        self._sqrt_dict_dim = math.sqrt(dict_dim)
         self.iters = iters
         self.tv_weight = tv_weight
-
-        # Stored for fallback softmax when Sinkhorn diverges
-        self.tau_float = tau
-        self.ot_eps_float = ot_eps
 
         # Truncated BPTT: run (iters - n_grad_iters) steps without grad,
         # then n_grad_iters steps with grad.  Balances speed vs. gradient quality.
@@ -270,7 +268,7 @@ class UnifiedDictionaryAttention(nn.Module):
         B, HW, N = C_mat.shape
         eps = F.softplus(self.log_eps) + 0.01
         log_a, log_b = -math.log(HW), -math.log(N)
-        M = C_mat.float() / eps
+        M = C_mat / eps
         log_f, log_g = C_mat.new_zeros(B, HW, 1), C_mat.new_zeros(B, 1, N)
 
         if self.training and self.n_nograd_iters > 0:
@@ -305,7 +303,45 @@ class UnifiedDictionaryAttention(nn.Module):
         return torch.exp(log_P.clamp(min=-60.0))
 
     # -----------------------------------------------------------------------
-    # KL-unbalanced Sinkhorn with spatially-varying ρ (log-domain)
+    # Shared Sinkhorn iteration runner
+    # -----------------------------------------------------------------------
+
+    def _sinkhorn_loop(
+        self,
+        log_f: torch.Tensor,
+        log_g: torch.Tensor,
+        M: torch.Tensor,
+        log_a: float,
+        log_b: float,
+        col_fn,
+        row_fn,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run warm-up (no-grad) + grad Sinkhorn iterations.
+
+        col_fn(lse) and row_fn(lse) apply the marginal proximity operator to
+        the respective logsumexp term.  For KL these are scalar multiplications;
+        for TV they are symmetric clamps.
+        """
+        if self.training and self.n_nograd_iters > 0:
+            with torch.no_grad():
+                for _ in range(self.n_nograd_iters):
+                    lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
+                    log_g = log_b - col_fn(lse_g)
+                    lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
+                    log_f = log_a - row_fn(lse_f)
+
+        n_iters = self.n_grad_iters if self.training else self.iters
+        for _ in range(n_iters):
+            lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
+            log_g = log_b - col_fn(lse_g)
+            lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
+            log_f = log_a - row_fn(lse_f)
+
+        return log_f, log_g
+
+    # -----------------------------------------------------------------------
+    # Unbalanced Sinkhorn with spatially-varying ρ (log-domain)
     # -----------------------------------------------------------------------
 
     def _route_unbalanced_eot(
@@ -343,60 +379,41 @@ class UnifiedDictionaryAttention(nn.Module):
         B, HW, N = C_mat.shape
         eps = F.softplus(self.log_eps) + 0.01  # strictly positive
 
-        log_a = -math.log(HW)  # scalar
-        log_b = -math.log(N)   # scalar
-        M = C_mat.float() / eps  # (B, HW, N)
+        log_a = -math.log(HW)
+        log_b = -math.log(N)
+        M = C_mat / eps
 
         rho_mean = rho_flat.mean(dim=1, keepdim=True)  # (B, 1)
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
         if self.marginal_div == "kl":
-            # Per-pixel row shrinkage: s_i = ρ_i/(ρ_i+ε) ∈ (0,1)
-            #   ρ→∞: s→1 (balanced limit)   ρ→0: s→0 (free transport)
+            # ρ→∞: shrink→1 (balanced limit)   ρ→0: shrink→0 (free transport)
             shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
             shrink_col = (rho_mean / (rho_mean + eps)).unsqueeze(2)  # (B, 1, 1)
+            log_f, log_g = self._sinkhorn_loop(
+                log_f,
+                log_g,
+                M,
+                log_a,
+                log_b,
+                col_fn=lambda lse: shrink_col * lse,
+                row_fn=lambda lse: shrink_row * lse,
+            )
+        else:  # tv — large ρ/ε → wide clamp (balanced), small ρ/ε → hard binary gating
+            rpe_row = (rho_flat / eps).unsqueeze(2)  # (B, HW, 1)
+            rpe_col = (rho_mean / eps).unsqueeze(2)  # (B, 1,  1)
+            log_f, log_g = self._sinkhorn_loop(
+                log_f,
+                log_g,
+                M,
+                log_a,
+                log_b,
+                col_fn=lambda lse: torch.clamp(lse, -rpe_col, rpe_col),
+                row_fn=lambda lse: torch.clamp(lse, -rpe_row, rpe_row),
+            )
 
-            if self.training and self.n_nograd_iters > 0:
-                with torch.no_grad():
-                    _sc, _sr = shrink_col.detach(), shrink_row.detach()
-                    for _ in range(self.n_nograd_iters):
-                        lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
-                        log_g = log_b - _sc * lse_g
-                        lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
-                        log_f = log_a - _sr * lse_f
-
-            n_iters = self.n_grad_iters if self.training else self.iters
-            for _ in range(n_iters):
-                lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
-                log_g = log_b - shrink_col * lse_g
-                lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B, HW, 1)
-                log_f = log_a - shrink_row * lse_f
-
-        else:  # tv
-            # TV clamp bounds in log-space: ρ/ε per pixel (row) and mean ρ/ε (col)
-            #   Large ρ/ε → wide clamp → approaches balanced OT
-            #   Small ρ/ε → narrow clamp → hard binary gating
-            rpe_row = (rho_flat / eps).unsqueeze(2)   # (B, HW, 1)
-            rpe_col = (rho_mean / eps).unsqueeze(2)   # (B, 1,  1)
-
-            if self.training and self.n_nograd_iters > 0:
-                with torch.no_grad():
-                    _rc, _rr = rpe_col.detach(), rpe_row.detach()
-                    for _ in range(self.n_nograd_iters):
-                        lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
-                        log_g = log_b - torch.clamp(lse_g, -_rc, _rc)
-                        lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
-                        log_f = log_a - torch.clamp(lse_f, -_rr, _rr)
-
-            n_iters = self.n_grad_iters if self.training else self.iters
-            for _ in range(n_iters):
-                lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
-                log_g = log_b - torch.clamp(lse_g, -rpe_col, rpe_col)
-                lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B, HW, 1)
-                log_f = log_a - torch.clamp(lse_f, -rpe_row, rpe_row)
-
-        log_P = log_f + log_g - M  # (B, HW, N)
+        log_P = log_f + log_g - M
 
         if torch.isnan(log_P).any():
             self.sinkhorn_divergence_count += 1
@@ -426,9 +443,6 @@ class UnifiedDictionaryAttention(nn.Module):
         as a safe fallback when Sinkhorn diverges in either EOT mode.
 
         P[b, hw, :] = softmax(−C[b, hw, :] / τ)  — rows sum to 1.
-
-        log_tau is always registered (see __init__ Bug-3 fix), so we can
-        always read it directly.
         """
         tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
         return F.softmax(-C_mat / tau, dim=-1)
@@ -457,8 +471,7 @@ class UnifiedDictionaryAttention(nn.Module):
         """
         marginal = P.sum(dim=1)  # (B, N)
         marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        _log2e = 1.0 / math.log(2)
-        H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean() * _log2e
+        H = -(marginal * torch.log2(marginal.clamp(min=1e-8))).sum(dim=1).mean()
         return -H  # negative entropy in bits
 
     # -----------------------------------------------------------------------
@@ -545,7 +558,7 @@ class UnifiedDictionaryAttention(nn.Module):
         # ── Value aggregation ─────────────────────────────────────────────────
         # Normalise values and scale by sqrt(D) so the expected output magnitude
         # is O(1) when row sums of P are O(1) — standard attention normalisation.
-        v_norm = F.normalize(v, p=2, dim=-1) * math.sqrt(self.dict_dim)  # (B, N, D)
+        v_norm = F.normalize(v, p=2, dim=-1) * self._sqrt_dict_dim  # (B, N, D)
         # Weighted sum: each spatial position gets a convex (or near-convex)
         # combination of dictionary value vectors.
         # P : (B, HW, N)   v_norm : (B, N, D)  →  out : (B, HW, D)
@@ -560,9 +573,11 @@ class UnifiedDictionaryAttention(nn.Module):
         if calc_disp:
             disp_loss = self._dispersion_loss(P) + tv_loss
             if self.training:
-                if self.routing_mode != "softmax" and hasattr(self, "log_tau"):
+                # Keep unused parameter in the backward graph for DDP correctness
+                # (find_unused_parameters=False requires all params to appear in loss).
+                if self.routing_mode != "softmax":
                     disp_loss = disp_loss + self.log_tau * 0.0
-                if self.routing_mode == "softmax" and hasattr(self, "log_eps"):
+                else:
                     disp_loss = disp_loss + self.log_eps * 0.0
         else:
             disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)

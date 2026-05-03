@@ -198,14 +198,25 @@ def main():
         choices=["kl", "tv"],
         help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
     )
-    parser.add_argument("--backbone", type=str, default="fdm",
-                        choices=["fdm", "ss2d", "cnn", "swin", "fdm_reversed"],
-                        help="Backbone variant matching the checkpoint.")
-    parser.add_argument("--use-dense-concat", action="store_true",
-                        help="Build the dense-concat variant (no stateful memory).")
-    parser.add_argument("--memory-init", type=str, default="bootstrap",
-                        choices=["bootstrap", "zero"],
-                        help="Memory initialisation strategy matching the checkpoint.")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="fdm",
+        choices=["fdm", "ss2d", "cnn", "swin", "fdm_reversed"],
+        help="Backbone variant matching the checkpoint.",
+    )
+    parser.add_argument(
+        "--use-dense-concat",
+        action="store_true",
+        help="Build the dense-concat variant (no stateful memory).",
+    )
+    parser.add_argument(
+        "--memory-init",
+        type=str,
+        default="bootstrap",
+        choices=["bootstrap", "zero"],
+        help="Memory initialisation strategy matching the checkpoint.",
+    )
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",

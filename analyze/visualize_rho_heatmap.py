@@ -33,12 +33,12 @@ import argparse
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-
 from _common import iter_dataset, load_model
 
 
@@ -83,13 +83,20 @@ def collect_rho_maps(model, x_padded: torch.Tensor, slice_indices: list[int]):
             if s_idx > 0:
                 slice_ch = hyper_prior.shape[1] // 2 // model.num_slices
                 for _ in range(s_idx):
-                    decoded.append(torch.zeros(
-                        x_padded.shape[0], slice_ch, latent_h, latent_w,
-                        device=x_padded.device,
-                    ))
+                    decoded.append(
+                        torch.zeros(
+                            x_padded.shape[0],
+                            slice_ch,
+                            latent_h,
+                            latent_w,
+                            device=x_padded.device,
+                        )
+                    )
             try:
                 rho_spatial = model._compute_rho_spatial(
-                    slice_idx=s_idx, hyper_prior=hyper_prior, decoded_slices=decoded,
+                    slice_idx=s_idx,
+                    hyper_prior=hyper_prior,
+                    decoded_slices=decoded,
                 )
                 # rho_spatial shape: (B, 1, latent_h, latent_w) or (B, latent_h, latent_w)
                 rho_np = rho_spatial.squeeze().cpu().numpy()
@@ -107,8 +114,13 @@ def main():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--image-dir", required=True)
     p.add_argument("--num-images", type=int, default=4)
-    p.add_argument("--slices", type=int, nargs="+", default=None,
-                   help="Slice indices to visualise. Default: [0, K//2, K-1].")
+    p.add_argument(
+        "--slices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Slice indices to visualise. Default: [0, K//2, K-1].",
+    )
     p.add_argument("--routing-mode", type=str, default="unbalanced_eot")
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--output", type=str, default="rho_heatmap.pdf")
@@ -118,8 +130,10 @@ def main():
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     model = load_model(
-        args.checkpoint, device,
-        routing_mode=args.routing_mode, ot_eps=args.ot_eps,
+        args.checkpoint,
+        device,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
         update_for_inference=True,
     )
 
@@ -138,11 +152,13 @@ def main():
 
     n_rows = len(image_paths)
     n_cols = 1 + len(slice_idx)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 3 * n_rows),
-                             squeeze=False)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(3.5 * n_cols, 3 * n_rows), squeeze=False
+    )
 
     for r, img_path in enumerate(image_paths):
         from _common import load_image
+
         x, x_padded, H, W = load_image(img_path, device=device)
         rho_maps, lat_h, lat_w = collect_rho_maps(model, x_padded, slice_idx)
 
@@ -164,10 +180,16 @@ def main():
             if rho.ndim == 2:
                 rho_cropped = rho[:true_lat_h, :true_lat_w]
             else:
-                rho_cropped = rho.reshape(-1, lat_h, lat_w).mean(0)[:true_lat_h, :true_lat_w]
-            im = axes[r, c].imshow(rho_cropped, cmap="inferno",
-                                   vmin=vmin, vmax=vmax,
-                                   interpolation="nearest")
+                rho_cropped = rho.reshape(-1, lat_h, lat_w).mean(0)[
+                    :true_lat_h, :true_lat_w
+                ]
+            im = axes[r, c].imshow(
+                rho_cropped,
+                cmap="inferno",
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
             axes[r, c].axis("off")
             if r == 0:
                 axes[r, c].set_title(f"ρ — slice {s}", fontsize=10)
