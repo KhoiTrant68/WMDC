@@ -12,16 +12,16 @@ CHECKPOINT_ROOT="$REPO/wmdc_runs"
 RESULTS_DIR="$REPO/results"
 
 # ── Training hyperparams ─────────────────────────────────────────────
-EPOCHS=2
-BATCH_SIZE=4
-LR_MILESTONES="1"
-LAST_EPOCHS_STE=0
+EPOCHS=400
+BATCH_SIZE=16
+LR_MILESTONES="360 380"
+LAST_EPOCHS_STE=20
 
 # ── Lambdas ──────────────────────────────────────────────────────────
 # LAMBDAS_FULL=(0.0018 0.0036 0.0067 0.013 0.025 0.0483)   # full RD curve
-LAMBDAS_FULL=(0.0036)   # full RD curve
+LAMBDAS_FULL=(0.0018 0.0036)   # full RD curve
 # LAMBDAS_ABLATION=(0.0036 0.013 0.0483)                    # 3-point ablation
-LAMBDAS_ABLATION=(0.0036)                    # 3-point ablation
+LAMBDAS_ABLATION=(0.0018 0.0036)                    # 3-point ablation
 
 
 # ── Model defaults ───────────────────────────────────────────────────
@@ -34,6 +34,7 @@ VARIANTS=(full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_d
 # ── Tools ────────────────────────────────────────────────────────────
 PYTHON="${PYTHON:-python}"
 LAUNCHER="${LAUNCHER:-accelerate launch}"   # set LAUNCHER=python for single GPU
+# LAUNCHER="${LAUNCHER:-accelerate launch --multi_gpu --num_processes 2}" #Uncomment if use 2 GPUs
 
 # ── Helper: extra flags per ablation variant ─────────────────────────
 variant_flags() {
