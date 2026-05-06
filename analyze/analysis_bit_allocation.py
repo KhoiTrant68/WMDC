@@ -24,7 +24,7 @@ from models.WMDC import WMDC
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--routing_mode",
+        "--routing-mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],

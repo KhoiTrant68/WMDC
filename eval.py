@@ -181,7 +181,7 @@ def compute_util_from_saved(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--routing_mode",
+        "--routing-mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],
@@ -191,6 +191,32 @@ def main():
     parser.add_argument("--output", type=str, default="output")
     parser.add_argument("--ot-eps", type=float, default=0.1)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
+    parser.add_argument(
+        "--marginal-div",
+        type=str,
+        default="kl",
+        choices=["kl", "tv"],
+        help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="fdm",
+        choices=["fdm", "ss2d", "cnn", "swin", "fdm_reversed"],
+        help="Backbone variant matching the checkpoint.",
+    )
+    parser.add_argument(
+        "--use-dense-concat",
+        action="store_true",
+        help="Build the dense-concat variant (no stateful memory).",
+    )
+    parser.add_argument(
+        "--memory-init",
+        type=str,
+        default="bootstrap",
+        choices=["bootstrap", "zero"],
+        help="Memory initialisation strategy matching the checkpoint.",
+    )
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
@@ -220,8 +246,12 @@ def main():
         M=320,
         num_slices=5,
         routing_mode=args.routing_mode,
+        marginal_div=args.marginal_div,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        backbone=args.backbone,
+        use_dense_concat=args.use_dense_concat,
+        memory_init=args.memory_init,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

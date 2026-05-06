@@ -15,6 +15,21 @@ from modules.utils import conv, deconv
 from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import FrequencyDisentangledMamba, GatedMemoryUpdater
 
+
+def _make_backbone(name: str, dim: int, drop_path: float = 0.1) -> nn.Module:
+    """
+    Construct an FDM-replacement block by name. Used by the Table 2
+    backbone ablation. Falls back to the production FDM when name=='fdm'.
+    """
+    if name == "fdm":
+        return FrequencyDisentangledMamba(dim, drop_path=drop_path)
+    # Lazy import — the ablation_models package only needs to exist when
+    # a non-FDM backbone is requested.
+    from ablation_models.backbone_variants import build_backbone
+
+    return build_backbone(name, dim=dim, drop_path=drop_path)
+
+
 # ---------------------------------------------------------------------------
 # Context manager for safe STE toggling
 # ---------------------------------------------------------------------------
@@ -158,6 +173,7 @@ class WMDC(CompressionModel):
     dict_head_num  : dict_dim = 32 × dict_head_num
     dict_num       : number of dictionary tokens
     routing_mode   : {'softmax', 'balanced_eot', 'unbalanced_eot'}
+    marginal_div   : divergence for unbalanced_eot row/col marginals — 'kl' or 'tv'
     ot_eps         : Sinkhorn entropic regularisation ε
     sinkhorn_iters : total Sinkhorn iterations (≥ 20 recommended for ε = 0.1)
     tv_weight      : spatial TV weight on transport plan P (0 = disabled)
@@ -171,9 +187,13 @@ class WMDC(CompressionModel):
         dict_head_num: int = 20,
         dict_num: int = 128,
         routing_mode: str = "unbalanced_eot",
+        marginal_div: str = "kl",
         ot_eps: float = 0.1,
         sinkhorn_iters: int = 20,
         tv_weight: float = 0.0,
+        backbone: str = "fdm",
+        use_dense_concat: bool = False,
+        memory_init: str = "bootstrap",
     ):
         super().__init__()
         self.N = N
@@ -183,6 +203,9 @@ class WMDC(CompressionModel):
         self.dict_num = dict_num
         self.dict_dim = 32 * dict_head_num
         self.routing_mode = routing_mode
+        self.marginal_div = marginal_div
+        self.use_dense_concat = use_dense_concat
+        self.memory_init = memory_init
 
         # DDP-safe, never silently reset on checkpoint resume.
         self.register_buffer("_use_ste_flag", torch.zeros(1, dtype=torch.bool))
@@ -193,22 +216,22 @@ class WMDC(CompressionModel):
         # ── Encoder ───────────────────────────────────────────────────────────
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
-            FrequencyDisentangledMamba(N, drop_path=0.1),
+            _make_backbone(backbone, N, drop_path=0.1),
             conv(N, N, kernel_size=5, stride=2),
-            FrequencyDisentangledMamba(N, drop_path=0.1),
+            _make_backbone(backbone, N, drop_path=0.1),
             conv(N, N, kernel_size=5, stride=2),
-            FrequencyDisentangledMamba(N, drop_path=0.1),
+            _make_backbone(backbone, N, drop_path=0.1),
             conv(N, M, kernel_size=5, stride=2),
         )
 
         # ── Decoder ───────────────────────────────────────────────────────────
         self.g_s = nn.Sequential(
             deconv(M, N, kernel_size=5, stride=2),
-            FrequencyDisentangledMamba(N, drop_path=0.1),
+            _make_backbone(backbone, N, drop_path=0.1),
             deconv(N, N, kernel_size=5, stride=2),
-            FrequencyDisentangledMamba(N, drop_path=0.1),
+            _make_backbone(backbone, N, drop_path=0.1),
             deconv(N, N, kernel_size=5, stride=2),
-            FrequencyDisentangledMamba(N, drop_path=0.1),
+            _make_backbone(backbone, N, drop_path=0.1),
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
@@ -264,9 +287,10 @@ class WMDC(CompressionModel):
             nn.init.constant_(predictor[-1].bias, 0.5)
 
         # ── Bootstrap memory state ─────────────────────────────────────────────
-        # Projects the full hyper_prior (2*M channels) down to slice_ch channels
-        # to initialise the memory state for slice 0.
-        self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=3, padding=1)
+        # Only created when stateful mode is used and bootstrap init is selected.
+        # Dense-concat has no Markov memory; zero-init skips the learned projection.
+        if not use_dense_concat and memory_init == "bootstrap":
+            self.init_memory = nn.Conv2d(2 * M, self.slice_ch, kernel_size=3, padding=1)
 
         # ── Per-slice K/V projections ──────────────────────────────────────────
         # Independent linear projections keep each slice's dictionary view
@@ -279,10 +303,17 @@ class WMDC(CompressionModel):
         )
 
         # ── Per-slice EOT dictionary attention ────────────────────────────────
+        # Query input_dim varies by context variant:
+        #   stateful:     2M + slice_ch  (hyper_prior + Markov memory)
+        #   dense-concat: 2M + i*slice_ch (hyper_prior + i prev slices; 2M for i=0)
+        _eot_in = [
+            2 * M + (i * self.slice_ch if use_dense_concat else self.slice_ch)
+            for i in range(num_slices)
+        ]
         self.eot_attentions = nn.ModuleList(
             [
                 UnifiedDictionaryAttention(
-                    input_dim=2 * M + self.slice_ch,
+                    input_dim=_eot_in[i],
                     output_dim=M,
                     dict_num=self.dict_num,
                     dict_dim=self.dict_dim,
@@ -290,28 +321,29 @@ class WMDC(CompressionModel):
                     ot_eps=ot_eps,
                     iters=sinkhorn_iters,
                     routing_mode=routing_mode,
+                    marginal_div=marginal_div,
                     tv_weight=tv_weight,
                 )
-                for _ in range(num_slices)
+                for i in range(num_slices)
             ]
         )
 
         # ── Gated memory updaters (num_slices − 1, last slice has no successor) ─
-        self.memory_updaters = nn.ModuleList(
-            [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices - 1)]
-        )
+        # Only created in stateful mode; dense-concat has no memory to update.
+        if not use_dense_concat:
+            self.memory_updaters = nn.ModuleList(
+                [GatedMemoryUpdater(self.slice_ch) for _ in range(num_slices - 1)]
+            )
 
         # ── Slice-specific context transforms ─────────────────────────────────
-        # Input to each transform:
-        #   query       = hyper_prior (2*M)  + memory (slice_ch)  = 2M + S
-        #   dict_info   = M  (output of eot_attention)
-        #   total       = 3M + S   =  shared_input_dim
-        shared_input_dim = 3 * M + self.slice_ch
+        # cc input_dim[i]  = eot_input_dim[i] + M  (query + dict_info)
+        # lrp input_dim[i] = cc_input_dim[i]  + slice_ch  (support + y_hat_slice)
+        _cc_in = [_eot_in[i] + M for i in range(num_slices)]
 
         self.cc_mean_transforms = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Conv2d(shared_input_dim, 128, 1),
+                    nn.Conv2d(_cc_in[i], 128, 1),
                     nn.GELU(),
                     nn.Conv2d(128, 224, 3, 1, 1),
                     nn.GELU(),
@@ -319,14 +351,14 @@ class WMDC(CompressionModel):
                     nn.GELU(),
                     nn.Conv2d(128, self.slice_ch, 3, 1, 1),
                 )
-                for _ in range(num_slices)
+                for i in range(num_slices)
             ]
         )
 
         self.cc_scale_transforms = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Conv2d(shared_input_dim, 128, 1),
+                    nn.Conv2d(_cc_in[i], 128, 1),
                     nn.GELU(),
                     nn.Conv2d(128, 224, 3, 1, 1),
                     nn.GELU(),
@@ -334,16 +366,15 @@ class WMDC(CompressionModel):
                     nn.GELU(),
                     nn.Conv2d(128, self.slice_ch, 3, 1, 1),
                 )
-                for _ in range(num_slices)
+                for i in range(num_slices)
             ]
         )
 
         # ── Latent Residual Prediction (LRP) transforms ───────────────────────
-        # Input: support (3M+S) + quantised y_hat_slice (S)  = 3M + 2S
         self.lrp_transforms = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Conv2d(shared_input_dim + self.slice_ch, 128, 1),
+                    nn.Conv2d(_cc_in[i] + self.slice_ch, 128, 1),
                     nn.GELU(),
                     nn.Conv2d(128, 224, 3, 1, 1),
                     nn.GELU(),
@@ -351,7 +382,7 @@ class WMDC(CompressionModel):
                     nn.GELU(),
                     nn.Conv2d(128, self.slice_ch, 3, 1, 1),
                 )
-                for _ in range(num_slices)
+                for i in range(num_slices)
             ]
         )
         # Zero-init LRP output: identity mapping at start of training so
@@ -432,12 +463,9 @@ class WMDC(CompressionModel):
         slice_idx: int,
         hyper_prior: torch.Tensor,
         decoded_slices: list,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         """
         Per-slice spatially-varying KL mass strength ρ(x).
-
-        Returns None when routing_mode != 'unbalanced_eot' so that
-        UnifiedDictionaryAttention simply ignores the rho argument.
 
         The predictor for slice i is conditioned on:
           - hyper_prior  : (B, 2*M, H, W)  — global image summary
@@ -448,8 +476,10 @@ class WMDC(CompressionModel):
 
         Returns
         -------
-        rho_raw * 0  : in non-unbalanced modes — zero value, live grad_fn
-        rho          : (B, H, W) strictly positive — in unbalanced mode
+        rho_raw * 0  : in non-unbalanced modes — zero-valued tensor with live
+                       grad_fn, so rho_predictors stay in the DDP backward graph.
+                       Callers pass None to UnifiedDictionaryAttention instead.
+        rho          : (B, H, W) strictly positive — in unbalanced_eot mode
         """
         context = (
             hyper_prior
@@ -524,7 +554,19 @@ class WMDC(CompressionModel):
         y_hat_slices: list[torch.Tensor] = []
         y_likelihood: list[torch.Tensor] = []
 
-        memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
+        if self.use_dense_concat:
+            pass  # context is built from y_hat_slices directly in the loop
+        elif self.memory_init == "bootstrap":
+            memory_state = self.init_memory(hyper_prior)  # (B, slice_ch, H, W)
+        else:
+            memory_state = torch.zeros(
+                hyper_prior.size(0),
+                self.slice_ch,
+                hyper_prior.size(2),
+                hyper_prior.size(3),
+                device=hyper_prior.device,
+                dtype=hyper_prior.dtype,
+            )
 
         # Routing entropy accumulator: ONLY −H from the per-slice attention.
         # dict_penalty is tracked separately and returned as its own key,
@@ -548,8 +590,15 @@ class WMDC(CompressionModel):
             k_dict = self.k_projs[i](dt)  # (B, N, dict_dim)
             v_dict = self.v_projs[i](dt)  # (B, N, dict_dim)
 
-            # Query = hyper_prior ⊕ memory  → (B, 2M+slice_ch, H, W)
-            query = torch.cat([hyper_prior, memory_state], dim=1)
+            # Query = hyper_prior ⊕ context
+            if self.use_dense_concat:
+                query = (
+                    hyper_prior
+                    if i == 0
+                    else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                )
+            else:
+                query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, disp_loss = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=self.training
@@ -589,9 +638,8 @@ class WMDC(CompressionModel):
             y_hat_slices.append(y_hat_slice_lrp)
             y_likelihood.append(y_slice_likelihood)
 
-            # Update memory with the best available (LRP-corrected) signal.
-            # Last slice has no successor so no update needed.
-            if i < self.num_slices - 1:
+            # Update memory for stateful mode; dense mode relies on y_hat_slices.
+            if not self.use_dense_concat and i < self.num_slices - 1:
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         # ── Decode ────────────────────────────────────────────────────────────
@@ -649,7 +697,20 @@ class WMDC(CompressionModel):
         y_slices = y.chunk(self.num_slices, dim=1)
         y_hat_slices: list[torch.Tensor] = []
         y_strings: list = []
-        memory_state = self.init_memory(hyper_prior)
+
+        if self.use_dense_concat:
+            pass
+        elif self.memory_init == "bootstrap":
+            memory_state = self.init_memory(hyper_prior)
+        else:
+            memory_state = torch.zeros(
+                hyper_prior.size(0),
+                self.slice_ch,
+                hyper_prior.size(2),
+                hyper_prior.size(3),
+                device=hyper_prior.device,
+                dtype=hyper_prior.dtype,
+            )
 
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
@@ -657,7 +718,14 @@ class WMDC(CompressionModel):
 
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
-            query = torch.cat([hyper_prior, memory_state], dim=1)
+            if self.use_dense_concat:
+                query = (
+                    hyper_prior
+                    if i == 0
+                    else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                )
+            else:
+                query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, _ = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
@@ -690,7 +758,7 @@ class WMDC(CompressionModel):
 
             y_hat_slices.append(y_hat_slice_lrp)
 
-            if i < self.num_slices - 1:
+            if not self.use_dense_concat and i < self.num_slices - 1:
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
@@ -723,7 +791,20 @@ class WMDC(CompressionModel):
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
 
         y_hat_slices: list[torch.Tensor] = []
-        memory_state = self.init_memory(hyper_prior)
+
+        if self.use_dense_concat:
+            pass
+        elif self.memory_init == "bootstrap":
+            memory_state = self.init_memory(hyper_prior)
+        else:
+            memory_state = torch.zeros(
+                hyper_prior.size(0),
+                self.slice_ch,
+                hyper_prior.size(2),
+                hyper_prior.size(3),
+                device=hyper_prior.device,
+                dtype=hyper_prior.dtype,
+            )
 
         for i in range(self.num_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
@@ -731,7 +812,14 @@ class WMDC(CompressionModel):
 
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
-            query = torch.cat([hyper_prior, memory_state], dim=1)
+            if self.use_dense_concat:
+                query = (
+                    hyper_prior
+                    if i == 0
+                    else torch.cat([hyper_prior] + y_hat_slices, dim=1)
+                )
+            else:
+                query = torch.cat([hyper_prior, memory_state], dim=1)
 
             dict_info, _ = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
@@ -757,7 +845,7 @@ class WMDC(CompressionModel):
 
             y_hat_slices.append(y_hat_slice_lrp)
 
-            if i < self.num_slices - 1:
+            if not self.use_dense_concat and i < self.num_slices - 1:
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         y_hat = torch.cat(y_hat_slices, dim=1)

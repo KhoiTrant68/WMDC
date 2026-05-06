@@ -1,227 +1,271 @@
 """
-analyze/ablation_dictionary_utilization.py
-===========================================
-Measures dictionary token utilisation (entropy of target marginal) across a
-test dataset, with and without dispersion loss.  Required experiment E4.
+analyze/ablation_dictionary_utils.py  (FIXED)
+=============================================
+Measures dictionary token utilisation across a test dataset, comparing a
+checkpoint trained WITH dispersion regularisation against one trained
+WITHOUT it.
 
-Computes per-image token utilisation entropy and its distribution across the
-dataset.  Compares two checkpoints: one trained with dispersion loss and one
-without (or the same model with dispersion_weight=0 as ablation).
+Bugs fixed vs. previous version
+-------------------------------
+1. Hooks `model.eot_attentions` (ModuleList) instead of the non-existent
+   `model.eot_attention` (singular).
+2. Reports BOTH the canonical column-marginal entropy used in the loss
+   (`mean(P, dim=row)` — matches dispersion_loss) AND the renormalised
+   probability-distribution entropy (sum-to-1) so the paper number is
+   unambiguous.
+3. Crops the padded latent grid to the true latent shape (H/16, W/16)
+   BEFORE marginalising, to avoid biased entropy from reflect-padded
+   regions that don't carry real content.
 
-Usage:
-    python analyze/ablation_dictionary_utilization.py \
-        --checkpoint-with-disp  checkpoints/lambda_0.013_mse/checkpoint_best.pth.tar \
-        --checkpoint-no-disp    checkpoints/ablation_no_disp/checkpoint_best.pth.tar \
-        --dataset               /data/kodak \
-        -o dictionary_utilization.pdf
+Usage
+-----
+    python analyze/ablation_dictionary_utils.py \
+        --checkpoint-with-disp checkpoints/full/best.pth.tar \
+        --checkpoint-no-disp   checkpoints/no_disp/best.pth.tar \
+        --dataset              /data/kodak \
+        -o dictionary_utilization.pdf \
+        --cuda
 """
 
 import argparse
+import json
 import math
-import os
-import sys
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(script_dir)
-sys.path.insert(0, parent_dir)
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
-from torchvision import transforms
+from _common import iter_dataset, load_model
 
-from models.WMDC import WMDC
+# Dictionary size — must match model.QueryDictionaryGenerator.dict_num.
+DICT_NUM = 128
+MAX_ENTROPY_NATS = math.log(DICT_NUM)
 
 
-def compute_utilization_entropy(
-    model, x_padded: torch.Tensor, orig_h: int, orig_w: int
-) -> float:
+def collect_routing_plans(model, x_padded: torch.Tensor) -> list[torch.Tensor]:
     """
-    Compute Shannon entropy of the dictionary token utilisation marginal
-    for a single image.
+    Run a forward pass and return the per-slice transport plans.
 
-    Higher entropy → more uniform token usage → better dictionary utilisation.
-    Max entropy = log(N) = log(128) ≈ 4.85 bits (all tokens equally used).
-
-    Returns entropy in nats.
+    Returns a list of length `num_slices`; each element has shape
+    (B, padded_HW, N_d) and is on CPU.
     """
-    model.eval()
-    entropies = []
+    plans: list[torch.Tensor] = []
 
-    # Capture routing plans from all slices via hook.
-    plans = []
+    def make_hook(slice_idx: int):
+        def hook_fn(module, inp, out):
+            # The plan is stored on the module by UnifiedDictionaryAttention
+            # under `attn_probs` (see dictionary_blocks.py).
+            if hasattr(module, "attn_probs") and module.attn_probs is not None:
+                plans.append(module.attn_probs.detach().cpu())
 
-    def hook_fn(module, input, output):
-        plans.append(module.attn_probs.detach().cpu())
+        return hook_fn
 
-    hook = model.eot_attention.register_forward_hook(hook_fn)
+    # Register one hook per slice (model.eot_attentions is a ModuleList).
+    handles = []
+    for i, attn_module in enumerate(model.eot_attentions):
+        handles.append(attn_module.register_forward_hook(make_hook(i)))
+
     try:
         with torch.no_grad():
             _ = model(x_padded)
     finally:
-        hook.remove()
+        for h in handles:
+            h.remove()
 
-    true_latent_h = orig_h // 16
-    true_latent_w = orig_w // 16
+    return plans
+
+
+def per_image_entropy(
+    plans: list[torch.Tensor],
+    latent_h_pad: int,
+    latent_w_pad: int,
+    true_h: int,
+    true_w: int,
+) -> dict:
+    """
+    Returns a dict with two entropy variants per image:
+
+      H_loss : entropy of  mean_i(P_ij)  over rows — matches dispersion loss
+               formulation in dictionary_blocks.py. NOT a probability
+               distribution under UEOT (sum != 1) but is the quantity the
+               training objective optimises.
+      H_norm : entropy of  bar_m / sum(bar_m)  — proper probability with
+               sum=1, useful for direct comparison with log(N_d) max.
+    """
+    H_loss_per_slice = []
+    H_norm_per_slice = []
+    sum_per_slice = []
 
     for P in plans:
-        # P is shape (B, padded_HW, N)
         B, _, N = P.shape
-
-        # Reshape to spatial grid: (B, padded_H, padded_W, N)
-        # Note: In WMDC, HW is derived from the latent shape.
-        latent_h_pad = x_padded.size(2) // 16
-        latent_w_pad = x_padded.size(3) // 16
-
+        # Reshape to spatial grid; padded_HW must equal latent_h_pad * latent_w_pad.
+        assert (
+            P.shape[1] == latent_h_pad * latent_w_pad
+        ), f"plan shape {P.shape} != ({latent_h_pad}*{latent_w_pad})"
         P_spatial = P.view(B, latent_h_pad, latent_w_pad, N)
+        # Crop padding before marginalising.
+        P_cropped = P_spatial[:, :true_h, :true_w, :]
+        # Flatten true spatial → (B, HW_true, N).
+        P_flat = P_cropped.reshape(B, -1, N)
 
-        # Crop out the padding!
-        P_cropped = P_spatial[:, :true_latent_h, :true_latent_w, :].reshape(B, -1, N)
+        # 1. Loss-aligned: bar_m = mean over rows.
+        bar_m_loss = P_flat.mean(dim=1)  # (B, N)
+        # Add eps for log stability.
+        eps = 1e-12
+        H_loss = -(bar_m_loss * (bar_m_loss + eps).log()).sum(dim=1).mean().item()
 
-        # Now calculate the true target marginal
-        target_marginal = P_cropped.sum(dim=1)  # (B, N)
-        target_marginal = target_marginal / (
-            target_marginal.sum(dim=1, keepdim=True) + 1e-8
+        # 2. Normalised probability distribution.
+        bar_m_sum = bar_m_loss.sum(dim=1, keepdim=True).clamp_min(eps)
+        bar_m_prob = bar_m_loss / bar_m_sum
+        H_norm = -(bar_m_prob * (bar_m_prob + eps).log()).sum(dim=1).mean().item()
+
+        H_loss_per_slice.append(H_loss)
+        H_norm_per_slice.append(H_norm)
+        sum_per_slice.append(bar_m_loss.sum(dim=1).mean().item())
+
+    return {
+        "H_loss_mean": float(np.mean(H_loss_per_slice)),
+        "H_norm_mean": float(np.mean(H_norm_per_slice)),
+        "marginal_total_mean": float(np.mean(sum_per_slice)),
+        "H_loss_per_slice": H_loss_per_slice,
+        "H_norm_per_slice": H_norm_per_slice,
+    }
+
+
+def evaluate_dataset(model, dataset_dir: str, device: str) -> list[dict]:
+    """Returns list of per-image entropy dicts."""
+    results = []
+    for path, _x, x_padded, H, W in iter_dataset(dataset_dir, device=device):
+        plans = collect_routing_plans(model, x_padded)
+        if not plans:
+            print(f"  WARN: no plans captured for {path}")
+            continue
+        latent_h_pad = x_padded.shape[-2] // 16
+        latent_w_pad = x_padded.shape[-1] // 16
+        true_h = H // 16
+        true_w = W // 16
+        entropies = per_image_entropy(plans, latent_h_pad, latent_w_pad, true_h, true_w)
+        entropies["path"] = path
+        results.append(entropies)
+        print(
+            f"  {path.split('/')[-1]:>30s}: "
+            f"H_loss={entropies['H_loss_mean']:.4f}  "
+            f"H_norm={entropies['H_norm_mean']:.4f}  "
+            f"sum_marginal={entropies['marginal_total_mean']:.4f}"
         )
-
-        H = -(target_marginal * (target_marginal + 1e-8).log()).sum(dim=1).mean()
-        entropies.append(H.item())
-
-    return float(np.mean(entropies))
-
-
-def evaluate_dataset(model, dataset_dir: str, device: str) -> list:
-    """Returns list of per-image utilisation entropies."""
-    image_paths = sorted(
-        [
-            os.path.join(dataset_dir, f)
-            for f in os.listdir(dataset_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ]
-    )
-
-    entropies = []
-    for img_path in image_paths:
-        img = Image.open(img_path).convert("RGB")
-        x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-        H, W = x.size(2), x.size(3)
-        pad_h = (64 - H % 64) % 64
-        pad_w = (64 - W % 64) % 64
-        x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-        ent = compute_utilization_entropy(model, x_padded, H, W)
-        entropies.append(ent)
-        print(f"  {os.path.basename(img_path)}: H = {ent:.4f} nats")
-
-    return entropies
-
-
-def load_model(
-    checkpoint_path: str,
-    device: str,
-    routing_mode: str = "unbalanced_eot",
-    ot_eps: float = 0.1,
-    sinkhorn_iters: int = 20,
-) -> WMDC:
-    model = WMDC(
-        N=192,
-        M=320,
-        num_slices=5,
-        routing_mode=routing_mode,
-        ot_eps=ot_eps,
-        sinkhorn_iters=sinkhorn_iters,
-    ).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt.get("state_dict", ckpt))
-    model.eval()
-    return model
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-with-disp", type=str, required=True)
-    parser.add_argument("--checkpoint-no-disp", type=str, required=True)
-    parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument(
-        "--routing_mode",
-        type=str,
-        default="unbalanced_eot",
-        choices=["softmax", "balanced_eot", "unbalanced_eot"],
-    )
-    parser.add_argument("--ot-eps", type=float, default=0.1)
-    parser.add_argument("--sinkhorn-iters", type=int, default=20)
-    parser.add_argument(
-        "-o", "--output", type=str, default="dictionary_utilization.pdf"
-    )
-    parser.add_argument("--cuda", action="store_true")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint-with-disp", type=str, required=True)
+    p.add_argument("--checkpoint-no-disp", type=str, required=True)
+    p.add_argument("--dataset", type=str, required=True)
+    p.add_argument("--routing-mode", type=str, default="unbalanced_eot")
+    p.add_argument("--ot-eps", type=float, default=0.1)
+    p.add_argument("--sinkhorn-iters", type=int, default=20)
+    p.add_argument("-o", "--output", type=str, default="dictionary_utilization.pdf")
+    p.add_argument("--json-out", type=str, default=None)
+    p.add_argument("--cuda", action="store_true")
+    args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    max_entropy = math.log(128)  # 4.852 nats for N=128 uniform distribution
-
-    print("Evaluating model WITH dispersion loss...")
-    model_with = load_model(
+    print("== Evaluating WITH dispersion ==")
+    m_with = load_model(
         args.checkpoint_with_disp,
         device,
-        args.routing_mode,
-        args.ot_eps,
-        args.sinkhorn_iters,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
+        update_for_inference=False,  # forward() only, faster
     )
-    ent_with = evaluate_dataset(model_with, args.dataset, device)
+    res_with = evaluate_dataset(m_with, args.dataset, device)
 
-    print("\nEvaluating model WITHOUT dispersion loss...")
-    model_no = load_model(
+    print("\n== Evaluating WITHOUT dispersion ==")
+    m_no = load_model(
         args.checkpoint_no_disp,
         device,
-        args.routing_mode,
-        args.ot_eps,
-        args.sinkhorn_iters,
+        routing_mode=args.routing_mode,
+        ot_eps=args.ot_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
+        update_for_inference=False,
     )
-    ent_no = evaluate_dataset(model_no, args.dataset, device)
+    res_no = evaluate_dataset(m_no, args.dataset, device)
+
+    H_norm_with = [r["H_norm_mean"] for r in res_with]
+    H_norm_no = [r["H_norm_mean"] for r in res_no]
 
     print(
-        f"\nWith dispersion:    mean H = {np.mean(ent_with):.4f} nats "
-        f"({np.mean(ent_with)/max_entropy*100:.1f}% of max)"
+        f"\n=== Summary (probability-normalised entropy, max={MAX_ENTROPY_NATS:.4f}) ==="
     )
     print(
-        f"Without dispersion: mean H = {np.mean(ent_no):.4f} nats "
-        f"({np.mean(ent_no)/max_entropy*100:.1f}% of max)"
+        f"With dispersion:    mean H_norm = {np.mean(H_norm_with):.4f} nats  "
+        f"({np.mean(H_norm_with)/MAX_ENTROPY_NATS*100:.1f}% of max)"
     )
+    print(
+        f"Without dispersion: mean H_norm = {np.mean(H_norm_no):.4f} nats  "
+        f"({np.mean(H_norm_no)/MAX_ENTROPY_NATS*100:.1f}% of max)"
+    )
+    delta = np.mean(H_norm_with) - np.mean(H_norm_no)
+    print(f"Δ = {delta:+.4f} nats (positive = dispersion helps)")
 
+    # ── Plot ─────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    x_vals = list(range(1, len(ent_with) + 1))
-    axes[0].bar(x_vals, ent_with, label="With disp.", alpha=0.7, color="steelblue")
-    axes[0].bar(x_vals, ent_no, label="Without disp.", alpha=0.7, color="salmon")
+    n = max(len(H_norm_with), len(H_norm_no))
+    x_axis = np.arange(1, n + 1)
+    axes[0].bar(
+        x_axis - 0.2, H_norm_with, width=0.4, label="With disp.", color="steelblue"
+    )
+    axes[0].bar(
+        x_axis + 0.2, H_norm_no, width=0.4, label="Without disp.", color="salmon"
+    )
     axes[0].axhline(
-        y=max_entropy,
+        MAX_ENTROPY_NATS,
         color="gray",
-        linestyle="--",
+        ls="--",
         alpha=0.7,
-        label=f"Max H={max_entropy:.2f}",
+        label=f"Max H = log({DICT_NUM})",
     )
     axes[0].set_xlabel("Image index")
-    axes[0].set_ylabel("Token utilisation entropy (nats)")
+    axes[0].set_ylabel("Token-utilisation entropy (nats)")
     axes[0].set_title("Per-image dictionary utilisation")
     axes[0].legend()
     axes[0].grid(alpha=0.3)
 
-    axes[1].hist(ent_with, bins=10, alpha=0.7, label="With disp.", color="steelblue")
-    axes[1].hist(ent_no, bins=10, alpha=0.7, label="Without disp.", color="salmon")
-    axes[1].axvline(x=np.mean(ent_with), color="blue", linestyle="--", alpha=0.8)
-    axes[1].axvline(x=np.mean(ent_no), color="red", linestyle="--", alpha=0.8)
-    axes[1].set_xlabel("Token utilisation entropy (nats)")
-    axes[1].set_ylabel("Count")
+    axes[1].hist(H_norm_with, bins=10, alpha=0.7, label="With disp.", color="steelblue")
+    axes[1].hist(H_norm_no, bins=10, alpha=0.7, label="Without disp.", color="salmon")
+    axes[1].axvline(np.mean(H_norm_with), color="blue", ls="--")
+    axes[1].axvline(np.mean(H_norm_no), color="red", ls="--")
+    axes[1].set_xlabel("Token-utilisation entropy (nats)")
+    axes[1].set_ylabel("Image count")
     axes[1].set_title("Distribution across dataset")
     axes[1].legend()
     axes[1].grid(alpha=0.3)
-
     fig.tight_layout()
     fig.savefig(args.output, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"\nSaved {args.output}")
+    print(f"\nSaved figure → {args.output}")
+
+    # ── JSON dump ────────────────────────────────────────────────────────
+    if args.json_out:
+        json_payload = {
+            "dict_num": DICT_NUM,
+            "max_entropy_nats": MAX_ENTROPY_NATS,
+            "with_disp": {
+                "mean_H_norm": float(np.mean(H_norm_with)),
+                "mean_H_loss": float(np.mean([r["H_loss_mean"] for r in res_with])),
+                "per_image": res_with,
+            },
+            "no_disp": {
+                "mean_H_norm": float(np.mean(H_norm_no)),
+                "mean_H_loss": float(np.mean([r["H_loss_mean"] for r in res_no])),
+                "per_image": res_no,
+            },
+            "delta_H_norm": float(delta),
+        }
+        with open(args.json_out, "w") as f:
+            json.dump(json_payload, f, indent=2)
+        print(f"Saved JSON → {args.json_out}")
 
 
 if __name__ == "__main__":

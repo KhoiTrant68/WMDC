@@ -28,6 +28,7 @@ class QueryDictionaryGenerator(nn.Module):
         super().__init__()
         self.dict_num = dict_num
         self.dict_dim = dict_dim
+        self._sqrt_dict_dim = math.sqrt(dict_dim)
 
         self.dict_queries = nn.Parameter(torch.randn(1, dict_num, in_dim))
 
@@ -68,7 +69,7 @@ class QueryDictionaryGenerator(nn.Module):
             sim_off_diag = sim_matrix - I
             penalty = F.relu(sim_off_diag).pow(2).mean()
 
-        return dt * math.sqrt(self.dict_dim), penalty
+        return dt * self._sqrt_dict_dim, penalty
 
 
 # ---------------------------------------------------------------------------
@@ -90,20 +91,29 @@ class UnifiedDictionaryAttention(nn.Module):
                        After Sinkhorn, P is scaled by HW so row sums ≈ 1,
                        matching the softmax normalisation convention.
 
-    'unbalanced_eot' — KL-unbalanced Sinkhorn
-                       with spatially-varying row marginal strength ρ(x).
+    'unbalanced_eot' — Unbalanced Sinkhorn with spatially-varying row marginal
+                       strength ρ(x).  The marginal divergence type is set by
+                       `marginal_div`:
 
-                        log_g_new = log_b  −  shrink_col * logsumexp(log_f − M, rows)
-                        log_f_new = log_a  −  shrink_row * logsumexp(log_g − M, cols)
+                       'kl'  (KL divergence, Séjourné et al. 2019):
+                           Aprox_KL(x) = ρ/(ρ+ε) · x   (multiplicative shrinkage)
+                           log_g ← log_b − shrink_col · lse(log_f − M, rows)
+                           log_f ← log_a − shrink_row · lse(log_g − M, cols)
+                           Smooth spatial gating: row sums taper continuously
+                           from 0 (outlier) to 1 (perfect match).
 
-                       This matches KullbackLeibler.aprox(x) = ρ/(ρ+ε)·x
-                       from the reference unbalanced-ot library (Séjourné et al.).
+                       'tv'  (Total Variation divergence, Séjourné et al. 2022):
+                           Aprox_TV(x) = clamp(x, −ρ, +ρ)   (hard clip)
+                           log_g ← log_b − clamp(lse(log_f − M, rows), −ρ/ε, ρ/ε)
+                           log_f ← log_a − clamp(lse(log_g − M, cols), −ρ/ε, ρ/ε)
+                           Sharp spatial gating: pixels either match the dict
+                           (row_sum ≈ 1) or are cleanly suppressed (row_sum ≈ 0),
+                           with no intermediate values.  Recommended for crisp
+                           object / texture boundaries.
 
-                       P is scaled by HW after Sinkhorn.  Row sums are NOT
-                       forced to 1 — unbalanced OT intentionally relaxes the
-                       row marginal.  Low-confidence pixels yield row sums < 1
-                       (spatial gating).  The raw row mass is stored in
-                       `last_row_mass` (eval mode only) for ablation studies.
+                       P is scaled by HW after Sinkhorn.  Row sums are NOT forced
+                       to 1 — unbalanced OT intentionally relaxes the row marginal.
+                       The raw row mass is stored in `last_row_mass` (eval only).
 
     Parameters
     ----------
@@ -115,6 +125,7 @@ class UnifiedDictionaryAttention(nn.Module):
     ot_eps      : initial Sinkhorn entropic regularisation ε
     iters       : total Sinkhorn iterations
     routing_mode: one of {'softmax', 'balanced_eot', 'unbalanced_eot'}
+    marginal_div: divergence for row/col marginals in unbalanced_eot — 'kl' or 'tv'
     tv_weight   : spatial TV weight on P (0 = disabled)
     """
 
@@ -128,17 +139,15 @@ class UnifiedDictionaryAttention(nn.Module):
         ot_eps: float = 0.1,
         iters: int = 20,
         routing_mode: str = "unbalanced_eot",
+        marginal_div: str = "kl",
         tv_weight: float = 0.0,
     ):
         super().__init__()
         self.dict_num = dict_num
         self.dict_dim = dict_dim
+        self._sqrt_dict_dim = math.sqrt(dict_dim)
         self.iters = iters
         self.tv_weight = tv_weight
-
-        # Stored for fallback softmax when Sinkhorn diverges
-        self.tau_float = tau
-        self.ot_eps_float = ot_eps
 
         # Truncated BPTT: run (iters - n_grad_iters) steps without grad,
         # then n_grad_iters steps with grad.  Balances speed vs. gradient quality.
@@ -149,6 +158,11 @@ class UnifiedDictionaryAttention(nn.Module):
         if routing_mode not in valid:
             raise ValueError(f"routing_mode must be one of {valid}")
         self.routing_mode = routing_mode
+
+        valid_div = {"kl", "tv"}
+        if marginal_div not in valid_div:
+            raise ValueError(f"marginal_div must be one of {valid_div}")
+        self.marginal_div = marginal_div
 
         # Learnable log-scale parameters so ε / τ stay positive during training
         self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
@@ -215,14 +229,20 @@ class UnifiedDictionaryAttention(nn.Module):
 
     def _spatial_tv(self, P: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """
-        Isotropic total-variation on the transport plan, encouraging
+        Isotropic total-variation on the routing distribution, encouraging
         spatially smooth token assignments.
 
         P : (B, HW, N)
         Returns scalar mean TV (mean over batch and token dims).
         """
-        B, HW, N = P.shape
-        P_sp = P.transpose(1, 2).view(B, N, H, W)  # (B, N, H, W)
+        # Normalise by row sums before computing TV so the penalty targets
+        # the routing distribution only, not the spatial gating signal (row
+        # mass). Without this, TV would penalise sharp gating boundaries
+        # in unbalanced_eot, counteracting the intended crisp spatial gating.
+        row_sum = P.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        P_norm = P / row_sum  # (B, HW, N) — row sums = 1
+        B, HW, N = P_norm.shape
+        P_sp = P_norm.transpose(1, 2).view(B, N, H, W)  # (B, N, H, W)
         tv_h = (P_sp[:, :, 1:, :] - P_sp[:, :, :-1, :]).abs().mean()
         tv_w = (P_sp[:, :, :, 1:] - P_sp[:, :, :, :-1]).abs().mean()
         return tv_h + tv_w
@@ -254,7 +274,7 @@ class UnifiedDictionaryAttention(nn.Module):
         B, HW, N = C_mat.shape
         eps = F.softplus(self.log_eps) + 0.01
         log_a, log_b = -math.log(HW), -math.log(N)
-        M = C_mat.float() / eps
+        M = C_mat / eps
         log_f, log_g = C_mat.new_zeros(B, HW, 1), C_mat.new_zeros(B, 1, N)
 
         if self.training and self.n_nograd_iters > 0:
@@ -283,52 +303,76 @@ class UnifiedDictionaryAttention(nn.Module):
             fallback_P = self._route_softmax(C_mat)
             if self.training:
                 fallback_P = fallback_P + self.log_eps * 0.0
-            return fallback_P
+            # Softmax row sums = 1; divide by HW so the caller's *HW gives row sums ≈ 1
+            return fallback_P / HW
 
         # exp(-60) ≈ 1e-26 — negligible contribution to row sums
         return torch.exp(log_P.clamp(min=-60.0))
 
     # -----------------------------------------------------------------------
-    # KL-unbalanced Sinkhorn with spatially-varying ρ (log-domain)
+    # Shared Sinkhorn iteration runner
+    # -----------------------------------------------------------------------
+
+    def _sinkhorn_loop(
+        self,
+        log_f: torch.Tensor,
+        log_g: torch.Tensor,
+        M: torch.Tensor,
+        log_a: float,
+        log_b: float,
+        col_fn,
+        row_fn,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run warm-up (no-grad) + grad Sinkhorn iterations.
+
+        col_fn(lse) and row_fn(lse) apply the marginal proximity operator to
+        the respective logsumexp term.  For KL these are scalar multiplications;
+        for TV they are symmetric clamps.
+        """
+        if self.training and self.n_nograd_iters > 0:
+            with torch.no_grad():
+                for _ in range(self.n_nograd_iters):
+                    lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
+                    log_g = log_b - col_fn(lse_g)
+                    lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
+                    log_f = log_a - row_fn(lse_f)
+
+        n_iters = self.n_grad_iters if self.training else self.iters
+        for _ in range(n_iters):
+            lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)
+            log_g = log_b - col_fn(lse_g)
+            lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)
+            log_f = log_a - row_fn(lse_f)
+
+        return log_f, log_g
+
+    # -----------------------------------------------------------------------
+    # Unbalanced Sinkhorn with spatially-varying ρ (log-domain)
     # -----------------------------------------------------------------------
 
     def _route_unbalanced_eot(
         self, C_mat: torch.Tensor, rho_flat: torch.Tensor
     ) -> torch.Tensor:
         """
-        KL-unbalanced entropic OT in log-domain.
+        Unbalanced entropic OT in log-domain.  Supports two marginal divergences
+        controlled by `self.marginal_div`:
 
-        Row marginal strength : per-pixel ρ_i  (spatially varying, (B, HW))
-        Col marginal strength : mean(ρ) across pixels  (B, 1)
+        'kl'  — KL proximity operator (Séjourné et al. 2019):
+                    Aprox_KL(x) = ρ/(ρ+ε) · x
+                    log_g ← log_b − shrink_col · lse(log_f − M, rows)
+                    log_f ← log_a − shrink_row · lse(log_g − M, cols)
+                Smooth spatial gating: row masses taper continuously ∈ (0,1).
 
-        The KL proximity operator is (Séjourné et al. 2019, Table 1):
-            Aprox_ρKL(x) = ρ/(ρ+ε) · x
+        'tv'  — TV proximity operator (Séjourné et al. 2022):
+                    Aprox_TV(x) = clamp(x, −ρ, +ρ)
+                    log_g ← log_b − clamp(lse(log_f − M, rows), −ρ/ε, ρ/ε)
+                    log_f ← log_a − clamp(lse(log_g − M, cols), −ρ/ε, ρ/ε)
+                Sharp spatial gating: pixels either fully match the dictionary
+                (row_sum ≈ 1) or are cleanly suppressed (row_sum ≈ 0).
 
-        Applied to the Sinkhorn potential updates this gives:
-
-                lse_g    = logsumexp(log_f − M, dim=rows)       (B, 1, N)
-                log_g   ← log_b  −  shrink_col * lse_g
-
-                lse_f    = logsumexp(log_g − M, dim=cols)       (B, HW, 1)
-                log_f   ← log_a  −  shrink_row * lse_f
-
-        Derivation sketch:
-            softmin_x(f)  =  ε · logsumexp((f/ε + log_a − C/ε), rows)
-                          =  ε · (log_a + logsumexp(log_f − M, rows))
-            g_new = −Aprox(−softmin_x(f))
-                  = (ρ/(ρ+ε)) · ε · (log_a + logsumexp(log_f−M, rows))
-
-            In absorbed form (potentials already include log_a / log_b):
-                log_g_new = log_b  −  shrink_col · logsumexp(log_f − M, rows)
-
-            The key point: shrinkage multiplies ONLY the logsumexp term,
-            NOT the marginal log_b.  Multiplying log_b by shrink would
-            correspond to applying Aprox to the marginal measure itself,
-            which is mathematically incorrect.
-
-        Numerical bias of the OLD (wrong) formula for typical compression:
-            HW=1536, N=128, ε=0.1, ρ=0.5  →  bias on log_P ≈ +2.03
-            →  P inflated by ≈ 7.6× relative to correct plan
+        In the absorbed form the shrinkage / clamp applies ONLY to the logsumexp
+        term, not to the marginal constants log_a / log_b.
 
         Parameters
         ----------
@@ -342,56 +386,46 @@ class UnifiedDictionaryAttention(nn.Module):
         B, HW, N = C_mat.shape
         eps = F.softplus(self.log_eps) + 0.01  # strictly positive
 
-        log_a = -math.log(HW)  # scalar
-        log_b = -math.log(N)  # scalar
+        log_a = -math.log(HW)
+        log_b = -math.log(N)
+        M = C_mat / eps
 
-        M = C_mat.float() / eps  # (B, HW, N)
-
-        # Per-pixel row shrinkage:  s_i = ρ_i / (ρ_i + ε)  ∈ (0, 1)
-        #   ρ → ∞ : s → 1  →  balanced limit (hard row constraint)
-        #   ρ → 0 : s → 0  →  free transport (no row constraint)
-        shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
-
-        # Column shrinkage from mean row strength.
         rho_mean = rho_flat.mean(dim=1, keepdim=True)  # (B, 1)
-        shrink_col = (rho_mean / (rho_mean + eps)).unsqueeze(2)  # (B, 1, 1)
-
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
-        # ── No-grad warm-up (training only) ──────────────────────────────────
-        # During warm-up we detach shrink_{row,col} because the no-grad context
-        # would prevent gradients anyway, but detaching avoids unnecessary
-        # computation in the backward graph of the subsequent grad iterations.
-        if self.training and self.n_nograd_iters > 0:
-            with torch.no_grad():
-                _s_col = shrink_col.detach()
-                _s_row = shrink_row.detach()
-                for _ in range(self.n_nograd_iters):
-                    # Shrink only the logsumexp, NOT log_b/log_a
-                    lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B,1,N)
-                    log_g = log_b - _s_col * lse_g
+        if self.marginal_div == "kl":
+            # ρ→∞: shrink→1 (balanced limit)   ρ→0: shrink→0 (free transport)
+            shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
+            shrink_col = (rho_mean / (rho_mean + eps)).unsqueeze(2)  # (B, 1, 1)
+            log_f, log_g = self._sinkhorn_loop(
+                log_f,
+                log_g,
+                M,
+                log_a,
+                log_b,
+                col_fn=lambda lse: shrink_col * lse,
+                row_fn=lambda lse: shrink_row * lse,
+            )
+        else:  # tv — large ρ/ε → wide clamp (balanced), small ρ/ε → hard binary gating
+            rpe_row = (rho_flat / eps).unsqueeze(2)  # (B, HW, 1)
+            rpe_col = (rho_mean / eps).unsqueeze(2)  # (B, 1,  1)
+            log_f, log_g = self._sinkhorn_loop(
+                log_f,
+                log_g,
+                M,
+                log_a,
+                log_b,
+                col_fn=lambda lse: torch.clamp(lse, -rpe_col, rpe_col),
+                row_fn=lambda lse: torch.clamp(lse, -rpe_row, rpe_row),
+            )
 
-                    lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B,HW,1)
-                    log_f = log_a - _s_row * lse_f
-
-        # ── Grad iterations ───────────────────────────────────────────────────
-        n_iters = self.n_grad_iters if self.training else self.iters
-        for _ in range(n_iters):
-            # log_g ← log_b  −  shrink_col · logsumexp(log_f − M, rows)
-            lse_g = torch.logsumexp(log_f - M, dim=1, keepdim=True)  # (B, 1, N)
-            log_g = log_b - shrink_col * lse_g
-
-            # log_f ← log_a  −  shrink_row · logsumexp(log_g − M, cols)
-            lse_f = torch.logsumexp(log_g - M, dim=2, keepdim=True)  # (B, HW, 1)
-            log_f = log_a - shrink_row * lse_f
-
-        log_P = log_f + log_g - M  # (B, HW, N)
+        log_P = log_f + log_g - M
 
         if torch.isnan(log_P).any():
             self.sinkhorn_divergence_count += 1
             warnings.warn(
-                f"[UnbalancedEOT] Sinkhorn NaN detected "
+                f"[UnbalancedEOT/{self.marginal_div.upper()}] Sinkhorn NaN detected "
                 f"(eps={eps.item():.4f}, "
                 f"rho_mean={rho_flat.mean().item():.4f}, "
                 f"count={self.sinkhorn_divergence_count}). "
@@ -400,7 +434,8 @@ class UnifiedDictionaryAttention(nn.Module):
             fallback_P = self._route_softmax(C_mat)
             if self.training:
                 fallback_P = fallback_P + (rho_flat * 0.0).sum() + self.log_eps * 0.0
-            return fallback_P
+            # Softmax row sums = 1; divide by HW so the caller's *HW gives row sums ≈ 1
+            return fallback_P / HW
 
         return torch.exp(log_P.clamp(min=-60.0))
 
@@ -416,9 +451,6 @@ class UnifiedDictionaryAttention(nn.Module):
         as a safe fallback when Sinkhorn diverges in either EOT mode.
 
         P[b, hw, :] = softmax(−C[b, hw, :] / τ)  — rows sum to 1.
-
-        log_tau is always registered (see __init__ Bug-3 fix), so we can
-        always read it directly.
         """
         tau = F.softplus(self.log_tau) + 0.01  # bounded away from 0
         return F.softmax(-C_mat / tau, dim=-1)
@@ -447,8 +479,7 @@ class UnifiedDictionaryAttention(nn.Module):
         """
         marginal = P.sum(dim=1)  # (B, N)
         marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        _log2e = 1.0 / math.log(2)
-        H = -(marginal * marginal.clamp(min=1e-8).log()).sum(dim=1).mean() * _log2e
+        H = -(marginal * torch.log2(marginal.clamp(min=1e-8))).sum(dim=1).mean()
         return -H  # negative entropy in bits
 
     # -----------------------------------------------------------------------
@@ -535,7 +566,7 @@ class UnifiedDictionaryAttention(nn.Module):
         # ── Value aggregation ─────────────────────────────────────────────────
         # Normalise values and scale by sqrt(D) so the expected output magnitude
         # is O(1) when row sums of P are O(1) — standard attention normalisation.
-        v_norm = F.normalize(v, p=2, dim=-1) * math.sqrt(self.dict_dim)  # (B, N, D)
+        v_norm = F.normalize(v, p=2, dim=-1) * self._sqrt_dict_dim  # (B, N, D)
         # Weighted sum: each spatial position gets a convex (or near-convex)
         # combination of dictionary value vectors.
         # P : (B, HW, N)   v_norm : (B, N, D)  →  out : (B, HW, D)
@@ -550,9 +581,11 @@ class UnifiedDictionaryAttention(nn.Module):
         if calc_disp:
             disp_loss = self._dispersion_loss(P) + tv_loss
             if self.training:
-                if self.routing_mode != "softmax" and hasattr(self, "log_tau"):
+                # Keep unused parameter in the backward graph for DDP correctness
+                # (find_unused_parameters=False requires all params to appear in loss).
+                if self.routing_mode != "softmax":
                     disp_loss = disp_loss + self.log_tau * 0.0
-                if self.routing_mode == "softmax" and hasattr(self, "log_eps"):
+                else:
                     disp_loss = disp_loss + self.log_eps * 0.0
         else:
             disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)

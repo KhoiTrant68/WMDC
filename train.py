@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import math
 import os
@@ -496,7 +497,7 @@ def test_epoch(
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--routing_mode",
+        "--routing-mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],
@@ -539,6 +540,35 @@ def parse_args():
         "Set to 0 to disable.",
     )
     p.add_argument("--ot-eps", type=float, default=0.1)
+    p.add_argument(
+        "--marginal-div",
+        type=str,
+        default="kl",
+        choices=["kl", "tv"],
+        help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
+    )
+    p.add_argument(
+        "--backbone",
+        type=str,
+        default="fdm",
+        choices=["fdm", "cnn", "swin", "ss2d", "fdm_reversed"],
+        help="Encoder/decoder backbone block (default: fdm = FrequencyDisentangledMamba).",
+    )
+    p.add_argument(
+        "--use-dense-concat",
+        action="store_true",
+        default=False,
+        dest="use_dense_concat",
+        help="Replace stateful Markov memory with dense channel-autoregressive concat.",
+    )
+    p.add_argument(
+        "--memory-init",
+        type=str,
+        default="bootstrap",
+        choices=["bootstrap", "zero"],
+        dest="memory_init",
+        help="How to initialise M_1: 'bootstrap' (learned Conv projection) or 'zero'.",
+    )
     p.add_argument("--sinkhorn-iters", type=int, default=20)
     p.add_argument("--lr-milestones", type=int, nargs="+", default=[360, 380])
     p.add_argument("--lr-gamma", type=float, default=0.1)
@@ -639,8 +669,12 @@ def main():
         M=320,
         num_slices=5,
         routing_mode=args.routing_mode,
+        marginal_div=args.marginal_div,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        backbone=args.backbone,
+        use_dense_concat=args.use_dense_concat,
+        memory_init=args.memory_init,
     )
 
     optimizer, aux_optimizer = configure_optimizers(model, args)
@@ -686,6 +720,8 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        if "aux_scheduler" in ckpt:
+            aux_scheduler.load_state_dict(ckpt["aux_scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("best_loss", float("inf"))
         if "criterion" in ckpt:
@@ -751,6 +787,7 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "aux_optimizer": aux_optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
+                "aux_scheduler": aux_scheduler.state_dict(),
                 "criterion": criterion.state_dict(),
                 "args": vars(args),
             }
@@ -768,8 +805,6 @@ def main():
                     "test_loss": round(test_loss, 4),
                     "gap_psnr_db": round(gap_psnr, 3),
                 }
-                import json
-
                 with open(summary_path, "w") as f:
                     json.dump(
                         {

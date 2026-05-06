@@ -25,7 +25,7 @@ def main():
     )
 
     parser.add_argument(
-        "--routing_mode",
+        "--routing-mode",
         type=str,
         default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],
@@ -52,6 +52,12 @@ def main():
     parser.add_argument("--cuda", action="store_true")
 
     args = parser.parse_args()
+
+    if args.mode == "spatial_gating" and args.routing_mode != "unbalanced_eot":
+        print(
+            f"[WARN] spatial_gating requires routing_mode=unbalanced_eot "
+            f"(got '{args.routing_mode}'). Cells will show N/A placeholders."
+        )
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
@@ -204,25 +210,36 @@ def main():
             num_slices = len(attn_maps)
 
             for s in range(num_slices):
-                row_mass = model.eot_attentions[s].last_row_mass.cpu()
-                row_mass = row_mass.view(1, 1, latent_h, latent_w)
+                ax = axes[row_idx][s + 1]
+                ax.axis("off")
+                if row_idx == 0:
+                    ax.set_title(f"Slice {s}")
 
+                raw = model.eot_attentions[s].last_row_mass
+                if raw is None:
+                    # last_row_mass is only populated for unbalanced_eot.
+                    ax.text(
+                        0.5,
+                        0.5,
+                        f"N/A\n(requires\nunbalanced_eot,\ngot {args.routing_mode})",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                        fontsize=8,
+                        color="gray",
+                    )
+                    continue
+
+                row_mass = raw.cpu().view(1, 1, latent_h, latent_w)
                 mass_resized = F.interpolate(
                     row_mass,
                     size=(padded_h, padded_w),
                     mode="bilinear",
                     align_corners=False,
                 )
-
                 mass_np = mass_resized[:, :, :H, :W].squeeze().numpy()
-
-                ax = axes[row_idx][s + 1]
                 ax.imshow(orig_np)
                 ax.imshow(mass_np, cmap="inferno", alpha=0.7)
-                ax.axis("off")
-
-                if row_idx == 0:
-                    ax.set_title(f"Slice {s}")
 
         # =========================
         # MODE 4: ENTROPY MAP 🔥

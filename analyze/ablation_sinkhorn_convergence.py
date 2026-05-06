@@ -1,190 +1,279 @@
+"""
+analyze/ablation_sinkhorn_convergence.py  (FIXED)
+=================================================
+Plots the unbalanced Sinkhorn primal objective vs. iteration count, to
+empirically justify the choice of `iters=20` in the model.
+
+Bugs fixed vs. previous version
+-------------------------------
+1. Uses `model._hyper_decode(z_hat)` instead of the now-removed
+   `model.h_scale_s` / `model.h_mean_s` (which were merged into
+   `h_trunk + h_scale_head + h_mean_head` after refactor).
+2. Unpacks the tuple returned by `model.hyper_to_dict(z_hat)`
+   (previously assumed it was a single tensor).
+3. Adds a sweep over multiple ε values to give the paper's convergence
+   study real teeth (Section 3.3 of the paper claims iters=20 is
+   sufficient — this script generates the evidence).
+
+Usage
+-----
+    python analyze/ablation_sinkhorn_convergence.py \
+        --checkpoint checkpoints/full/best.pth.tar \
+        --image      /data/kodak/kodim01.png \
+        --max-iters  30 \
+        --eps-sweep  0.05 0.1 0.2 0.5 \
+        -o sinkhorn_convergence.pdf \
+        --cuda
+"""
+
 import argparse
-import os
-import sys
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(script_dir)
-sys.path.insert(0, parent_dir)
-
-import math
+import json
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from PIL import Image
-from torchvision import transforms
-
-from models.WMDC import WMDC
+from _common import load_image, load_model
 
 
-def measure_convergence(model, x_padded, max_iters: int, device: str):
+def _decode_hyper(model, z_hat: torch.Tensor) -> torch.Tensor:
     """
-    Run the EOT routing with iter counts [1, 2, ..., max_iters] and record
-    the primal transport cost Σ_{ij} C_{ij} π_{ij} at each count.
+    Run the hyper-decoder. Tries the new shared-trunk path first and falls
+    back to the legacy path so this script works on either checkpoint.
+    """
+    if hasattr(model, "_hyper_decode"):
+        scales, means = model._hyper_decode(z_hat)
+        return torch.cat([scales, means], dim=1)
+    if hasattr(model, "h_trunk"):
+        h = model.h_trunk(z_hat)
+        scales = model.h_scale_head(h)
+        means = model.h_mean_head(h)
+        return torch.cat([scales, means], dim=1)
+    # Legacy fallback (pre-refactor checkpoints).
+    scales = model.h_scale_s(z_hat)
+    means = model.h_mean_s(z_hat)
+    return torch.cat([scales, means], dim=1)
 
-    Returns:
-        iter_counts  : list of int
-        costs        : list of float  (mean over batch and spatial positions)
+
+def _get_dt(model, z_hat: torch.Tensor) -> torch.Tensor:
+    """hyper_to_dict returns (dt, dict_penalty) — we only need dt here."""
+    out = model.hyper_to_dict(z_hat)
+    return out[0] if isinstance(out, tuple) else out
+
+
+def measure_convergence(
+    model,
+    x_padded: torch.Tensor,
+    max_iters: int,
+    *,
+    eps_value: float | None = None,
+) -> dict:
+    """
+    For iter counts 1..max_iters, run the unbalanced Sinkhorn solver on
+    slice 0 and record the primal objective:
+
+        J(P) = <C, P> + <ρ, KL(P1 || a)> + ε · KL(P^T 1 || b)
+
+    Setting `eps_value` overrides the model's learned ε for the duration
+    of the measurement (useful for the ε-sweep figure).
     """
     model.eval()
+    attn = model.eot_attentions[0]
 
-    # Extract the components needed to build a cost matrix.
     with torch.no_grad():
+        # ── Forward to slice-0 inputs ─────────────────────────────────────
         y = model.g_a(x_padded)
         z = model.h_a(y)
-        z_hat = model.entropy_bottleneck.decompress(
-            model.entropy_bottleneck.compress(z), z.size()[-2:]
-        )
-        dt = model.hyper_to_dict(z_hat)
-        latent_scales = model.h_scale_s(z_hat)
-        latent_means = model.h_mean_s(z_hat)
-        hyper_prior = torch.cat([latent_scales, latent_means], dim=1)
+        # Use real entropy-coded z_hat for fidelity; falls back to round if
+        # the entropy bottleneck CDF tables are not populated.
+        try:
+            z_str = model.entropy_bottleneck.compress(z)
+            z_hat = model.entropy_bottleneck.decompress(z_str, z.size()[-2:])
+        except Exception:
+            z_hat = torch.round(z)
+
+        dt = _get_dt(model, z_hat)
+        hyper_prior = _decode_hyper(model, z_hat)
+
         rho_spatial = model._compute_rho_spatial(
             slice_idx=0, hyper_prior=hyper_prior, decoded_slices=[]
         )
 
-        # Use slice-0 projection for the convergence test.
         k_dict = model.k_projs[0](dt)
-        v_dict = model.v_projs[0](dt)
-
         memory_state = model.init_memory(hyper_prior)
         query = torch.cat([hyper_prior, memory_state], dim=1)
 
         B, _, H, W = query.shape
         HW = H * W
 
-        # Build cost matrix once (independent of iters). Access eot_attentions[0]
-        C_mat = model.eot_attentions[0]._cost_matrix(query, k_dict, H, W)
-        rho_flat = rho_spatial.view(B, HW).clamp(min=0.01)
+        C_mat = attn._cost_matrix(query, k_dict, H, W)
+        rho_flat = rho_spatial.view(B, HW).clamp_min(0.01)
 
+    # ── Iter sweep ───────────────────────────────────────────────────────
     iter_counts = list(range(1, max_iters + 1))
-    costs = []
+    primal_costs: list[float] = []
+    transport_costs: list[float] = []
+    kl_row_costs: list[float] = []
+    kl_col_costs: list[float] = []
 
-    # Temporarily swap iters inside the module. Access eot_attentions[0]
-    original_iters = model.eot_attentions[0].iters
+    # Determine effective epsilon.
+    if eps_value is None:
+        eps_val = F.softplus(attn.log_eps).item() + 0.01
+    else:
+        eps_val = eps_value
 
-    # Calculate effective epsilon dynamically based on learned log_eps
-    eps_val = F.softplus(model.eot_attentions[0].log_eps).item() + 0.01
-
-    for n_iters in iter_counts:
-        model.eot_attentions[0].iters = n_iters
-        # Make sure gradient iterations adjust alongside max_iters for testing
-        model.eot_attentions[0].n_grad_iters = n_iters
-        model.eot_attentions[0].n_nograd_iters = 0
-
+    # Save and override solver state so we can sweep iter count.
+    original = (attn.iters, attn.n_grad_iters, attn.n_nograd_iters)
+    if eps_value is not None:
+        # Temporarily override learned eps. We rebuild from log_eps so we
+        # can restore exactly.
+        original_log_eps = attn.log_eps.detach().clone()
+        # log_eps + 0.01 → softplus^{-1}(eps - 0.01)
+        target_softplus = max(eps_value - 0.01, 1e-6)
+        new_log = torch.log(torch.exp(torch.tensor(target_softplus)) - 1.0)
         with torch.no_grad():
-            P = model.eot_attentions[0]._route_unbalanced_eot(C_mat, rho_flat)
+            attn.log_eps.copy_(new_log)
 
-            # 1. Linear Transport Cost
-            transport_cost = (C_mat * P).sum(dim=(1, 2))
+    try:
+        for n in iter_counts:
+            attn.iters = n
+            attn.n_grad_iters = n
+            attn.n_nograd_iters = 0
 
-            # 2. Marginal KL Divergences (Penalty for creating/destroying mass)
-            # P_row_sum is P1, P_col_sum is P^T1
-            P_row_sum = P.sum(dim=2) + 1e-8  # (B, HW)
-            P_col_sum = P.sum(dim=1) + 1e-8  # (B, N)
+            with torch.no_grad():
+                P = attn._route_unbalanced_eot(C_mat, rho_flat)
 
-            alpha = 1.0 / HW
-            beta = 1.0 / C_mat.size(-1)
+                transport = (C_mat * P).sum(dim=(1, 2))  # (B,)
 
-            # D_KL(u || v) = u log(u/v) - u + v
-            # FIX: Compute kl_row PER PIXEL (shape: B, HW)
-            kl_row_per_pixel = (
-                P_row_sum * torch.log(P_row_sum / alpha) - P_row_sum + alpha
-            )
+                P_row = P.sum(dim=2).clamp_min(1e-12)
+                P_col = P.sum(dim=1).clamp_min(1e-12)
 
-            # kl_col can be summed entirely (shape: B)
-            kl_col = (P_col_sum * torch.log(P_col_sum / beta) - P_col_sum + beta).sum(
-                dim=1
-            )
+                a_unif = 1.0 / HW
+                b_unif = 1.0 / C_mat.shape[-1]
 
-            # Spatial Rho applies to rows per-pixel, uniform epsilon to cols
-            rho_penalty = (rho_flat * kl_row_per_pixel).sum(dim=1)  # (B)
+                # KL(P1 || a) per pixel: u·log(u/v) - u + v
+                kl_row_pp = P_row * torch.log(P_row / a_unif) - P_row + a_unif
+                kl_row = (rho_flat * kl_row_pp).sum(dim=1)  # (B,)
 
-            # Total Unbalanced Primal Objective (using dynamic eps_val)
-            total_cost = (transport_cost + rho_penalty + eps_val * kl_col).mean().item()
+                kl_col_pp = P_col * torch.log(P_col / b_unif) - P_col + b_unif
+                kl_col = eps_val * kl_col_pp.sum(dim=1)  # (B,)
 
-        costs.append(total_cost)
+                primal = (transport + kl_row + kl_col).mean().item()
 
-    model.eot_attentions[0].iters = original_iters
-    return iter_counts, costs
+                primal_costs.append(primal)
+                transport_costs.append(transport.mean().item())
+                kl_row_costs.append(kl_row.mean().item())
+                kl_col_costs.append(kl_col.mean().item())
+    finally:
+        attn.iters, attn.n_grad_iters, attn.n_nograd_iters = original
+        if eps_value is not None:
+            with torch.no_grad():
+                attn.log_eps.copy_(original_log_eps)
+
+    final = primal_costs[-1] if primal_costs else float("nan")
+    return {
+        "iter_counts": iter_counts,
+        "primal_cost": primal_costs,
+        "transport_cost": transport_costs,
+        "kl_row": kl_row_costs,
+        "kl_col": kl_col_costs,
+        "relative_primal": [c / (final + 1e-12) for c in primal_costs],
+        "eps_value": eps_val,
+        "final_cost": final,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--image", type=str, required=True)
-    parser.add_argument(
-        "--routing_mode",
-        type=str,
-        default="unbalanced_eot",
-        choices=["softmax", "balanced_eot", "unbalanced_eot"],
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--image", type=str, required=True)
+    p.add_argument("--routing-mode", type=str, default="unbalanced_eot")
+    p.add_argument("--ot-eps", type=float, default=0.1)
+    p.add_argument("--max-iters", type=int, default=30)
+    p.add_argument(
+        "--eps-sweep",
+        type=float,
+        nargs="+",
+        default=[0.1],
+        help="Sweep multiple ε values for the convergence plot.",
     )
-    parser.add_argument("--ot-eps", type=float, default=0.1)
-    parser.add_argument("--max-iters", type=int, default=20)
-    parser.add_argument("-o", "--output", type=str, default="sinkhorn_convergence.pdf")
-    parser.add_argument("--cuda", action="store_true")
-    args = parser.parse_args()
+    p.add_argument("-o", "--output", type=str, default="sinkhorn_convergence.pdf")
+    p.add_argument("--json-out", type=str, default=None)
+    p.add_argument("--cuda", action="store_true")
+    args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
-    model = WMDC(
-        N=192,
-        M=320,
-        num_slices=5,
+    model = load_model(
+        args.checkpoint,
+        device,
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.max_iters,
-    ).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt.get("state_dict", ckpt))
-    model.update(force=True)
-
-    img = Image.open(args.image).convert("RGB")
-    x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-    H, W = x.size(2), x.size(3)
-    pad_h = (64 - H % 64) % 64
-    pad_w = (64 - W % 64) % 64
-    x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-
-    iter_counts, costs = measure_convergence(model, x_padded, args.max_iters, device)
-
-    # Cost relative to max-iter value (convergence fraction).
-    final_cost = costs[-1]
-    rel_costs = [c / (final_cost + 1e-8) for c in costs]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-    ax1.plot(iter_counts, costs, "b-o", markersize=3)
-    ax1.axvline(x=3, color="red", linestyle="--", alpha=0.7, label="Original (3)")
-    ax1.axvline(x=20, color="green", linestyle="--", alpha=0.7, label="Fixed (20)")
-    ax1.set_xlabel("Sinkhorn iterations")
-    ax1.set_ylabel("Primal transport cost")
-    ax1.set_title("Convergence of transport cost")
-    ax1.legend()
-    ax1.grid(alpha=0.3)
-
-    ax2.plot(iter_counts, rel_costs, "b-o", markersize=3)
-    ax2.axvline(x=3, color="red", linestyle="--", alpha=0.7, label="Original (3)")
-    ax2.axvline(x=20, color="green", linestyle="--", alpha=0.7, label="Fixed (20)")
-    ax2.axhline(y=1.0, color="gray", linestyle=":", alpha=0.5)
-    ax2.set_xlabel("Sinkhorn iterations")
-    ax2.set_ylabel("Cost / cost at max iters")
-    ax2.set_title("Relative convergence")
-    ax2.legend()
-    ax2.grid(alpha=0.3)
-
-    cost_at_3 = costs[2] if len(costs) > 2 else float("nan")
-    cost_at_20 = costs[19] if len(costs) > 19 else float("nan")
-    print(f"Transport cost at  3 iters: {cost_at_3:.6f}")
-    print(f"Transport cost at 20 iters: {cost_at_20:.6f}")
-    print(
-        f"Relative gap (3 vs 20):     {abs(cost_at_3 - cost_at_20) / (cost_at_20 + 1e-8) * 100:.2f}%"
+        update_for_inference=True,
     )
+    _x, x_padded, _H, _W = load_image(args.image, device=device)
+
+    all_results = {}
+    for eps in args.eps_sweep:
+        print(f"\n== ε = {eps} ==")
+        res = measure_convergence(model, x_padded, args.max_iters, eps_value=eps)
+        all_results[f"{eps:.4f}"] = res
+        costs = res["primal_cost"]
+
+        def _cost_at(n: int) -> str:
+            return f"{costs[n - 1]:.6f}" if n <= len(costs) else "n/a"
+
+        print(
+            f"  cost @ iter 3:  {_cost_at(3)}\n"
+            f"  cost @ iter 10: {_cost_at(10)}\n"
+            f"  cost @ iter 20: {_cost_at(20)}\n"
+            f"  cost @ iter {args.max_iters}: {res['final_cost']:.6f}"
+        )
+
+    # ── Plot ─────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    cmap = plt.get_cmap("viridis")
+
+    for idx, (eps_label, res) in enumerate(all_results.items()):
+        col = cmap(idx / max(len(all_results) - 1, 1))
+        axes[0].plot(
+            res["iter_counts"],
+            res["primal_cost"],
+            "-o",
+            markersize=3,
+            color=col,
+            label=f"ε = {eps_label}",
+        )
+        axes[1].plot(
+            res["iter_counts"],
+            res["relative_primal"],
+            "-o",
+            markersize=3,
+            color=col,
+            label=f"ε = {eps_label}",
+        )
+
+    for ax in axes:
+        ax.axvline(20, color="green", ls="--", alpha=0.7, label="chosen (20)")
+        ax.set_xlabel("Sinkhorn iterations")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=9)
+
+    axes[0].set_ylabel("Primal objective")
+    axes[0].set_title("Convergence of unbalanced Sinkhorn primal cost")
+    axes[1].set_ylabel("Cost / cost at max iters")
+    axes[1].set_title("Relative convergence")
+    axes[1].axhline(1.0, color="gray", ls=":", alpha=0.5)
 
     fig.tight_layout()
     fig.savefig(args.output, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved {args.output}")
+    print(f"\nSaved figure → {args.output}")
+
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"Saved JSON → {args.json_out}")
 
 
 if __name__ == "__main__":
