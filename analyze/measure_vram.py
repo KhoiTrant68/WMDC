@@ -113,17 +113,20 @@ def measure_one(
     if mode == "train":
         # Forward + a synthetic RD-style loss + backward.
         out = model(x)
-        # Mimic the training loss: distortion + bpp + dispersion bonus.
+        # Mimic the training loss (RateDistortionLoss) for an accurate VRAM
+        # estimate: distortion + bpp + routing regularisers.
         x_hat = out["x_hat"]
         mse = F.mse_loss(x_hat, x)
         bpp = sum(torch.log(lh).sum() for lh in out["likelihoods"].values()).abs() / (
             x.numel()
         )
         loss = 0.013 * 65025.0 * mse + bpp
-        if "dispersion_loss" in out:
-            loss = loss + 0.01 * out["dispersion_loss"]
+        if "column_neg_entropy" in out:
+            loss = loss + 0.01 * out["column_neg_entropy"]
+        if "row_entropy" in out:
+            loss = loss + 0.05 * out["row_entropy"]
         if "dict_penalty" in out:
-            loss = loss + 1.0 * out["dict_penalty"]
+            loss = loss + 0.1 * out["dict_penalty"]
         loss.backward()
     else:
         with torch.no_grad():

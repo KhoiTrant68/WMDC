@@ -16,8 +16,10 @@ Variant list
   no_fdm            — FDM block   → standard SS2D Mamba block (no wavelet).
   no_stateful_mem   — stateful memory → dense channel-autoregressive concat.
   no_bootstrap_M1   — M_1 bootstrapped from Φ → M_1 = 0 (zero init).
-  no_disp_bonus     — remove the −α·H(̄m) entropy bonus from the loss.
-  no_dict_penalty   — remove the +β·P_dict diversity penalty from the loss.
+  no_disp_bonus     — remove the routing-entropy regularisers from the loss
+                      (both column-entropy bonus AND row-entropy penalty
+                       AND the anti-leakage alignment hinge).
+  no_dict_penalty   — remove the dictionary-token diversity penalty.
 
 Notes for the trainer
 ---------------------
@@ -55,8 +57,14 @@ VARIANTS: dict[str, dict] = {
         "--memory-init": "zero",
     },
     "no_disp_bonus": {
-        # Set EMA-adaptive disp weight base to zero → no entropy bonus.
-        "--disp-weight": 0.0,
+        # Ablate the ENTIRE dictionary-routing regularisation block:
+        # column-entropy bonus, row-entropy sparsity penalty, AND the
+        # anti-leakage alignment hinge.  This mirrors the original
+        # ablation intent ("remove the −α·H entropy bonus") but is
+        # adapted to the refactored MI-decomposition loss.
+        "--column-entropy-weight": 0.0,
+        "--row-entropy-weight": 0.0,
+        "--alignment-weight": 0.0,
     },
     "no_dict_penalty": {
         # Set fixed dictionary-penalty weight to zero.
@@ -84,8 +92,10 @@ RUN_ORDER = [
 #   --backbone {fdm, cnn, swin, ss2d, fdm_reversed}    (NEW; see ablation_models/backbone_variants.py)
 #   --use-dense-concat                                  (NEW; see analyze/measure_vram.py footer)
 #   --memory-init {bootstrap, zero}                     (NEW; trivial — see WMDC.init_memory)
-#   --disp-weight <float>                               (existing)
-#   --dict-penalty-weight <float>                       (existing — see train.py update)
+#   --column-entropy-weight <float>                     (β_col: −H_col bonus)
+#   --row-entropy-weight    <float>                     (β_row: H_row penalty)
+#   --alignment-weight      <float>                     (γ: anti-leakage hinge)
+#   --dict-penalty-weight   <float>                     (δ: token diversity)
 #
 # When in doubt about a flag's effect, search train.py for the existing
-# disp-weight/dict-penalty-weight wiring and follow the same pattern.
+# wiring in RateDistortionLoss and follow the same pattern.

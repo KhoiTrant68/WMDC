@@ -43,7 +43,7 @@ variant_flags() {
         no_fdm)           echo "--backbone ss2d" ;;
         no_stateful_mem)  echo "--use-dense-concat" ;;
         no_bootstrap_M1)  echo "--memory-init zero" ;;
-        no_disp_bonus)    echo "--disp-weight 0.0" ;;
+        no_disp_bonus)    echo "--column-entropy-weight 0.0 --row-entropy-weight 0.0 --alignment-weight 0.0" ;;
         no_dict_penalty)  echo "--dict-penalty-weight 0.0" ;;
         *) echo "ERROR: unknown variant $1" >&2; return 1 ;;
     esac
