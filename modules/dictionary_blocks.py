@@ -456,31 +456,66 @@ class UnifiedDictionaryAttention(nn.Module):
         return F.softmax(-C_mat / tau, dim=-1)
 
     # -----------------------------------------------------------------------
-    # Dispersion loss  (returns −H in BITS)
+    # Routing-entropy losses  (both in BITS, commensurate with bpp)
     # -----------------------------------------------------------------------
 
     @staticmethod
     def _dispersion_loss(P: torch.Tensor) -> torch.Tensor:
         """
-        Returns −H(m) where m is the column-marginal distribution of P.
+        Negative column entropy −H_col(m) where m is the column-marginal of P.
 
             m_j = Σ_i P_ij / Z,    Z = Σ_{i,j} P_ij
+            H_col = −Σ_j m_j log₂ m_j     (bits)
 
-        H(m) = −Σ_j m_j log₂ m_j   (Shannon entropy in bits)
+        Returns −H so callers can MINIMISE this term to MAXIMISE H_col.
+        Maximising H_col prevents dead codes — every dictionary token must
+        get some usage across the spatial grid.
 
-        Entropy is in bits to be commensurate with bpp_loss units so that
-        the adaptive EMA scaling in RateDistortionLoss remains well-conditioned.
+        Theoretical role
+        ----------------
+        H_col is half of the mutual-information decomposition
 
-        Returns negative entropy so callers can SUBTRACT it from the loss
-        (minimising loss → maximising H → uniform dictionary usage).
+            I(pixel ; token)  =  H_col − E_pixel[ H_row ]
+
+        Maximising I requires BOTH high H_col AND low H_row.  This method
+        provides H_col; _row_entropy provides H_row.  Optimising only H_col
+        admits the trivial P[i,j] = 1/N solution (100% utilisation on every
+        slice with zero specialisation) — observed as the dictionary-collapse
+        failure mode in the pre-refactor training run.
 
         P : (B, HW, N) — already scaled by HW in the caller
-        Returns: scalar tensor
+        Returns: scalar tensor (bits)
         """
         marginal = P.sum(dim=1)  # (B, N)
         marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
         H = -(marginal * torch.log2(marginal.clamp(min=1e-8))).sum(dim=1).mean()
         return -H  # negative entropy in bits
+
+    @staticmethod
+    def _row_entropy(P: torch.Tensor) -> torch.Tensor:
+        """
+        Mean per-pixel row entropy H_row of P (bits, positive).
+
+            p_i(j) = P_ij / Σ_j P_ij                    (row-normalised)
+            H_row  = E_i[ −Σ_j p_i(j) log₂ p_i(j) ]    (bits, ≥ 0)
+
+        Minimising H_row drives each pixel toward a sparse (peaked) choice
+        over the N dictionary tokens — i.e. specialisation.  Together with
+        the column-entropy bonus this maximises I(pixel ; token).
+
+        For unbalanced OT, some rows have Σ_j P_ij < 1 (mass dropped by ρ).
+        The per-row normalisation makes the entropy a property of the
+        DISTRIBUTION of mass over tokens, independent of the total row
+        mass — leakage is regularised separately by the alignment loss.
+
+        P : (B, HW, N)  with non-negative entries
+        Returns: scalar tensor (bits)
+        """
+        row_sums = P.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        P_norm = P / row_sums
+        log_p = torch.log2(P_norm.clamp(min=1e-8))
+        H = -(P_norm * log_p).sum(dim=-1)  # (B, HW)
+        return H.mean()
 
     # -----------------------------------------------------------------------
     # Forward
@@ -493,7 +528,7 @@ class UnifiedDictionaryAttention(nn.Module):
         v: torch.Tensor,
         rho_spatial: torch.Tensor | None,
         calc_disp: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict]:
         """
         Parameters
         ----------
@@ -502,12 +537,22 @@ class UnifiedDictionaryAttention(nn.Module):
         v           : (B, N, dict_dim)        dictionary values (from v_proj)
         rho_spatial : (B, H, W) or None       per-pixel KL mass strength
                       Required for 'unbalanced_eot', ignored otherwise.
-        calc_disp   : bool  — compute dispersion loss (True during training)
+        calc_disp   : bool  — compute routing-entropy signals (True in training)
 
         Returns
         -------
-        out      : (B, output_dim, H, W)  aggregated dictionary features
-        disp_loss: scalar tensor          −H (bits), 0 if calc_disp=False
+        out : (B, output_dim, H, W)  aggregated dictionary features
+        aux : dict with keys
+            'column_neg_entropy' : scalar −H_col (bits).  Minimise to maximise
+                                   H_col (anti-dead-code: every token used).
+            'row_entropy'        : scalar H_row (bits, ≥ 0).  Minimise to make
+                                   each pixel pick FEW tokens (specialisation).
+            'row_mass'           : (B, HW) per-pixel row marginal Σ_j P_ij.
+                                   For unbalanced_eot ∈ (0, 1] carries the
+                                   spatial gating ρ/(ρ+ε); for softmax /
+                                   balanced ≡ 1 (no gating).
+            'tv_loss'            : scalar ≥ 0 spatial-TV regulariser on P.
+            All four are zero scalars when calc_disp=False (compress / eval).
         """
         B, _, H, W = x.shape
         HW = H * W
@@ -542,12 +587,6 @@ class UnifiedDictionaryAttention(nn.Module):
             # aggregated feature → effective soft-masking of irrelevant regions.
             P = P * HW
 
-            # Store raw row mass (eval only) for ablation visualisation
-            if not self.training:
-                self.last_row_mass = P.sum(dim=-1).detach()  # (B, HW)
-            else:
-                self.last_row_mass = None
-
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode!r}")
 
@@ -557,6 +596,24 @@ class UnifiedDictionaryAttention(nn.Module):
             self.attn_probs = P.detach()
         else:
             self.attn_probs = None
+
+        # ── Per-pixel row marginal (always computed, grad-bearing) ───────────
+        # The anti-leakage alignment regulariser in RateDistortionLoss tilts
+        # this signal so corr(row_mass, content_complexity) ≥ 0.  Without that
+        # constraint the optimizer chose corr = -0.66 — UEOT abuse, dropping
+        # mass at complex regions and laundering rate into the Gaussian channel.
+        if self.routing_mode == "unbalanced_eot":
+            row_mass = P.sum(dim=-1)  # (B, HW), grad-bearing
+            # Eval-only side-channel kept for analyze/visualize_attention.py
+            if not self.training:
+                self.last_row_mass = row_mass.detach()
+            else:
+                self.last_row_mass = None
+        else:
+            # softmax / balanced: rows sum to 1 exactly — no gating to align.
+            row_mass = P.new_ones(B, HW)
+            if not self.training:
+                self.last_row_mass = None
 
         # ── Spatial TV regularisation (optional, training only) ──────────────
         tv_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
@@ -577,17 +634,28 @@ class UnifiedDictionaryAttention(nn.Module):
             .view(B, -1, H, W)  # (B, D, H, W)
         )
 
-        # ── Dispersion loss ───────────────────────────────────────────────────
+        # ── Routing-entropy signals ──────────────────────────────────────────
+        zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if calc_disp:
-            disp_loss = self._dispersion_loss(P) + tv_loss
+            column_neg_entropy = self._dispersion_loss(P)
+            row_entropy = self._row_entropy(P)
+            # DDP find_unused_parameters=False guard: every parameter must
+            # reach the loss graph.  Either log_tau or log_eps is unused
+            # depending on routing_mode; add it with zero coefficient so
+            # backward still sees the parameter.
             if self.training:
-                # Keep unused parameter in the backward graph for DDP correctness
-                # (find_unused_parameters=False requires all params to appear in loss).
                 if self.routing_mode != "softmax":
-                    disp_loss = disp_loss + self.log_tau * 0.0
+                    column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
                 else:
-                    disp_loss = disp_loss + self.log_eps * 0.0
+                    column_neg_entropy = column_neg_entropy + self.log_eps * 0.0
         else:
-            disp_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            column_neg_entropy = zero
+            row_entropy = zero
 
-        return self.out_proj(out), disp_loss
+        aux = {
+            "column_neg_entropy": column_neg_entropy,
+            "row_entropy": row_entropy,
+            "row_mass": row_mass,
+            "tv_loss": tv_loss,
+        }
+        return self.out_proj(out), aux

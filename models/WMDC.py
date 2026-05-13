@@ -458,6 +458,53 @@ class WMDC(CompressionModel):
         trunk = self.h_trunk(z_hat)
         return self.h_scale_head(trunk), self.h_mean_head(trunk)
 
+    @staticmethod
+    @torch.no_grad()
+    def _compute_complexity(
+        x: torch.Tensor, target_size: tuple[int, int]
+    ) -> torch.Tensor:
+        """
+        Per-image content-complexity map at z-grid resolution, normalised
+        to [0, 1].  Used as the *target* of the anti-leakage alignment
+        regulariser — detached, no learnable parameters.
+
+        Definition
+        ----------
+            edge(x)  =  ‖∇x‖₂  via 3×3 Sobel on the grey channel
+            c       =  AvgPool_{H/Hz × W/Wz}( edge(x) )
+            c       =  (c − min(c)) / (max(c) − min(c) + ε)
+
+        Why edge-magnitude?  In a learned codec the rate is dominated by
+        the high-frequency / textured regions; these are exactly the
+        positions where the dictionary side-information should help most.
+        The dictionary's per-pixel mass (row_mass) therefore must be
+        positively correlated with this complexity proxy.
+
+        Parameters
+        ----------
+        x           : (B, 3, H, W)
+        target_size : (Hz, Wz)
+
+        Returns
+        -------
+        (B, Hz * Wz) complexity map normalised per-image to [0, 1].
+        """
+        x_gray = x.mean(dim=1, keepdim=True)  # (B, 1, H, W)
+        kx = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 1, 3, 3)
+        ky = kx.transpose(2, 3)
+        gx = F.conv2d(x_gray, kx, padding=1)
+        gy = F.conv2d(x_gray, ky, padding=1)
+        edge = torch.sqrt(gx * gx + gy * gy + 1e-12)  # (B, 1, H, W)
+
+        edge_z = F.adaptive_avg_pool2d(edge, target_size).flatten(1)  # (B, Hz*Wz)
+        mn = edge_z.amin(dim=1, keepdim=True)
+        mx = edge_z.amax(dim=1, keepdim=True)
+        return (edge_z - mn) / (mx - mn + 1e-8)
+
     def _compute_rho_spatial(
         self,
         slice_idx: int,
@@ -511,20 +558,31 @@ class WMDC(CompressionModel):
         straight-through rounding is used for both z and y_slice.
 
         Returns dict with keys:
-            x_hat          : (B, 3, H, W)  reconstructed image
-            likelihoods    : {'y': ..., 'z': ...}
-            aux_loss       : scalar — entropy bottleneck CDF loss
-            dispersion_loss: scalar — negative dictionary-routing entropy (−H, bits),
-                             summed over slices and divided by num_slices.
-                             Sign convention: minimising  dispersion_loss
-                             ⟺ maximising H ⟺ uniform dictionary use.
-            dict_penalty   : scalar ≥ 0 — pairwise off-diagonal cosine
-                             similarity penalty on the dictionary tokens
-                             (encourages diverse/orthogonal tokens).
-                             Returned SEPARATELY from dispersion_loss because
-                             the two have different sign conventions and very
-                             different magnitudes; conflating them breaks the
-                             EMA-based adaptive scaling in RateDistortionLoss.
+            x_hat              : (B, 3, H, W)  reconstructed image
+            likelihoods        : {'y': ..., 'z': ...}
+            aux_loss           : scalar — entropy bottleneck CDF loss
+            column_neg_entropy : scalar −H_col (bits), averaged over slices.
+                                 Minimise → maximise H_col (anti-dead-code).
+            row_entropy        : scalar H_row (bits, ≥ 0), averaged over slices.
+                                 Minimise → sparse per-pixel selection.
+            row_mass           : (B, num_slices, Hz·Wz) per-pixel row marginal,
+                                 grad-bearing.  Identically 1 for non-unbalanced
+                                 modes (alignment loss is then a no-op).
+            complexity         : (B, Hz·Wz) detached content-complexity target
+                                 for the anti-leakage alignment regulariser.
+            dict_penalty       : scalar ≥ 0 — off-diagonal cosine similarity on
+                                 the dictionary tokens (token diversity).
+            tv_loss            : scalar ≥ 0 — spatial-TV regulariser on P,
+                                 averaged over slices (already weight-scaled).
+
+        Loss-side recipe (in RateDistortionLoss)
+        ----------------------------------------
+            L = λ·D + R
+              + β_col · column_neg_entropy        (= −β_col · H_col)
+              + β_row · row_entropy               (= +β_row · H_row)
+              + γ · ReLU( −Pearson(row_mass, complexity) )
+              + δ · dict_penalty
+              + tv_loss
         """
         x = x.float()
         if x.size(2) % 64 != 0 or x.size(3) % 64 != 0:
@@ -549,6 +607,11 @@ class WMDC(CompressionModel):
         dt, dict_penalty = self.hyper_to_dict(z_hat)
         latent_scales, latent_means = self._hyper_decode(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)  # (B, 2M, H, W)
+        Hz, Wz = hyper_prior.shape[-2:]
+
+        # ── Content complexity proxy (for anti-leakage alignment) ─────────────
+        # Detached, no params; computed once at z-grid resolution.
+        complexity = self._compute_complexity(x, (Hz, Wz))  # (B, Hz*Wz)
 
         y_slices = y.chunk(self.num_slices, dim=1)
         y_hat_slices: list[torch.Tensor] = []
@@ -568,22 +631,23 @@ class WMDC(CompressionModel):
                 dtype=hyper_prior.dtype,
             )
 
-        # Routing entropy accumulator: ONLY −H from the per-slice attention.
-        # dict_penalty is tracked separately and returned as its own key,
-        # so RateDistortionLoss can apply an independent (non-EMA) weight to it.
-        total_dispersion = torch.zeros((), device=x.device, dtype=x.dtype)
+        # Per-slice accumulators for the routing-entropy signals.
+        zero = torch.zeros((), device=x.device, dtype=x.dtype)
+        total_col_neg_H = zero
+        total_row_H = zero
+        total_tv = zero
+        row_mass_list: list[torch.Tensor] = []
 
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
 
             if self.routing_mode != "unbalanced_eot":
-                # Add zero contribution to keep rho_predictors in the backward
-                # graph for DDP correctness with find_unused_parameters=False.
-                # rho_out is rho_raw * 0.0 in this branch (see _compute_rho_spatial),
-                # so the numerical contribution is exactly zero.
+                # Keep rho_predictors in the backward graph for DDP correctness
+                # with find_unused_parameters=False.  rho_out is rho_raw * 0.0 in
+                # this branch (see _compute_rho_spatial), so contribution = 0.
                 if self.training:
-                    total_dispersion = total_dispersion + rho_out.sum()
-                rho_spatial = None  # attention routing unchanged
+                    total_col_neg_H = total_col_neg_H + rho_out.sum()
+                rho_spatial = None
             else:
                 rho_spatial = rho_out
 
@@ -600,10 +664,15 @@ class WMDC(CompressionModel):
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, disp_loss = self.eot_attentions[i](
+            dict_info, attn_aux = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=self.training
             )
-            total_dispersion = total_dispersion + disp_loss / self.num_slices
+
+            # Accumulate routing-entropy signals (per-slice averages).
+            total_col_neg_H = total_col_neg_H + attn_aux["column_neg_entropy"]
+            total_row_H = total_row_H + attn_aux["row_entropy"]
+            total_tv = total_tv + attn_aux["tv_loss"]
+            row_mass_list.append(attn_aux["row_mass"])  # (B, Hz*Wz)
 
             # Collect eval-mode attention maps
             if not self.training and self.eot_attentions[i].attn_probs is not None:
@@ -645,6 +714,13 @@ class WMDC(CompressionModel):
         # ── Decode ────────────────────────────────────────────────────────────
         x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
 
+        # ── Slice-averaged entropy signals + stacked row_mass ────────────────
+        S = float(self.num_slices)
+        column_neg_entropy = total_col_neg_H / S
+        row_entropy = total_row_H / S
+        tv_loss = total_tv / S
+        row_mass = torch.stack(row_mass_list, dim=1)  # (B, S, Hz*Wz)
+
         return {
             "x_hat": x_hat,
             "likelihoods": {
@@ -652,8 +728,12 @@ class WMDC(CompressionModel):
                 "z": z_likelihoods,
             },
             "aux_loss": self.aux_loss(),
-            "dispersion_loss": total_dispersion,  # only −H from routing
-            "dict_penalty": dict_penalty,  # ≥ 0, separate signal
+            "column_neg_entropy": column_neg_entropy,
+            "row_entropy": row_entropy,
+            "row_mass": row_mass,
+            "complexity": complexity,
+            "dict_penalty": dict_penalty,
+            "tv_loss": tv_loss,
         }
 
     # =========================================================================
@@ -727,7 +807,7 @@ class WMDC(CompressionModel):
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attentions[i](
+            dict_info, _aux = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
             )
 
@@ -821,7 +901,7 @@ class WMDC(CompressionModel):
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _ = self.eot_attentions[i](
+            dict_info, _aux = self.eot_attentions[i](
                 query, k_dict, v_dict, rho_spatial, calc_disp=False
             )
 
