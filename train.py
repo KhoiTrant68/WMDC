@@ -511,18 +511,18 @@ def test_epoch(
     model.eval()
     criterion.eval()
 
-    psnr_meter = AverageMeter()           # forward (estimated) PSNR
-    bpp_meter = AverageMeter()            # estimated BPP from likelihoods
+    psnr_meter = AverageMeter()  # forward (estimated) PSNR
+    bpp_meter = AverageMeter()  # estimated BPP from likelihoods
     loss_meter = AverageMeter()
-    col_H_meter = AverageMeter()          # H_col
-    row_H_meter = AverageMeter()          # H_row
-    align_meter = AverageMeter()          # alignment hinge
+    col_H_meter = AverageMeter()  # H_col
+    row_H_meter = AverageMeter()  # H_row
+    align_meter = AverageMeter()  # alignment hinge
     dict_pen_meter = AverageMeter()
 
     # Real-bytes meters (rank-0 only, since compress is sequential per image)
     real_psnr_meter = AverageMeter()
     real_bpp_meter = AverageMeter()
-    bpp_gap_meter = AverageMeter()        # real_bpp − est_bpp (sign of mis-cal)
+    bpp_gap_meter = AverageMeter()  # real_bpp − est_bpp (sign of mis-cal)
 
     gap_psnr: float = float("nan")
 
@@ -566,9 +566,7 @@ def test_epoch(
                         -out_criterion["column_neg_entropy"].item(), d.size(0)
                     )
                 if "row_entropy" in out_criterion:
-                    row_H_meter.update(
-                        out_criterion["row_entropy"].item(), d.size(0)
-                    )
+                    row_H_meter.update(out_criterion["row_entropy"].item(), d.size(0))
                 if "alignment_loss" in out_criterion:
                     align_meter.update(
                         out_criterion["alignment_loss"].item(), d.size(0)
@@ -597,13 +595,11 @@ def test_epoch(
                 if real_done < real_bytes_batches:
                     unwrapped = accelerator.unwrap_model(model)
                     out_enc = unwrapped.compress(d)
-                    out_dec = unwrapped.decompress(
-                        out_enc["strings"], out_enc["shape"]
-                    )
+                    out_dec = unwrapped.decompress(out_enc["strings"], out_enc["shape"])
                     x_hat_real = out_dec["x_hat"].clamp(0, 1)
-                    mse_real = F.mse_loss(
-                        x_hat_real, d, reduction="none"
-                    ).mean(dim=(1, 2, 3))
+                    mse_real = F.mse_loss(x_hat_real, d, reduction="none").mean(
+                        dim=(1, 2, 3)
+                    )
                     psnr_real = torch.where(
                         mse_real > 0,
                         -10.0 * mse_real.log10(),
@@ -612,8 +608,8 @@ def test_epoch(
 
                     num_pixels_per_image = d.size(2) * d.size(3)
                     total_bytes = _bytes_from_strings(out_enc["strings"])
-                    real_bpp_batch = total_bytes * 8.0 / (
-                        d.size(0) * num_pixels_per_image
+                    real_bpp_batch = (
+                        total_bytes * 8.0 / (d.size(0) * num_pixels_per_image)
                     )
 
                     real_metrics = torch.stack(
@@ -682,7 +678,9 @@ def test_epoch(
             if real_psnr_meter.count > 0:
                 writer.add_scalar("Val/PSNR_real", real_psnr_meter.avg, epoch)
                 writer.add_scalar("Val/Bpp_real", real_bpp_meter.avg, epoch)
-                writer.add_scalar("Val/Bpp_gap_real_minus_est", bpp_gap_meter.avg, epoch)
+                writer.add_scalar(
+                    "Val/Bpp_gap_real_minus_est", bpp_gap_meter.avg, epoch
+                )
             if not math.isnan(gap_psnr):
                 writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
 
