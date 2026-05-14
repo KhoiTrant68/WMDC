@@ -53,6 +53,8 @@ def load_model(
     backbone: str = "fdm",
     use_dense_concat: bool = False,
     memory_init: str = "bootstrap",
+    use_content_adaptive: bool = False,
+    cluster_num: int = 8,
     update_for_inference: bool = True,
     strict_load: bool = True,
 ) -> WMDC:
@@ -77,6 +79,8 @@ def load_model(
         backbone=backbone,
         use_dense_concat=use_dense_concat,
         memory_init=memory_init,
+        use_content_adaptive=use_content_adaptive,
+        cluster_num=cluster_num,
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)

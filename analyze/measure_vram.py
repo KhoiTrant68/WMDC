@@ -37,13 +37,25 @@ import torch.nn.functional as F
 from _common import load_model
 
 
-def _build_model(variant: str, device: str, checkpoint: str | None):
+def _build_model(
+    variant: str,
+    device: str,
+    checkpoint: str | None,
+    use_content_adaptive: bool = False,
+    cluster_num: int = 8,
+):
     """
     Build a model in the given variant. Variant ∈ {"stateful", "dense"}.
     """
     from models.WMDC import WMDC
 
-    kwargs: dict[str, Any] = dict(N=192, M=320, num_slices=5)
+    kwargs: dict[str, Any] = dict(
+        N=192,
+        M=320,
+        num_slices=5,
+        use_content_adaptive=use_content_adaptive,
+        cluster_num=cluster_num,
+    )
 
     if variant == "dense":
         # Try the canonical flag names; if none is accepted we fall back
@@ -97,6 +109,8 @@ def measure_one(
     device: str,
     mode: str,
     checkpoint: str | None,
+    use_content_adaptive: bool = False,
+    cluster_num: int = 8,
 ) -> dict:
     print(f"\n=== variant={variant}  resolution={H}x{W}  mode={mode} ===")
     # Reset CUDA state for clean measurement.
@@ -105,7 +119,13 @@ def measure_one(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    model = _build_model(variant, device, checkpoint)
+    model = _build_model(
+        variant,
+        device,
+        checkpoint,
+        use_content_adaptive=use_content_adaptive,
+        cluster_num=cluster_num,
+    )
     model.train() if mode == "train" else model.eval()
 
     x = torch.randn(1, 3, H, W, device=device, requires_grad=False)
@@ -174,6 +194,20 @@ def main():
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--output", type=str, default="vram_results.json")
     p.add_argument("--cuda", action="store_true")
+    p.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    p.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -196,6 +230,8 @@ def main():
                     device=device,
                     mode=args.mode,
                     checkpoint=args.checkpoint,
+                    use_content_adaptive=args.use_content_adaptive,
+                    cluster_num=args.cluster_num,
                 )
             except torch.cuda.OutOfMemoryError as e:
                 row = {

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from modules.content_adaptive_blocks import ContentAdaptiveVSSBlock
 from modules.VSS_module import VSSBlock
 
 # ==============================================================================
@@ -440,18 +441,32 @@ class FrequencyDisentangledMamba(nn.Module):
     6. IDWT(fused) → output in pixel space.
     """
 
-    def __init__(self, dim: int, drop_path: float = 0.1):
+    def __init__(
+        self,
+        dim: int,
+        drop_path: float = 0.1,
+        use_content_adaptive: bool = False,
+        cluster_num: int = 8,
+    ):
         super().__init__()
         self.dwt = DWT_2D(wave="bior4.4")
         self.idwt = IDWT_2D(wave="bior4.4")
         self.dim = dim
 
+        # Choose VSSBlock class based on content_adaptive flag
+        if use_content_adaptive:
+            mamba_cls = lambda: ContentAdaptiveVSSBlock(
+                hidden_dim=dim, drop_path=drop_path, cluster_num=cluster_num
+            )
+        else:
+            mamba_cls = lambda: VSSBlock(hidden_dim=dim, drop_path=drop_path)
+
         # ── LL branch (main low-frequency path) ───────────────────────────────
-        self.ll_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
+        self.ll_mamba = mamba_cls()
 
         # ── Context branch (sees all subbands) ────────────────────────────────
         self.pre_context_proj = nn.Conv2d(dim * 4, dim, kernel_size=1)
-        self.context_mamba = VSSBlock(hidden_dim=dim, drop_path=drop_path)
+        self.context_mamba = mamba_cls()
 
         # ── Affine FiLM predictors (one per subband) ──────────────────────────
         # Each predictor outputs 2*out_dim values: first out_dim are log-scale

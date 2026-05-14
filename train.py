@@ -805,6 +805,20 @@ def parse_args():
         dest="memory_init",
         help="How to initialise M_1: 'bootstrap' (learned Conv projection) or 'zero'.",
     )
+    p.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    p.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
     p.add_argument("--sinkhorn-iters", type=int, default=20)
     p.add_argument("--lr-milestones", type=int, nargs="+", default=[360, 380])
     p.add_argument("--lr-gamma", type=float, default=0.1)
@@ -927,6 +941,8 @@ def main():
         backbone=args.backbone,
         use_dense_concat=args.use_dense_concat,
         memory_init=args.memory_init,
+        use_content_adaptive=args.use_content_adaptive,
+        cluster_num=args.cluster_num,
     )
 
     optimizer, aux_optimizer = configure_optimizers(model, args)

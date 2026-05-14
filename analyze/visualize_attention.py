@@ -50,6 +50,20 @@ def main():
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
 
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    parser.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
 
     args = parser.parse_args()
 

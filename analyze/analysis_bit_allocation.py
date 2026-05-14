@@ -34,6 +34,20 @@ def main():
     parser.add_argument("-o", "--output", type=str, default="bit_allocation_plot.pdf")
     parser.add_argument("--ot-eps", type=float, default=0.1)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
+    parser.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    parser.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -45,6 +59,8 @@ def main():
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        use_content_adaptive=args.use_content_adaptive,
+        cluster_num=args.cluster_num,
     ).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint.get("state_dict", checkpoint))

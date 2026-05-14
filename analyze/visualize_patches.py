@@ -50,6 +50,20 @@ def parse_args():
         help="Use actual entropy-coded BPP (slower). Recommended for paper figures.",
     )
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    parser.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
     return parser.parse_args()
 
 
@@ -63,6 +77,8 @@ def main():
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        use_content_adaptive=args.use_content_adaptive,
+        cluster_num=args.cluster_num,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("state_dict", ckpt))
