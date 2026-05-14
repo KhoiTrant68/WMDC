@@ -26,7 +26,7 @@ LAMBDAS_ABLATION=(0.0018 0.0036)                    # 3-point ablation
 
 # ── Model defaults ───────────────────────────────────────────────────
 ROUTING_MODE="unbalanced_eot"
-ROUTING_MODES=(softmax balanced_eot unbalanced_eot)
+ROUTING_MODES=(unbalanced_eot balanced_eot softmax)
 
 # ── Ablation variants ────────────────────────────────────────────────
 VARIANTS=(full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_dict_penalty)

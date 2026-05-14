@@ -27,7 +27,7 @@ MODES_TO_RUN=("${ROUTING_MODES[@]}")
 for arg in "$@"; do
     case "$arg" in
         --resume) RESUME=1 ;;
-        softmax|balanced_eot|unbalanced_eot) MODES_TO_RUN=("$arg") ;;
+        unbalanced_eot|balanced_eot|softmax) MODES_TO_RUN=("$arg") ;;
         *) echo "Unknown arg: $arg" >&2; exit 1 ;;
     esac
 done
