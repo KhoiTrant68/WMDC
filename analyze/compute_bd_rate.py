@@ -83,6 +83,8 @@ def cmd_evaluate(args):
             backbone=args.backbone,
             use_dense_concat=args.use_dense_concat,
             memory_init=args.memory_init,
+            use_content_adaptive=args.use_content_adaptive,
+            cluster_num=args.cluster_num,
             update_for_inference=True,
             strict_load=False,
         )
@@ -243,6 +245,13 @@ def main():
     )
     p_eval.add_argument("--dump-per-image", action="store_true")
     p_eval.add_argument("--cuda", action="store_true")
+    p_eval.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        dest="use_content_adaptive",
+        help="Match checkpoint trained with ContentAdaptiveVSSBlock.",
+    )
+    p_eval.add_argument("--cluster-num", type=int, default=8, dest="cluster_num")
     p_eval.set_defaults(func=cmd_evaluate)
 
     # bd-rate

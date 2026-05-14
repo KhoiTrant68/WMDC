@@ -30,6 +30,12 @@ ROUTING_MODES=(unbalanced_eot balanced_eot softmax)
 CONTENT_ADAPTIVE=1 # set to 0 to disable ContentAdaptiveVSSBlock
 CLUSTER_NUM=8
 
+# Derived CLI flags for eval/visualize scripts. Empty if content-adaptive
+# is disabled. Must match the value used during training so that
+# load_state_dict sees the same parameter shapes / buffer keys.
+CA_FLAGS=""
+[ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && CA_FLAGS="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+
 # ── Ablation variants ────────────────────────────────────────────────
 VARIANTS=(full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_dict_penalty)
 

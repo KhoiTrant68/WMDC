@@ -36,24 +36,28 @@ run_attention() {
         [ -f "$ck" ] || { echo "[skip] missing $ck"; continue; }
         echo "-- $mode"
 
+        # shellcheck disable=SC2086  # word-split intentional for $CA_FLAGS
         $PYTHON analyze/visualize_attention.py \
             --img_dir "$KODAK_DIR" --checkpoint "$ck" --routing-mode "$mode" \
-            --mode top_tokens --slice 4 --top_k 4 --cuda \
+            --mode top_tokens --slice 4 --top_k 4 --cuda $CA_FLAGS \
             --output "$VIZ_DIR/attention_top_tokens_${mode}.pdf"
 
+        # shellcheck disable=SC2086
         $PYTHON analyze/visualize_attention.py \
             --img_dir "$KODAK_DIR" --checkpoint "$ck" --routing-mode "$mode" \
-            --mode slice_evolution --target_token 42 --cuda \
+            --mode slice_evolution --target_token 42 --cuda $CA_FLAGS \
             --output "$VIZ_DIR/attention_slice_evolution_${mode}.pdf"
 
+        # shellcheck disable=SC2086
         $PYTHON analyze/visualize_attention.py \
             --img_dir "$KODAK_DIR" --checkpoint "$ck" --routing-mode "$mode" \
-            --mode spatial_gating --cuda \
+            --mode spatial_gating --cuda $CA_FLAGS \
             --output "$VIZ_DIR/attention_spatial_gating_${mode}.pdf"
 
+        # shellcheck disable=SC2086
         $PYTHON analyze/visualize_attention.py \
             --img_dir "$KODAK_DIR" --checkpoint "$ck" --routing-mode "$mode" \
-            --mode entropy_map --cuda \
+            --mode entropy_map --cuda $CA_FLAGS \
             --output "$VIZ_DIR/attention_entropy_map_${mode}.pdf"
     done
     echo "[done] attention maps → $VIZ_DIR"
@@ -71,9 +75,10 @@ run_patches() {
         [ -f "$ck" ] || { echo "[skip] missing $ck"; continue; }
         echo "-- $mode"
 
+        # shellcheck disable=SC2086
         $PYTHON analyze/visualize_patches.py \
             -i "$REF_IMG" -c "$ck" \
-            --routing-mode "$mode" --cuda \
+            --routing-mode "$mode" --cuda $CA_FLAGS \
             -o "$VIZ_DIR/patches_${mode}.pdf"
     done
     echo "[done] patches → $VIZ_DIR"
@@ -91,9 +96,10 @@ run_latents() {
         [ -f "$ck" ] || { echo "[skip] missing $ck"; continue; }
         echo "-- $mode"
 
+        # shellcheck disable=SC2086
         $PYTHON analyze/visualize_latents.py \
             --image "$REF_IMG" --checkpoint "$ck" \
-            --routing-mode "$mode" --cuda \
+            --routing-mode "$mode" --cuda $CA_FLAGS \
             --output "$VIZ_DIR/latents_${mode}.pdf"
     done
     echo "[done] latents → $VIZ_DIR"
@@ -109,13 +115,14 @@ run_sinkhorn() {
     local ck; ck="$(ckpt_routing "unbalanced_eot")"
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
+    # shellcheck disable=SC2086
     $PYTHON analyze/ablation_sinkhorn_convergence.py \
         --checkpoint "$ck" \
         --image "$CONV_IMG" \
         --routing-mode unbalanced_eot \
         --max-iters 30 \
         --eps-sweep 0.05 0.1 0.2 0.5 \
-        --cuda \
+        --cuda $CA_FLAGS \
         -o "$VIZ_DIR/sinkhorn_convergence.pdf" \
         --json-out "$VIZ_DIR/sinkhorn_convergence.json"
 
@@ -140,12 +147,13 @@ run_dict_util() {
         return
     fi
 
+    # shellcheck disable=SC2086
     $PYTHON analyze/ablation_dictionary_utils.py \
         --checkpoint-with-disp "$ck_with" \
         --checkpoint-no-disp   "$ck_no" \
         --dataset "$KODAK_DIR" \
         --routing-mode unbalanced_eot \
-        --cuda \
+        --cuda $CA_FLAGS \
         -o "$VIZ_DIR/dictionary_utilization.pdf" \
         --json-out "$VIZ_DIR/dictionary_utilization.json"
 
@@ -162,10 +170,11 @@ run_rho() {
     local ck; ck="$(ckpt_routing "unbalanced_eot")"
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
+    # shellcheck disable=SC2086
     $PYTHON analyze/visualize_rho_heatmap.py \
         --image-dir "$KODAK_DIR" \
         --checkpoint "$ck" \
-        --routing-mode unbalanced_eot --cuda \
+        --routing-mode unbalanced_eot --cuda $CA_FLAGS \
         --output "$VIZ_DIR/rho_heatmap.pdf"
 
     echo "[done] rho heatmap → $VIZ_DIR/rho_heatmap.pdf"
@@ -181,10 +190,11 @@ run_failures() {
     local ck; ck="$(ckpt_routing "unbalanced_eot")"
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
+    # shellcheck disable=SC2086
     $PYTHON analyze/visualize_failure_cases.py \
         --dataset "$KODAK_DIR" \
         --checkpoint "$ck" \
-        --routing-mode unbalanced_eot --cuda \
+        --routing-mode unbalanced_eot --cuda $CA_FLAGS \
         --output "$VIZ_DIR/failure_cases.pdf"
 
     echo "[done] failure cases → $VIZ_DIR/failure_cases.pdf"
@@ -200,12 +210,13 @@ run_audit() {
     local ck; ck="$(ckpt_routing "unbalanced_eot")"
     [ -f "$ck" ] || { echo "[skip] missing $ck"; return; }
 
+    # shellcheck disable=SC2086
     $PYTHON analyze/audit_rate_vs_gating.py \
         --checkpoint "$ck" \
         --dataset "$KODAK_DIR" \
         --routing-mode unbalanced_eot \
         --output-dir "$VIZ_DIR/audit_gating" \
-        --cuda
+        --cuda $CA_FLAGS
 
     echo "[done] audit → $VIZ_DIR/audit_gating/"
 }

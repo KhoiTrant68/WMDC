@@ -33,11 +33,13 @@ eval_routing() {
         echo "-- routing-mode=$mode"
         mkdir -p "$out"
 
+        # shellcheck disable=SC2086  # word-split intentional for $CA_FLAGS
         $PYTHON eval.py \
             --dataset "$KODAK_DIR" \
             --checkpoint "$ckpt" \
             --output "$out" \
             --routing-mode "$mode" \
+            $CA_FLAGS \
             --cuda \
             --measure-dict-util
 
@@ -73,6 +75,7 @@ eval_ablation() {
                 --output "$out" \
                 --routing-mode unbalanced_eot \
                 $eval_flags \
+                $CA_FLAGS \
                 --cuda \
                 --measure-dict-util
 
