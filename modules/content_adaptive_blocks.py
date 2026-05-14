@@ -96,11 +96,11 @@ class TokenClustering(nn.Module):
 
         # Initialize on first forward
         if not self.initted:
-            x_flat = x.view(-1, D)
+            x_flat = x.reshape(-1, D)
             self._bootstrap_from_batch(x_flat)
 
         # Hard assignment: argmin distance to nearest centroid
-        x_flat = x.view(B * HW, D)
+        x_flat = x.reshape(B * HW, D)
         dists = torch.cdist(x_flat, self.means)  # (B*HW, N)
         assign_flat = dists.argmin(dim=1)  # (B*HW,)
 
