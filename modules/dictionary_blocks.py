@@ -110,10 +110,21 @@ class UnifiedDictionaryAttention(nn.Module):
             raise ValueError(f"marginal_div must be one of {valid_div}")
         self.marginal_div = marginal_div
 
+        # log_tau (softmax temperature) — always present; serves as a fallback
+        # in NaN cases for the OT branches.
         self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
-        self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
 
-        self.log_rho_col = nn.Parameter(torch.tensor(0.0))
+        # OT-specific parameters: only register when actually used so that
+        # DDP can run with find_unused_parameters=False.
+        if routing_mode in ("balanced_eot", "unbalanced_eot"):
+            self.log_eps = nn.Parameter(torch.tensor(math.log(ot_eps)))
+        else:
+            self.register_parameter("log_eps", None)
+
+        if routing_mode == "unbalanced_eot":
+            self.log_rho_col = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.register_parameter("log_rho_col", None)
 
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
         self.out_proj = nn.Sequential(
@@ -221,9 +232,9 @@ class UnifiedDictionaryAttention(nn.Module):
                 f"[BalancedEOT] NaN detected (eps={eps.item():.4f}, "
                 f"count={self.sinkhorn_divergence_count}). Falling back to softmax."
             )
-            fallback_P = self._route_softmax(C_mat)
-            if self.training:
-                fallback_P = fallback_P + self.log_eps * 0.0
+            # Fallback keeps log_eps in graph so DDP find_unused_parameters=False
+            # remains happy when OT branch silently degrades.
+            fallback_P = self._route_softmax(C_mat) + self.log_eps * 0.0
             return fallback_P / HW
 
         return torch.exp(log_P.clamp(min=-60.0))
@@ -310,9 +321,14 @@ class UnifiedDictionaryAttention(nn.Module):
                 f"(eps={eps.item():.4f}, rho_col={rho_col.item():.4f}, "
                 f"count={self.sinkhorn_divergence_count}). Falling back to softmax."
             )
-            fallback_P = self._route_softmax(C_mat)
-            if self.training:
-                fallback_P = fallback_P + (rho_flat * 0.0).sum() + self.log_eps * 0.0
+            # Fallback keeps OT-specific params in the autograd graph so DDP
+            # with find_unused_parameters=False does not error.
+            fallback_P = (
+                self._route_softmax(C_mat)
+                + (rho_flat * 0.0).sum()
+                + self.log_eps * 0.0
+                + self.log_rho_col * 0.0
+            )
             return fallback_P / HW
 
         return torch.exp(log_P.clamp(min=-60.0))
@@ -409,15 +425,13 @@ class UnifiedDictionaryAttention(nn.Module):
         if calc_disp:
             column_neg_entropy = self._dispersion_loss(P)
             row_entropy = self._row_entropy(P)
-            if self.training:
-                if self.routing_mode == "unbalanced_eot":
-                    column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
-                elif self.routing_mode == "balanced_eot":
-                    column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
-                    column_neg_entropy = column_neg_entropy + self.log_rho_col * 0.0
-                else:  # softmax
-                    column_neg_entropy = column_neg_entropy + self.log_eps * 0.0
-                    column_neg_entropy = column_neg_entropy + self.log_rho_col * 0.0
+            # In the OT branches, log_tau is unused unless we hit a NaN fallback;
+            # keep it in the graph for DDP find_unused_parameters=False.
+            if self.training and self.routing_mode in (
+                "balanced_eot",
+                "unbalanced_eot",
+            ):
+                column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
         else:
             column_neg_entropy = zero
             row_entropy = zero

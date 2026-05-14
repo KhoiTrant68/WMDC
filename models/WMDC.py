@@ -209,6 +209,12 @@ class WMDC(CompressionModel):
         cluster_num: int = 8,
     ):
         super().__init__()
+        if M % num_slices != 0:
+            raise ValueError(f"M ({M}) must be divisible by num_slices ({num_slices}).")
+        if routing_mode not in ("softmax", "balanced_eot", "unbalanced_eot"):
+            raise ValueError(f"Unknown routing_mode: {routing_mode!r}")
+        if memory_init not in ("bootstrap", "zero"):
+            raise ValueError(f"Unknown memory_init: {memory_init!r}")
         self.N = N
         self.M = M
         self.num_slices = num_slices
@@ -320,22 +326,27 @@ class WMDC(CompressionModel):
         )
 
         # ── Spatially-adaptive KL mass predictors ────────
-
-        self.rho_predictors = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv2d(2 * M + i * self.slice_ch, 32, 1),
-                    nn.GELU(),
-                    nn.Conv2d(32, 1, 1),
-                )
-                for i in range(num_slices)
-            ]
-        )
-        # Zero-init output layer: rho starts at softplus(0) + bias = constant.
-        # The 0.5 bias gives a reasonable initial ρ at the start of training.
-        for predictor in self.rho_predictors:
-            nn.init.zeros_(predictor[-1].weight)
-            nn.init.constant_(predictor[-1].bias, 0.5)
+        # Only created when actually used (unbalanced_eot).  Other routing
+        # modes leave `rho_predictors` as None so DDP can run with
+        # find_unused_parameters=False.
+        if routing_mode == "unbalanced_eot":
+            self.rho_predictors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv2d(2 * M + i * self.slice_ch, 32, 1),
+                        nn.GELU(),
+                        nn.Conv2d(32, 1, 1),
+                    )
+                    for i in range(num_slices)
+                ]
+            )
+            # Zero-init output layer: rho starts at softplus(0) + bias = constant.
+            # The 0.5 bias gives a reasonable initial ρ at the start of training.
+            for predictor in self.rho_predictors:
+                nn.init.zeros_(predictor[-1].weight)
+                nn.init.constant_(predictor[-1].bias, 0.5)
+        else:
+            self.rho_predictors = None
 
         # ── Bootstrap memory state ─────────────────────────────────────────────
         # Only created when stateful mode is used and bootstrap init is selected.
@@ -480,14 +491,14 @@ class WMDC(CompressionModel):
         """
         Rebuild entropy coder CDFs.
 
-        Scale table upper limit is set to 1024 (instead of the compressai
-        default of 256) to support very low-bitrate compression where large
-        Gaussian scales can appear.
+        Scale table covers [0.11, 256] in 64 log-spaced bins.  The forward,
+        compress, and decompress paths all clamp scale to the same range, so
+        every emitted Gaussian falls inside a table bin — preventing index
+        saturation that previously inflated bpp at low λ.
         """
         if scale_table is None:
-            # Expand scale table upper limit to 1024 to support low-bitrate compression
             scale_table = torch.exp(
-                torch.linspace(math.log(0.11), math.log(1024), 64, dtype=torch.float32)
+                torch.linspace(math.log(0.11), math.log(256.0), 64, dtype=torch.float32)
             )
         updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
         updated |= super().update(force=force)
@@ -561,38 +572,30 @@ class WMDC(CompressionModel):
         slice_idx: int,
         hyper_prior: torch.Tensor,
         decoded_slices: list,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """
         Per-slice spatially-varying KL mass strength ρ(x).
 
-        The predictor for slice i is conditioned on:
+        In non-unbalanced routing modes the predictor module is not created at
+        all (`self.rho_predictors is None`) and this function returns None.
+        Callers pass None to UnifiedDictionaryAttention which then skips the
+        unbalanced branch entirely.
+
+        For unbalanced_eot, the predictor for slice i is conditioned on:
           - hyper_prior  : (B, 2*M, H, W)  — global image summary
           - decoded_slices[0:i] — growing context from previous slices
 
-        This allows the routing budget to adapt as the image is progressively
-        described by the autoregressive slice loop.
-
-        Returns
-        -------
-        rho_raw * 0  : in non-unbalanced modes — zero-valued tensor with live
-                       grad_fn, so rho_predictors stay in the DDP backward graph.
-                       Callers pass None to UnifiedDictionaryAttention instead.
-        rho          : (B, H, W) strictly positive — in unbalanced_eot mode
+        Returns (B, H, W) strictly positive ρ.
         """
+        if self.rho_predictors is None:
+            return None
+
         context = (
             hyper_prior
             if slice_idx == 0
             else torch.cat([hyper_prior] + decoded_slices, dim=1)
         )
-
-        # Always execute rho_predictors
         rho_raw = self.rho_predictors[slice_idx](context)  # (B, 1, H, W)
-
-        if self.routing_mode != "unbalanced_eot":
-            # Return a zero-valued tensor in the backward graph.
-            # The caller multiplies this into total_dispersion to satisfy DDP.
-            return rho_raw * 0.0
-
         rho = F.softplus(rho_raw).clamp(min=0.05) + 1e-4
         return rho.squeeze(1)  # (B, H, W)
 
@@ -646,11 +649,17 @@ class WMDC(CompressionModel):
         y = self.g_a(x)
         z = self.h_a(y)
 
-        # Entropy bottleneck: additive noise relaxation or STE
+        # Entropy bottleneck: additive noise relaxation or STE.
+        # In STE mode the forward value is rounded AROUND THE MEDIANS so that
+        # train forward and compress/decompress see the same quantisation grid.
+        # (The previous version rounded around zero — a 1.5 dB train/infer
+        # gap source on its own when medians drifted away from 0.)
         z_hat_soft, z_likelihoods = self.entropy_bottleneck(z)
         if self.training and self.use_ste:
-            # STE: forward is hard rounding, backward is identity
-            z_hat = torch.round(z) - z.detach() + z
+            medians = self.entropy_bottleneck._get_medians()  # (C, 1, 1)
+            medians = medians.reshape(1, -1, 1, 1)  # broadcast over (B,H,W)
+            z_round = torch.round(z - medians) + medians
+            z_hat = z_round.detach() - z.detach() + z  # STE
         else:
             z_hat = z_hat_soft
 
@@ -690,17 +699,9 @@ class WMDC(CompressionModel):
         row_mass_list: list[torch.Tensor] = []
 
         for i, y_slice in enumerate(y_slices):
-            rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
-
-            if self.routing_mode != "unbalanced_eot":
-                # Keep rho_predictors in the backward graph for DDP correctness
-                # with find_unused_parameters=False.  rho_out is rho_raw * 0.0 in
-                # this branch (see _compute_rho_spatial), so contribution = 0.
-                if self.training:
-                    total_col_neg_H = total_col_neg_H + rho_out.sum()
-                rho_spatial = None
-            else:
-                rho_spatial = rho_out
+            # rho_spatial is None for softmax/balanced modes (rho_predictors
+            # does not exist); UnifiedDictionaryAttention handles None.
+            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
 
             k_dict = self.k_projs[i](dt)  # (B, N, dict_dim)
             v_dict = self.v_projs[i](dt)  # (B, N, dict_dim)
@@ -733,17 +734,37 @@ class WMDC(CompressionModel):
             # ── Gaussian conditional ─────────────────────────────────────────
             support = torch.cat([query, dict_info], dim=1)  # (B, 3M+S, H, W)
             mu = self.cc_mean_transforms[i](support)  # (B, S, H, W)
-            scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
+            # Clamp scale to BOTH ends of the entropy-coder scale_table so the
+            # estimated rate matches the bytes the coder will actually emit
+            # (saturating to the largest table index used to silently inflate
+            # bpp at low-rate λ).
+            scale = self.cc_scale_transforms[i](support).clamp(min=0.11, max=256.0)
 
-            y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
-                y_slice, scale, means=mu
-            )
+            if self.training and self.use_ste:
+                # STE-y: forward is hard-rounded, gradient flows through y_slice.
+                # Likelihood is computed on the hard-rounded value (= what the
+                # arithmetic coder will see), closing the rate side of the
+                # train/infer gap.
+                y_hat_hard = torch.round(y_slice - mu) + mu
+                y_slice_likelihood = self.gaussian_conditional._likelihood(
+                    y_hat_hard, scale, means=mu
+                )
+                if self.gaussian_conditional.use_likelihood_bound:
+                    y_slice_likelihood = (
+                        self.gaussian_conditional.likelihood_lower_bound(
+                            y_slice_likelihood
+                        )
+                    )
+                y_hat_slice = y_hat_hard.detach() - y_slice.detach() + y_slice
+            else:
+                y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
+                    y_slice, scale, means=mu
+                )
 
             # ── LRP with STE proxy ───────────────────────────────────────────
-            # During training we feed a hard-rounded proxy to the LRP network
-            # so LRP learns to correct quantisation error rather than noise.
-            # The STE trick (detach + add) keeps gradients flowing through the
-            # soft y_hat_slice path for the entropy model.
+            # The LRP network expects the hard-rounded value (what the codec
+            # produces) — keep this regardless of self.use_ste so the LRP
+            # supervision target is consistent across training regimes.
             if self.training:
                 y_hat_hard = torch.round(y_slice - mu) + mu
                 y_hat_for_lrp = y_hat_hard.detach() - y_hat_slice.detach() + y_hat_slice
@@ -765,7 +786,11 @@ class WMDC(CompressionModel):
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         # ── Decode ────────────────────────────────────────────────────────────
-        x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
+        # Clamp to [0, 1] in BOTH training and eval so distortion is measured
+        # consistently with eval.py / compress→decompress.  Gradient flows
+        # through clamp on the non-saturated interior (vanishes outside [0,1],
+        # which is the intended behaviour for an RGB codec).
+        x_hat = self.g_s(torch.cat(y_hat_slices, dim=1)).clamp(0.0, 1.0)
 
         # ── Slice-averaged entropy signals + stacked row_mass ────────────────
         S = float(self.num_slices)
@@ -846,8 +871,7 @@ class WMDC(CompressionModel):
             )
 
         for i, y_slice in enumerate(y_slices):
-            rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
-            rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
+            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
 
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
@@ -870,7 +894,7 @@ class WMDC(CompressionModel):
 
             support = torch.cat([query, dict_info], dim=1)
             mu = self.cc_mean_transforms[i](support)
-            scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
+            scale = self.cc_scale_transforms[i](support).clamp(min=0.11, max=256.0)
 
             # Arithmetic encode
             index = self.gaussian_conditional.build_indexes(scale)
@@ -940,8 +964,7 @@ class WMDC(CompressionModel):
             )
 
         for i in range(self.num_slices):
-            rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
-            rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
+            rho_spatial = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
 
             k_dict = self.k_projs[i](dt)
             v_dict = self.v_projs[i](dt)
@@ -964,7 +987,7 @@ class WMDC(CompressionModel):
 
             support = torch.cat([query, dict_info], dim=1)
             mu = self.cc_mean_transforms[i](support)
-            scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
+            scale = self.cc_scale_transforms[i](support).clamp(min=0.11, max=256.0)
 
             index = self.gaussian_conditional.build_indexes(scale)
             y_hat_slice = self.gaussian_conditional.decompress(

@@ -873,12 +873,10 @@ def main():
         raise ValueError(
             f"--patch-size must be a multiple of 64, got {args.patch_size}."
         )
-    find_unused = (
-        args.column_entropy_weight == 0.0
-        or args.row_entropy_weight == 0.0
-        or args.alignment_weight == 0.0
-    )
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
+    # After the routing-mode-aware parameter cleanup, ALL registered params
+    # are reached by the forward graph regardless of regulariser weights, so
+    # find_unused_parameters=False is correct (and ~10-15% faster on DDP).
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
 
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
@@ -986,7 +984,18 @@ def main():
     # ── Resume ────────────────────────────────────────────────────────────────
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        accelerator.unwrap_model(model).load_state_dict(ckpt["state_dict"])
+        # strict=False: routing-mode-aware parameter cleanup means a checkpoint
+        # trained as 'unbalanced_eot' has log_rho_col / rho_predictors keys that
+        # are unexpected for a 'softmax' resume (and vice versa).  Surface the
+        # delta as a warning instead of aborting.
+        missing, unexpected = accelerator.unwrap_model(model).load_state_dict(
+            ckpt["state_dict"], strict=False
+        )
+        if accelerator.is_main_process and (missing or unexpected):
+            print(
+                f"[resume] missing={len(missing)} unexpected={len(unexpected)} "
+                f"(routing-mode change between checkpoint and current args?)"
+            )
         optimizer.load_state_dict(ckpt["optimizer"])
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])

@@ -56,7 +56,7 @@ def load_model(
     use_content_adaptive: bool = False,
     cluster_num: int = 8,
     update_for_inference: bool = True,
-    strict_load: bool = True,
+    strict_load: bool = False,
 ) -> WMDC:
     """
     Build a WMDC, load a checkpoint, and put it in eval mode.

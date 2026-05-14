@@ -271,7 +271,14 @@ def main():
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt.get("state_dict", ckpt))
+    state = ckpt.get("state_dict", ckpt)
+    # strict=False: routing-mode-aware parameter cleanup may leave the
+    # checkpoint with extra keys (e.g. log_rho_col when --routing-mode=softmax).
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[load] missing keys ({len(missing)}): {missing[:5]}...")
+    if unexpected:
+        print(f"[load] unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
     model.eval()
     model.update(force=True)
 

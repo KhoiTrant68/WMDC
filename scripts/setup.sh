@@ -22,6 +22,12 @@ install_deps() {
         flops-profiler \
         bjontegaard
 
+    # Wavelet transforms: pytorch_wavelets provides bior4.4 with proper
+    # boundary handling (replaces the hand-rolled DWT/IDWT).  PyWavelets is
+    # a transitive dep of pytorch_wavelets but is pinned here so version
+    # drift does not silently change filter coefficients.
+    pip install pytorch-wavelets "PyWavelets>=1.4.0"
+
     # Pin tensorboard to avoid protobuf conflicts
     pip install tensorboard==2.14 protobuf==4.25.3
     echo "[ok] dependencies installed"
@@ -36,10 +42,24 @@ build_kernel() {
 }
 
 verify() {
-    echo "=== Verifying wavelet module ==="
+    echo "=== Verifying wavelet module (PR at boundaries, no crop) ==="
     cd "$REPO"
     $PYTHON -m modules.wavelet_blocks
     echo "[ok] wavelet module OK"
+
+    echo "=== Importing core model classes ==="
+    $PYTHON -c "
+from models.WMDC import WMDC
+from modules.dictionary_blocks import UnifiedDictionaryAttention
+from modules.content_adaptive_blocks import TokenClustering
+m = WMDC(routing_mode='softmax')
+print('  softmax        params:', sum(p.numel() for p in m.parameters()))
+m = WMDC(routing_mode='balanced_eot')
+print('  balanced_eot   params:', sum(p.numel() for p in m.parameters()))
+m = WMDC(routing_mode='unbalanced_eot')
+print('  unbalanced_eot params:', sum(p.numel() for p in m.parameters()))
+print('[ok] all three routing modes instantiate cleanly')
+"
 }
 
 case "${1:-all}" in
