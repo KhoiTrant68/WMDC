@@ -16,13 +16,24 @@ from modules.VSS_module import VSSBlock
 from modules.wavelet_blocks import FrequencyDisentangledMamba, GatedMemoryUpdater
 
 
-def _make_backbone(name: str, dim: int, drop_path: float = 0.1) -> nn.Module:
+def _make_backbone(
+    name: str,
+    dim: int,
+    drop_path: float = 0.1,
+    use_content_adaptive: bool = False,
+    cluster_num: int = 8,
+) -> nn.Module:
     """
     Construct an FDM-replacement block by name. Used by the Table 2
     backbone ablation. Falls back to the production FDM when name=='fdm'.
     """
     if name == "fdm":
-        return FrequencyDisentangledMamba(dim, drop_path=drop_path)
+        return FrequencyDisentangledMamba(
+            dim,
+            drop_path=drop_path,
+            use_content_adaptive=use_content_adaptive,
+            cluster_num=cluster_num,
+        )
     # Lazy import — the ablation_models package only needs to exist when
     # a non-FDM backbone is requested.
     from ablation_models.backbone_variants import build_backbone
@@ -194,6 +205,8 @@ class WMDC(CompressionModel):
         backbone: str = "fdm",
         use_dense_concat: bool = False,
         memory_init: str = "bootstrap",
+        use_content_adaptive: bool = False,
+        cluster_num: int = 8,
     ):
         super().__init__()
         self.N = N
@@ -206,6 +219,8 @@ class WMDC(CompressionModel):
         self.marginal_div = marginal_div
         self.use_dense_concat = use_dense_concat
         self.memory_init = memory_init
+        self.use_content_adaptive = use_content_adaptive
+        self.cluster_num = cluster_num
 
         # DDP-safe, never silently reset on checkpoint resume.
         self.register_buffer("_use_ste_flag", torch.zeros(1, dtype=torch.bool))
@@ -216,22 +231,58 @@ class WMDC(CompressionModel):
         # ── Encoder ───────────────────────────────────────────────────────────
         self.g_a = nn.Sequential(
             conv(3, N, kernel_size=5, stride=2),
-            _make_backbone(backbone, N, drop_path=0.1),
+            _make_backbone(
+                backbone,
+                N,
+                drop_path=0.1,
+                use_content_adaptive=use_content_adaptive,
+                cluster_num=cluster_num,
+            ),
             conv(N, N, kernel_size=5, stride=2),
-            _make_backbone(backbone, N, drop_path=0.1),
+            _make_backbone(
+                backbone,
+                N,
+                drop_path=0.1,
+                use_content_adaptive=use_content_adaptive,
+                cluster_num=cluster_num,
+            ),
             conv(N, N, kernel_size=5, stride=2),
-            _make_backbone(backbone, N, drop_path=0.1),
+            _make_backbone(
+                backbone,
+                N,
+                drop_path=0.1,
+                use_content_adaptive=use_content_adaptive,
+                cluster_num=cluster_num,
+            ),
             conv(N, M, kernel_size=5, stride=2),
         )
 
         # ── Decoder ───────────────────────────────────────────────────────────
         self.g_s = nn.Sequential(
             deconv(M, N, kernel_size=5, stride=2),
-            _make_backbone(backbone, N, drop_path=0.1),
+            _make_backbone(
+                backbone,
+                N,
+                drop_path=0.1,
+                use_content_adaptive=use_content_adaptive,
+                cluster_num=cluster_num,
+            ),
             deconv(N, N, kernel_size=5, stride=2),
-            _make_backbone(backbone, N, drop_path=0.1),
+            _make_backbone(
+                backbone,
+                N,
+                drop_path=0.1,
+                use_content_adaptive=use_content_adaptive,
+                cluster_num=cluster_num,
+            ),
             deconv(N, N, kernel_size=5, stride=2),
-            _make_backbone(backbone, N, drop_path=0.1),
+            _make_backbone(
+                backbone,
+                N,
+                drop_path=0.1,
+                use_content_adaptive=use_content_adaptive,
+                cluster_num=cluster_num,
+            ),
             deconv(N, 3, kernel_size=5, stride=2),
         )
 

@@ -27,7 +27,7 @@ MODES_TO_RUN=("${ROUTING_MODES[@]}")
 for arg in "$@"; do
     case "$arg" in
         --resume) RESUME=1 ;;
-        softmax|balanced_eot|unbalanced_eot) MODES_TO_RUN=("$arg") ;;
+        unbalanced_eot|balanced_eot|softmax) MODES_TO_RUN=("$arg") ;;
         *) echo "Unknown arg: $arg" >&2; exit 1 ;;
     esac
 done
@@ -49,6 +49,9 @@ train_mode() {
     mkdir -p "$save_dir"
     cd "$REPO"
 
+    local ca_flags=""
+    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && ca_flags="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+
     # shellcheck disable=SC2086
     $LAUNCHER train.py \
         -d "$TRAIN_DATA" \
@@ -60,6 +63,7 @@ train_mode() {
         --batch-size "$BATCH_SIZE" \
         --lr-milestones $LR_MILESTONES \
         --last-epochs-with-ste "$LAST_EPOCHS_STE" \
+        $ca_flags \
         $resume_flag
 
     echo "[done] $mode → $save_dir"

@@ -5,15 +5,44 @@ from models.WMDC import WMDC
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Profile WMDC model")
+    parser.add_argument("--N", type=int, default=192)
+    parser.add_argument("--M", type=int, default=320)
+    parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    parser.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
+    args = parser.parse_args()
+
+    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     print(f"Device selected: {device}")
 
     print("Initializing WMDC model...")
-    model = WMDC(N=192, M=320, num_slices=5).to(device)
+    model = WMDC(
+        N=args.N,
+        M=args.M,
+        num_slices=5,
+        use_content_adaptive=args.use_content_adaptive,
+        cluster_num=args.cluster_num,
+    ).to(device)
     model.eval()
 
     batch_size = 1
-    input_shape = (batch_size, 3, 256, 256)
+    input_shape = (batch_size, 3, args.resolution, args.resolution)
 
     print("\nRunning a dummy forward pass to check model execution...")
     dummy_input = torch.randn(input_shape).to(device)
@@ -36,8 +65,8 @@ def main():
     print("\n" + "=" * 40)
     print("          MODEL PROFILING RESULTS         ")
     print("=" * 40)
-    print("Model:  WMDC(N=192, M=320)")
-    print("Image:  256x256 RGB")
+    print(f"Model:  WMDC(N={args.N}, M={args.M})")
+    print(f"Image:  {args.resolution}x{args.resolution} RGB")
     print("-" * 40)
     print(f"FLOPs:  {flops}")
     print(f"MACs:   {macs}")

@@ -217,6 +217,20 @@ def main():
         choices=["bootstrap", "zero"],
         help="Memory initialisation strategy matching the checkpoint.",
     )
+    parser.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    parser.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
         "--measure-dict-util",
@@ -252,6 +266,8 @@ def main():
         backbone=args.backbone,
         use_dense_concat=args.use_dense_concat,
         memory_init=args.memory_init,
+        use_content_adaptive=args.use_content_adaptive,
+        cluster_num=args.cluster_num,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
