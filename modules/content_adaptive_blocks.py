@@ -61,8 +61,8 @@ class TokenClustering(nn.Module):
         # x_flat: (B*HW, D)
         B_HW = x_flat.shape[0]
         idx = torch.randperm(B_HW, device=x_flat.device)[: self.cluster_num]
-        self.means.data = x_flat[idx].clone().detach()
-        self.initted.data = torch.tensor(True, dtype=torch.bool)
+        self.means.data.copy_(x_flat[idx].detach())
+        self.initted.fill_(True)
 
     def _center_iter(self, x_flat: torch.Tensor, assign: torch.Tensor) -> None:
         """Single K-means iteration: update centroids via hard assignment."""
