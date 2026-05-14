@@ -101,7 +101,7 @@ def compute_util_from_saved(
     all_row_masses : list of (1, HW) tensors or None — unbalanced OT only
     shape          : (H_z, W_z) from compress() output
     dict_num       : number of dictionary tokens N
-    y_to_z_ratio   : (ratio_h, ratio_w) from probe_y_to_z_ratio()  [FIX-M1]
+    y_to_z_ratio   : (ratio_h, ratio_w) from probe_y_to_z_ratio()
 
     Returns dict with:
       - per_slice_utilisation_pct : list[float]
@@ -274,6 +274,10 @@ def main():
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
     model.update(force=True)
+
+    if args.measure_dict_util:
+        for a in model.eot_attentions:
+            a.store_attn_probs = True
 
     y_to_z_ratio = probe_y_to_z_ratio(model, device)
     print(f"Probed y-to-z spatial ratio: {y_to_z_ratio}")

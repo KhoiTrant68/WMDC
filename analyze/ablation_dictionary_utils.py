@@ -1,5 +1,5 @@
 """
-analyze/ablation_dictionary_utils.py  (FIXED)
+analyze/ablation_dictionary_utils.py
 =============================================
 Measures dictionary token utilisation across a test dataset, comparing a
 checkpoint trained WITH dispersion regularisation against one trained
@@ -179,6 +179,9 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
         update_for_inference=False,  # forward() only, faster
     )
+    # Required so the forward hook on attn_probs captures non-None plans.
+    for a in m_with.eot_attentions:
+        a.store_attn_probs = True
     res_with = evaluate_dataset(m_with, args.dataset, device)
 
     print("\n== Evaluating WITHOUT dispersion ==")
@@ -190,6 +193,8 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
         update_for_inference=False,
     )
+    for a in m_no.eot_attentions:
+        a.store_attn_probs = True
     res_no = evaluate_dataset(m_no, args.dataset, device)
 
     H_norm_with = [r["H_norm_mean"] for r in res_with]

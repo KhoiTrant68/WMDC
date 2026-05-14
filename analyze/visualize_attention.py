@@ -89,6 +89,11 @@ def main():
     model.load_state_dict(ckpt.get("state_dict", ckpt))
     model.eval()
 
+    # Required so eot_attentions populate attn_probs / last_row_mass during
+    # forward(); otherwise model.slice_attn_probs stays empty.
+    for a in model.eot_attentions:
+        a.store_attn_probs = True
+
     # Load images
     img_files = sorted(
         [

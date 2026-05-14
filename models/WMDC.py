@@ -67,7 +67,7 @@ def ste_mode(model: "WMDC"):
 
 
 # ---------------------------------------------------------------------------
-# Legacy checkpoint migration helper  (FIX-N1)
+# Legacy checkpoint migration helper
 # ---------------------------------------------------------------------------
 
 
@@ -748,7 +748,9 @@ class WMDC(CompressionModel):
                 y_hat_hard = torch.round(y_slice - mu) + mu
                 y_hat_for_lrp = y_hat_hard.detach() - y_hat_slice.detach() + y_hat_slice
             else:
-                y_hat_for_lrp = y_hat_slice
+                # Match compress/decompress: feed hard-rounded value to LRP so
+                # that forward(eval) metrics align with the actual codec path.
+                y_hat_for_lrp = torch.round(y_slice - mu) + mu
 
             lrp_support = torch.cat([support, y_hat_for_lrp], dim=1)
             residual = self.lrp_transforms[i](lrp_support)

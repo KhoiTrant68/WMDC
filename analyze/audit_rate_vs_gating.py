@@ -274,6 +274,10 @@ def main():
         update_for_inference=False,  # forward() only
     )
 
+    # Required so eot_attentions populate last_row_mass during eval forward().
+    for a in model.eot_attentions:
+        a.store_attn_probs = True
+
     rm_all, bpp_all, cpx_all, per_image = [], [], [], []
     for path, x, x_padded, H, W in iter_dataset(args.dataset, device=device):
         rec = _collect_per_image(model, x, x_padded, H, W)

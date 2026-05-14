@@ -143,7 +143,6 @@ def main():
         # --- PLOT ATTENTION MAPS (Columns 1 to N) ---
         for col_idx, (entry_idx, head_idx) in enumerate(target_maps):
 
-            # FIX: Prevent IndexError if the image is too small (e.g. 256x256 gives a 64-token dictionary)
             safe_entry_idx = min(entry_idx, max_dict_idx)
 
             # Extract 2D heatmap:[latent_h, latent_w]
