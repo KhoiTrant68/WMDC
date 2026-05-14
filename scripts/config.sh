@@ -13,7 +13,7 @@ RESULTS_DIR="$REPO/results"
 
 # ── Training hyperparams ─────────────────────────────────────────────
 EPOCHS=400
-BATCH_SIZE=16
+BATCH_SIZE=8
 LR_MILESTONES="360 380"
 LAST_EPOCHS_STE=20
 
