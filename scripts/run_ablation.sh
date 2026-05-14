@@ -28,6 +28,9 @@ run_train_job() {
     local out_dir="$CHECKPOINT_ROOT/ablation/$variant/lam_$lam"
 
     mkdir -p "$out_dir"
+    local ca_flags=""
+    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && ca_flags="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+
 
     # Build the command
     local cmd="$LAUNCHER train.py \
@@ -41,6 +44,7 @@ run_train_job() {
         --last-epochs-with-ste $LAST_EPOCHS_STE"
 
     [ -n "$extra_flags" ] && cmd="$cmd $extra_flags"
+    [ -n "$ca_flags" ] && cmd="$cmd $ca_flags"
 
     if [ "$dry" -eq 1 ]; then
         echo "[dry-run] $variant @ λ=$lam"
