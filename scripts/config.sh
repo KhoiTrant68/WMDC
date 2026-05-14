@@ -12,16 +12,16 @@ CHECKPOINT_ROOT="$REPO/wmdc_runs"
 RESULTS_DIR="$REPO/results"
 
 # ── Training hyperparams ─────────────────────────────────────────────
-EPOCHS=400
+EPOCHS=2
 BATCH_SIZE=4
-LR_MILESTONES="360 380"
-LAST_EPOCHS_STE=20
+LR_MILESTONES="1"
+LAST_EPOCHS_STE=1
 
 # ── Lambdas ──────────────────────────────────────────────────────────
 # LAMBDAS_FULL=(0.0018 0.0036 0.0067 0.013 0.025 0.0483)   # full RD curve
-LAMBDAS_FULL=(0.0018 0.0036)   # full RD curve
+LAMBDAS_FULL=(0.0036)   # full RD curve
 # LAMBDAS_ABLATION=(0.0036 0.013 0.0483)                    # 3-point ablation
-LAMBDAS_ABLATION=(0.0018 0.0036)                    # 3-point ablation
+LAMBDAS_ABLATION=(0.0036)                    # 3-point ablation
 
 
 # ── Model defaults ───────────────────────────────────────────────────
