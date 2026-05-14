@@ -740,26 +740,27 @@ class WMDC(CompressionModel):
             # bpp at low-rate λ).
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11, max=256.0)
 
-            if self.training and self.use_ste:
-                # STE-y: forward is hard-rounded, gradient flows through y_slice.
-                # Likelihood is computed on the hard-rounded value (= what the
-                # arithmetic coder will see), closing the rate side of the
-                # train/infer gap.
-                y_hat_hard = torch.round(y_slice - mu) + mu
-                y_slice_likelihood = self.gaussian_conditional._likelihood(
-                    y_hat_hard, scale, means=mu
-                )
-                if self.gaussian_conditional.use_likelihood_bound:
-                    y_slice_likelihood = (
-                        self.gaussian_conditional.likelihood_lower_bound(
-                            y_slice_likelihood
-                        )
-                    )
-                y_hat_slice = y_hat_hard.detach() - y_slice.detach() + y_slice
-            else:
-                y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
-                    y_slice, scale, means=mu
-                )
+            # NOTE on the y-quantisation pipeline
+            # -----------------------------------
+            # We always use the noise-relaxed likelihood from
+            # `gaussian_conditional` for the rate term.  The LRP block below
+            # then STE-merges a HARD-rounded copy back in for x_hat
+            # reconstruction (regardless of `self.use_ste`), so:
+            #
+            #   • rate gradient  ← noise-relaxed likelihood (smooth, optimiser-friendly)
+            #   • recon gradient ← hard-rounded forward via LRP STE-merge
+            #
+            # Forcing rate-side STE on top (computing likelihood at the hard
+            # rounded value) was empirically too harsh in early training:
+            # likelihoods clip to 1e-9 for any y_slice far from mu and the
+            # optimiser collapses cc_scale to its minimum clamp.  If you want
+            # to close the rate-side train/infer gap at the very end of
+            # training, do it via a short LR-annealed fine-tune with a
+            # separate flag, NOT through this `use_ste` switch which is
+            # currently scoped to z only.
+            y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
+                y_slice, scale, means=mu
+            )
 
             # ── LRP with STE proxy ───────────────────────────────────────────
             # The LRP network expects the hard-rounded value (what the codec
@@ -786,11 +787,17 @@ class WMDC(CompressionModel):
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         # ── Decode ────────────────────────────────────────────────────────────
-        # Clamp to [0, 1] in BOTH training and eval so distortion is measured
-        # consistently with eval.py / compress→decompress.  Gradient flows
-        # through clamp on the non-saturated interior (vanishes outside [0,1],
-        # which is the intended behaviour for an RGB codec).
-        x_hat = self.g_s(torch.cat(y_hat_slices, dim=1)).clamp(0.0, 1.0)
+        # IMPORTANT: do NOT clamp x_hat in training.  `clamp(0,1)` zeroes
+        # the MSE gradient on pixels outside [0,1], which strands ~30-50%
+        # of g_s's randomly-initialised outputs without a learning signal —
+        # PSNR can stall ~4 dB lower in early epochs (observed regression
+        # documented in repo history).  Standard CompressAI convention:
+        # training uses RAW x_hat (MSE itself pulls outputs into [0,1]);
+        # eval, compress, decompress, and all PSNR-reporting callers
+        # apply `.clamp(0, 1)` themselves.
+        x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
+        if not self.training:
+            x_hat = x_hat.clamp(0.0, 1.0)
 
         # ── Slice-averaged entropy signals + stacked row_mass ────────────────
         S = float(self.num_slices)
