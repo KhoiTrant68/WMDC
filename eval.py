@@ -20,11 +20,16 @@ from models.WMDC import WMDC
 
 
 def _byte_size(obj) -> int:
-    """Recursively sum byte-lengths of all byte-strings in a nested structure."""
-    if isinstance(obj, bytes):
+    """
+    Recursively sum byte-lengths of all bytes objects in a nested structure.
+        strings = [y_strings, z_strings]
+        y_strings = [[bytes, bytes, ...], [bytes, bytes, ...], ...]   (5 slices × batch)
+        z_strings = [bytes, bytes, ...]                                (batch)
+    """
+    if isinstance(obj, (bytes, bytearray)):
         return len(obj)
     if isinstance(obj, (list, tuple)):
-        return sum(_byte_size(s) for s in obj)
+        return sum(_byte_size(item) for item in obj)
     return 0
 
 
@@ -52,29 +57,15 @@ def pad_image(x: torch.Tensor, p: int = 64):
 
 
 def _sync(device: str):
-    """Synchronise CUDA stream so wall-clock timings are accurate."""
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def probe_y_to_z_ratio(model: WMDC, device: str) -> tuple[int, int]:
-    """
-    Probe the model with a minimal dummy input to measure the exact spatial
-    downsampling ratio between the latent y (output of g_a) and the hyper-
-    latent z (output of h_a).
-
-    This ratio is used in compute_util_from_saved() to reshape the flattened
-    attention maps back to 2-D spatial grids.
-
-    Returns
-    -------
-    (ratio_h, ratio_w) — integer scale factors, typically (4, 4) for the
-    default architecture where h_a applies 2× stride twice.
-    """
     with torch.no_grad():
         dummy = torch.zeros(1, 3, 64, 64, device=device)
-        dummy_y = model.g_a(dummy)  # (1, M, H/16, W/16)
-        dummy_z = model.h_a(dummy_y)  # (1, 192, H/64, W/64)
+        dummy_y = model.g_a(dummy)
+        dummy_z = model.h_a(dummy_y)
     rh = dummy_y.shape[2] // dummy_z.shape[2]
     rw = dummy_y.shape[3] // dummy_z.shape[3]
     return rh, rw
@@ -92,25 +83,6 @@ def compute_util_from_saved(
     dict_num: int,
     y_to_z_ratio: tuple[int, int],
 ) -> dict:
-    """
-    Compute per-slice utilisation metrics from saved attention maps.
-
-    Parameters
-    ----------
-    all_probs      : list of (1, HW, N) tensors — one per slice
-    all_row_masses : list of (1, HW) tensors or None — unbalanced OT only
-    shape          : (H_z, W_z) from compress() output
-    dict_num       : number of dictionary tokens N
-    y_to_z_ratio   : (ratio_h, ratio_w) from probe_y_to_z_ratio()
-
-    Returns dict with:
-      - per_slice_utilisation_pct : list[float]
-      - mean_utilisation_pct      : float
-      - max_entropy_bits          : float = log2(dict_num)
-      - assignment_maps           : list of (H_lat, W_lat) int tensors
-      - entropy_maps              : list of (H_lat, W_lat) float tensors
-      - row_mass_maps             : list of (H_lat, W_lat) float | None
-    """
     if not all_probs:
         return {
             "error": "No attention maps collected. Check routing_mode != 'softmax'."
@@ -118,7 +90,6 @@ def compute_util_from_saved(
 
     H_lat_y = shape[0] * y_to_z_ratio[0]
     W_lat_y = shape[1] * y_to_z_ratio[1]
-
     max_ent = math.log2(dict_num)
 
     per_slice_util: list[float] = []
@@ -127,16 +98,12 @@ def compute_util_from_saved(
     row_mass_maps: list = []
 
     for s_idx, P in enumerate(all_probs):
-        # P: (1, HW, N) — detached and cloned
         B, HW, N = P.shape
-
-        # Column marginal → utilisation entropy in BITS
-        marginal = P.sum(dim=1)  # (1, N)
+        marginal = P.sum(dim=1)
         marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp(min=1e-8)
         H_bits = -(marginal * marginal.clamp(1e-8).log2()).sum(dim=1).mean()
         per_slice_util.append(float(H_bits.item() / max_ent * 100.0))
 
-        # Spatial maps: reshape P to (H_lat_y, W_lat_y, N)
         try:
             P_sp = P[0].view(H_lat_y, W_lat_y, N)
         except RuntimeError:
@@ -145,15 +112,12 @@ def compute_util_from_saved(
             row_mass_maps.append(None)
             continue
 
-        # Top-1 assignment map
-        assignment_maps.append(P_sp.argmax(dim=-1).cpu())  # (H, W) int
+        assignment_maps.append(P_sp.argmax(dim=-1).cpu())
 
-        # Per-pixel entropy map
         p_norm = P_sp / P_sp.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         H_pixel = -(p_norm * p_norm.clamp(1e-8).log2()).sum(dim=-1)
-        entropy_maps.append(H_pixel.cpu())  # (H, W) float
+        entropy_maps.append(H_pixel.cpu())
 
-        # Row mass map (unbalanced OT spatial gating signal)
         rm = all_row_masses[s_idx] if s_idx < len(all_row_masses) else None
         if rm is not None:
             try:
@@ -196,54 +160,30 @@ def main():
         type=str,
         default="kl",
         choices=["kl", "tv"],
-        help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
     )
     parser.add_argument(
         "--backbone",
         type=str,
         default="fdm",
         choices=["fdm", "ss2d", "cnn", "swin", "fdm_reversed"],
-        help="Backbone variant matching the checkpoint.",
     )
-    parser.add_argument(
-        "--use-dense-concat",
-        action="store_true",
-        help="Build the dense-concat variant (no stateful memory).",
-    )
+    parser.add_argument("--use-dense-concat", action="store_true")
     parser.add_argument(
         "--memory-init",
         type=str,
         default="bootstrap",
         choices=["bootstrap", "zero"],
-        help="Memory initialisation strategy matching the checkpoint.",
     )
     parser.add_argument(
         "--content-adaptive",
         action="store_true",
         default=False,
         dest="use_content_adaptive",
-        help="Use content-adaptive K-means token permutation in Mamba blocks.",
     )
-    parser.add_argument(
-        "--cluster-num",
-        type=int,
-        default=8,
-        dest="cluster_num",
-        help="Number of clusters for content-adaptive K-means tokenization.",
-    )
+    parser.add_argument("--cluster-num", type=int, default=8, dest="cluster_num")
     parser.add_argument("--cuda", action="store_true")
-    parser.add_argument(
-        "--measure-dict-util",
-        action="store_true",
-        help="Record per-slice dictionary utilisation, assignment maps, "
-        "entropy maps, and row-mass maps for every image.",
-    )
-    parser.add_argument(
-        "--save-attn-maps",
-        action="store_true",
-        help="Save assignment, entropy, and row-mass map tensors as .pt files "
-        "(only effective with --measure-dict-util).",
-    )
+    parser.add_argument("--measure-dict-util", action="store_true")
+    parser.add_argument("--save-attn-maps", action="store_true")
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -272,8 +212,7 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = ckpt.get("state_dict", ckpt)
-    # strict=False: routing-mode-aware parameter cleanup may leave the
-    # checkpoint with extra keys (e.g. log_rho_col when --routing-mode=softmax).
+    # strict=False: routing-mode-aware parameter cleanup
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"[load] missing keys ({len(missing)}): {missing[:5]}...")
@@ -312,9 +251,9 @@ def main():
             "dec_time",
         )
     }
+    nan_images: list[str] = []
     per_slice_util_all: list[list[float]] = []
     per_image: list[dict] = []
-
     to_tensor = transforms.ToTensor()
 
     with torch.no_grad():
@@ -335,12 +274,13 @@ def main():
             t0 = time.time()
             out_enc = model.compress(x_pad)
 
-            # Clone attention maps immediately so decompress() can reuse them
-            saved_attn_probs = [p.clone() for p in model.slice_attn_probs]
+            # Clone attention maps immediately
+            saved_attn_probs = [p.detach().cpu() for p in model.slice_attn_probs]
+            model.slice_attn_probs.clear()
             saved_row_masses = []
             for a in model.eot_attentions:
                 rm = getattr(a, "last_row_mass", None)
-                saved_row_masses.append(rm.clone() if rm is not None else None)
+                saved_row_masses.append(rm.detach().cpu() if rm is not None else None)
 
             _sync(device)
             enc_time = time.time() - t0
@@ -352,23 +292,36 @@ def main():
             _sync(device)
             dec_time = time.time() - t1
 
-            # Crop padding and clamp
+            # Crop and clamp
             x_hat = out_dec["x_hat"]
             if pad_h > 0 or pad_w > 0:
                 x_hat = x_hat[:, :, :H, :W]
             x_hat = x_hat.clamp(0, 1)
 
-            save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
+            has_nan = torch.isnan(x_hat).any().item()
+            if has_nan:
+                nan_frac = torch.isnan(x_hat).float().mean().item()
+                print(
+                    f"[WARN] {os.path.basename(img_path)}: x_hat has "
+                    f"{nan_frac:.1%} NaN values — metrics set to 0"
+                )
+                nan_images.append(os.path.basename(img_path))
+                x_hat = torch.nan_to_num(x_hat, nan=0.0, posinf=1.0, neginf=0.0)
+                psnr = 0.0
+                msssim = 0.0
+            else:
+                save_image(x_hat, os.path.join(img_dir, os.path.basename(img_path)))
+                mse = F.mse_loss(x, x_hat)
+                psnr = -10.0 * math.log10(mse.item()) if mse.item() > 0 else 100.0
+                try:
+                    msssim = ms_ssim(x, x_hat, data_range=1.0).item()
+                except Exception:
+                    msssim = float("nan")
 
             # BPP — two variants
             bpp_orig = compute_actual_bpp(out_enc["strings"], num_pixels_orig)
             bpp_pad = compute_actual_bpp(out_enc["strings"], num_pixels_padded)
             pad_oh = bpp_orig - bpp_pad
-
-            # Quality
-            mse = F.mse_loss(x, x_hat)
-            psnr = -10.0 * math.log10(mse.item()) if mse.item() > 0 else 100.0
-            msssim = ms_ssim(x, x_hat, data_range=1.0).item()
 
             metrics["bpp"].append(bpp_orig)
             metrics["bpp_padded"].append(bpp_pad)
@@ -385,9 +338,10 @@ def main():
                 "bpp_padded": round(bpp_pad, 4),
                 "pad_overhead_bpp": round(pad_oh, 6),
                 "psnr": round(psnr, 2),
-                "ms_ssim": round(msssim, 4),
+                "ms_ssim": round(msssim, 4) if not math.isnan(msssim) else None,
                 "enc_time": round(enc_time, 3),
                 "dec_time": round(dec_time, 3),
+                "has_nan": has_nan,
             }
 
             if args.measure_dict_util:
@@ -396,7 +350,7 @@ def main():
                     saved_row_masses,
                     out_enc["shape"],
                     model.dict_num,
-                    y_to_z_ratio,  # FIX-M1: pass probed ratio
+                    y_to_z_ratio,
                 )
 
                 if "error" not in util:
@@ -441,6 +395,7 @@ def main():
 
             per_image.append(row)
 
+            nan_marker = " [NaN→0]" if has_nan else ""
             util_str = ""
             if args.measure_dict_util and "mean_utilisation_pct" in row:
                 slices = row["per_slice_utilisation_pct"]
@@ -452,21 +407,26 @@ def main():
 
             print(
                 f"{os.path.basename(img_path):30s} | "
-                f"BPP: {bpp_orig:.4f} (pad: {bpp_pad:.4f}, oh: {pad_oh:+.5f}) | "
+                f"BPP: {bpp_orig:.4f} | "
                 f"PSNR: {psnr:.2f} dB | MS-SSIM: {msssim:.4f} | "
-                f"Enc: {enc_time:.3f}s  Dec: {dec_time:.3f}s{util_str}"
+                f"Enc: {enc_time:.3f}s  Dec: {dec_time:.3f}s"
+                f"{util_str}{nan_marker}"
             )
 
     # ── Aggregate statistics ──────────────────────────────────────────────────
     def _stats(vals):
-        a = float(np.mean(vals))
-        s = float(np.std(vals))
+        # Exclude NaN from statistics (NaN images report psnr=0 not nan)
+        clean = [v for v in vals if not (isinstance(v, float) and math.isnan(v))]
+        if not clean:
+            return {"mean": float("nan"), "std": float("nan")}
+        a = float(np.mean(clean))
+        s = float(np.std(clean))
         return {"mean": round(a, 4), "std": round(s, 4)}
 
     avg = {k: _stats(v) for k, v in metrics.items()}
 
     if per_slice_util_all:
-        per_slice_arr = np.array(per_slice_util_all)  # (N_images, num_slices)
+        per_slice_arr = np.array(per_slice_util_all)
         avg["per_slice_utilisation_pct"] = [
             {
                 "slice": i,
@@ -475,17 +435,11 @@ def main():
             }
             for i in range(per_slice_arr.shape[1])
         ]
-        avg["mean_utilisation_pct"] = _stats(per_slice_arr.mean(axis=1))
+        avg["mean_utilisation_pct"] = _stats(list(per_slice_arr.mean(axis=1)))
 
     print("\n── Average results ──────────────────────────────")
     print(
-        f"  BPP (original pixels) : {avg['bpp']['mean']:.4f} ± {avg['bpp']['std']:.4f}"
-    )
-    print(
-        f"  BPP (padded pixels)   : {avg['bpp_padded']['mean']:.4f} ± {avg['bpp_padded']['std']:.4f}"
-    )
-    print(
-        f"  Pad overhead          : {avg['pad_overhead_bpp']['mean']:+.5f} bpp (mean)"
+        f"  BPP                   : {avg['bpp']['mean']:.4f} ± {avg['bpp']['std']:.4f}"
     )
     print(
         f"  PSNR                  : {avg['psnr']['mean']:.2f} ± {avg['psnr']['std']:.2f} dB"
@@ -495,6 +449,12 @@ def main():
     )
     print(f"  Enc time              : {avg['enc_time']['mean']:.3f}s")
     print(f"  Dec time              : {avg['dec_time']['mean']:.3f}s")
+    if nan_images:
+        print(
+            f"\n  [WARN] {len(nan_images)} images had NaN x_hat (PSNR set to 0, not 100):"
+        )
+        for n in nan_images:
+            print(f"         - {n}")
     if per_slice_util_all:
         print("  Dict utilisation per slice:")
         for s in avg["per_slice_utilisation_pct"]:
@@ -504,6 +464,7 @@ def main():
     report = {
         "average": avg,
         "per_image": per_image,
+        "nan_images": nan_images,
         "args": vars(args),
         "y_to_z_ratio": list(y_to_z_ratio),
     }

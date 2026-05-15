@@ -78,52 +78,26 @@ def compute_bpp(out_net: dict, num_pixels: int) -> torch.Tensor:
 
 class RateDistortionLoss(nn.Module):
     """
-    Mathematically principled rate-distortion loss with explicit routing
-    regularisers for dictionary-based neural image compression.
+    Rate-distortion loss with routing regularisers.
 
-        L =  λ · distortion                                  # RD trade-off
-           + bpp                                              #
-           + β_col · column_neg_entropy(P)                    # = −β_col · H_col
-           + β_row · row_entropy(P)                           # = +β_row · H_row
-           + γ      · ReLU( −Pearson(row_mass, complexity) )  # anti-leakage
-           + δ      · dict_penalty                            # token diversity
-           + tv_loss                                          # spatial TV on P
+        L = λ·D + R·rate_warmup
+          + β_col · column_neg_entropy
+          + β_row · row_entropy
+          + γ · ReLU(−Pearson(row_mass, complexity))   [delayed by alignment_delay_epochs]
+          + δ · dict_penalty
+          + tv_loss
 
-    Information-theoretic derivation of the dictionary regularisers
-    ---------------------------------------------------------------
-    For the side-information channel "pixel → token" implemented by the
-    transport plan P, the mutual information decomposes as
-
-        I(pixel ; token)  =  H_col  −  E_pixel[ H_row ]
-
-    Maximising I therefore requires SIMULTANEOUSLY:
-      (a) maximising H_col   ⇒  no dead codes (every token used somewhere),
-      (b) minimising H_row   ⇒  each pixel selects FEW tokens (specialisation).
-
-    The pre-refactor loss carried only (a) and a token-orthogonality penalty,
-    leaving the trivial uniform routing P[i,j] = 1/N as a global optimum —
-    matching the observed 100 % per-slice utilisation and the 0.5 dB rate gap.
-
-    Anti-leakage alignment
-    ----------------------
-    Under unbalanced entropic OT the row marginal m_i = Σ_j P_ij carries the
-    spatial gating Aprox_KL(1) = ρ_i/(ρ_i + ε) ∈ (0, 1].  Compression theory
-    says the dictionary side-information should help MOST where the latent
-    is high-entropy (i.e. content-complex regions).  Audit on the failed
-    checkpoint showed Pearson( row_mass , complexity ) = −0.66 — the optimizer
-    chose the OPPOSITE alignment, dropping mass at complex regions and
-    laundering the saved rate into the Gaussian channel.  The hinge term
-    ReLU( −corr(row_mass, complexity) ) penalises only the wrong-sign regime
-    and is identically zero on data already in the correct alignment.
-
-    Why a fixed (not EMA-adaptive) weight on the entropy terms
-    ----------------------------------------------------------
-    Earlier code scaled β_col by EMA(bpp) / EMA(H_col) clamped to [0.01, 2.0]
-    in an attempt to keep entropy commensurate with bpp.  This conflated two
-    quantities that change on different time scales and introduced a feedback
-    loop with the optimiser (high bpp → larger entropy weight → faster bpp
-    reduction → smaller weight → …).  In bits-vs-bits both H_col and H_row
-    are already commensurate with bpp_loss, so a constant weight is principled.
+    Changes vs previous version
+    ----------------------------
+    1. rate_warmup parameter (passed from train loop, linear schedule over
+       warmup_steps) prevents scale collapse in early epochs by ramping up
+       the rate penalty gradually.
+    2. alignment_delay_epochs prevents the alignment loss from destabilising
+       the model before the basic RD objective has converged.
+    3. _alignment_loss now has a variance floor to prevent gradient explosion
+       at initialisation when row_mass is nearly uniform.
+    4. warmup_steps and alignment_delay_epochs are stored as attributes so
+       train_one_epoch can access them.
     """
 
     def __init__(
@@ -134,6 +108,8 @@ class RateDistortionLoss(nn.Module):
         row_entropy_weight: float = 0.05,
         alignment_weight: float = 0.2,
         dict_penalty_weight: float = 0.1,
+        warmup_steps: int = 2000,
+        alignment_delay_epochs: int = 50,
     ):
         super().__init__()
         self.mse = nn.MSELoss()
@@ -143,49 +119,32 @@ class RateDistortionLoss(nn.Module):
         self.row_entropy_weight = float(row_entropy_weight)
         self.alignment_weight = float(alignment_weight)
         self.dict_penalty_weight = float(dict_penalty_weight)
+        self.warmup_steps = warmup_steps
+        self.alignment_delay_epochs = alignment_delay_epochs
 
         if metric == "ms-ssim" and lmbda < 1.0:
             warnings.warn(
                 f"λ={lmbda:.4f} is very small for metric='ms-ssim'. "
-                "MS-SSIM distortion is in [0, 1], so tiny λ values cause the "
-                "model to optimise rate only. Recommended λ range: 2.4 – 115.37. "
-                "Did you mean to use --metric mse?",
+                "Recommended λ range: 2.4 – 115.37.",
                 UserWarning,
                 stacklevel=2,
             )
         if metric == "mse" and lmbda > 1.0:
             warnings.warn(
                 f"λ={lmbda:.4f} is unusually large for metric='mse'. "
-                "MSE distortion is scaled by 255²≈65025. "
                 "Recommended λ range: 0.0018 – 0.05.",
                 UserWarning,
                 stacklevel=2,
             )
 
-    # -----------------------------------------------------------------------
-    # Anti-leakage alignment regulariser
-    # -----------------------------------------------------------------------
-
     @staticmethod
     def _alignment_loss(
-        row_mass: torch.Tensor, complexity: torch.Tensor
+        row_mass: torch.Tensor,
+        complexity: torch.Tensor,
+        var_floor: float = 1e-4,
     ) -> torch.Tensor:
         """
-        Hinge on the NEGATIVE Pearson correlation between per-pixel row mass
-        and per-pixel content complexity:
-
-            L_align = E_batch,slice [ ReLU( −corr(row_mass, complexity) ) ]
-                    ∈ [0, 1]
-
-        Parameters
-        ----------
-        row_mass    : (B, S, HW) or (B, HW)   grad-bearing
-        complexity  : (B, HW)                 detached, ∈ [0, 1]
-
-        Returns
-        -------
-        scalar tensor ∈ [0, 1].  Zero if every (batch, slice) pair already
-        has non-negative correlation between routing mass and complexity.
+        Hinge on −Pearson(row_mass, complexity).
         """
         if row_mass.dim() == 3:
             B, S, HW = row_mass.shape
@@ -195,20 +154,33 @@ class RateDistortionLoss(nn.Module):
             rm = row_mass
             co = complexity
 
-        # Constant-row guard: if every position has the same mass (e.g. softmax
-        # / balanced modes), Pearson is undefined; treat as zero correlation.
         rm = rm - rm.mean(dim=-1, keepdim=True)
         co = co - co.mean(dim=-1, keepdim=True)
         num = (rm * co).sum(dim=-1)
-        den = rm.norm(dim=-1) * co.norm(dim=-1) + 1e-8
-        corr = num / den  # (B*S,)
+
+        # Variance floor: prevents division by ~0 at init when P is uniform
+        min_norm = math.sqrt(var_floor * rm.shape[-1])
+        rm_norm = rm.norm(dim=-1).clamp(min=min_norm)
+        co_norm = co.norm(dim=-1).clamp(min=min_norm)
+
+        corr = (num / (rm_norm * co_norm)).clamp(-1.0, 1.0)
         return F.relu(-corr).mean()
 
-    # -----------------------------------------------------------------------
-    # Forward
-    # -----------------------------------------------------------------------
-
-    def forward(self, output: dict, target: torch.Tensor) -> dict:
+    def forward(
+        self,
+        output: dict,
+        target: torch.Tensor,
+        rate_warmup: float = 1.0,
+        current_epoch: int = 0,
+    ) -> dict:
+        """
+        Parameters
+        ----------
+        rate_warmup    : scalar in [0.1, 1.0], linearly ramped over warmup_steps.
+                         Prevents scale collapse by starting with a small rate penalty.
+        current_epoch  : used to gate the alignment loss (only active after
+                         alignment_delay_epochs).
+        """
         num_pixels = target.size(0) * target.size(2) * target.size(3)
         bpp_loss = compute_bpp(output, num_pixels)
 
@@ -222,52 +194,53 @@ class RateDistortionLoss(nn.Module):
             out["ms_ssim_loss"] = 1 - ms_ssim(output["x_hat"], target, data_range=1.0)
             distortion = out["ms_ssim_loss"]
 
-        loss = self.lmbda * distortion + bpp_loss
+        # rate_warmup ramps bpp_loss from 0.1× to 1.0× over warmup_steps
+        loss = self.lmbda * distortion + bpp_loss * rate_warmup
 
-        # ── Column-entropy bonus (anti-dead-code) ─────────────────────────
-        # column_neg_entropy = −H_col.  Adding it with a POSITIVE weight to
-        # the loss thus MAXIMISES H_col (every dictionary token gets used).
+        # ── Column-entropy bonus ────────────────────────────────────────
         col_neg_H = output.get("column_neg_entropy")
         if col_neg_H is not None:
             out["column_neg_entropy"] = col_neg_H.detach()
             if self.training and self.column_entropy_weight > 0.0:
                 loss = loss + self.column_entropy_weight * col_neg_H
 
-        # ── Row-entropy penalty (sparsity / specialisation) ────────────────
-        # row_entropy = H_row ≥ 0.  Adding it with a POSITIVE weight MINIMISES
-        # H_row, driving each pixel toward a peaked choice over tokens.
+        # ── Row-entropy penalty ────────────────────────────────────────
         row_H = output.get("row_entropy")
         if row_H is not None:
             out["row_entropy"] = row_H.detach()
             if self.training and self.row_entropy_weight > 0.0:
                 loss = loss + self.row_entropy_weight * row_H
 
-        # ── Anti-leakage alignment ────────────────────────────────────────
+        # ── Anti-leakage alignment (delayed) ─────────────────────────
         row_mass = output.get("row_mass")
         complexity = output.get("complexity")
-        if (
+        alignment_active = (
             self.training
             and self.alignment_weight > 0.0
+            and current_epoch >= self.alignment_delay_epochs
             and row_mass is not None
             and complexity is not None
-        ):
+        )
+        if alignment_active:
             align = self._alignment_loss(row_mass, complexity)
             out["alignment_loss"] = align.detach()
             loss = loss + self.alignment_weight * align
+        else:
+            out["alignment_loss"] = torch.zeros((), device=target.device)
 
-        # ── Dictionary-token diversity penalty ────────────────────────────
+        # ── Dictionary-token diversity penalty ─────────────────────────
         dp = output.get("dict_penalty")
         if dp is not None:
             out["dict_penalty"] = dp.detach() if dp.requires_grad else dp
             if self.training and self.dict_penalty_weight > 0.0:
                 loss = loss + self.dict_penalty_weight * dp
 
-        # ── Spatial TV on P (already weight-scaled inside the attention) ───
+        # ── Spatial TV on P ────────────────────────────────────────────
         tv = output.get("tv_loss")
         if tv is not None:
             out["tv_loss"] = tv.detach() if tv.requires_grad else tv
             if self.training:
-                loss = loss + tv  # tv_weight is baked in
+                loss = loss + tv
 
         out["loss"] = loss
         return out
@@ -279,7 +252,6 @@ class RateDistortionLoss(nn.Module):
 
 
 def configure_optimizers(net: nn.Module, args):
-    """Separate main params from entropy-bottleneck quantile params."""
     main_params = [
         p
         for n, p in net.named_parameters()
@@ -311,6 +283,7 @@ def train_one_epoch(
     logger,
     writer,
     accelerator,
+    global_step_offset: int = 0,
 ):
     model.train()
     criterion.train()
@@ -318,10 +291,11 @@ def train_one_epoch(
     rd_meter = AverageMeter()
     aux_meter = AverageMeter()
     bpp_meter = AverageMeter()
-    col_H_meter = AverageMeter()  # H_col   = −column_neg_entropy
-    row_H_meter = AverageMeter()  # H_row   (sparsity penalty target)
-    align_meter = AverageMeter()  # alignment hinge ∈ [0, 1]
+    col_H_meter = AverageMeter()
+    row_H_meter = AverageMeter()
+    align_meter = AverageMeter()
     dict_pen_meter = AverageMeter()
+    warmup_meter = AverageMeter()
 
     pbar = tqdm(
         enumerate(train_dataloader),
@@ -331,13 +305,28 @@ def train_one_epoch(
     )
 
     for i, d in pbar:
+        global_step = global_step_offset + i
+
+        # rate_warmup: linear ramp from 0.1 → 1.0 over criterion.warmup_steps
+        # Prevents cc_scale_transforms from collapsing to min_clamp (0.11) in
+        # the first few epochs when the rate gradient is very strong.
+        rate_warmup = float(
+            min(1.0, 0.1 + 0.9 * global_step / max(1, criterion.warmup_steps))
+        )
+        warmup_meter.update(rate_warmup)
+
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
         out_net = model(d)
-        out_criterion = criterion(out_net, d)
+        out_criterion = criterion(
+            out_net,
+            d,
+            rate_warmup=rate_warmup,
+            current_epoch=epoch,
+        )
 
-        # ── Pass 1: RD loss ────────────────────────────────────────────────
+        # Pass 1: RD loss
         accelerator.backward(out_criterion["loss"])
         if clip_max_norm > 0:
             main_params = [
@@ -346,7 +335,7 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
         optimizer.step()
 
-        # ── Pass 2: aux loss (entropy bottleneck CDF) ──────────────────────
+        # Pass 2: aux loss (entropy bottleneck CDF)
         accelerator.backward(out_net["aux_loss"])
         aux_optimizer.step()
 
@@ -355,7 +344,6 @@ def train_one_epoch(
         bpp_meter.update(out_criterion["bpp_loss"].item())
 
         if "column_neg_entropy" in out_criterion:
-            # log H_col (positive) for readability
             col_H_meter.update(-out_criterion["column_neg_entropy"].item())
         if "row_entropy" in out_criterion:
             row_H_meter.update(out_criterion["row_entropy"].item())
@@ -364,12 +352,14 @@ def train_one_epoch(
         if "dict_penalty" in out_criterion:
             dict_pen_meter.update(out_criterion["dict_penalty"].item())
 
+        align_active = epoch >= criterion.alignment_delay_epochs
         pbar.set_postfix(
             rd=f"{rd_meter.avg:.4f}",
             bpp=f"{bpp_meter.avg:.4f}",
+            rw=f"{rate_warmup:.2f}",
             Hc=f"{col_H_meter.avg:.2f}",
             Hr=f"{row_H_meter.avg:.2f}",
-            al=f"{align_meter.avg:.3f}",
+            al=f"{align_meter.avg:.3f}" + ("" if align_active else "(off)"),
         )
 
         if accelerator.is_main_process and i % 100 == 0:
@@ -378,12 +368,13 @@ def train_one_epoch(
                 writer.add_scalar("Train/RD_Loss", rd_meter.avg, step)
                 writer.add_scalar("Train/Aux_Loss", aux_meter.avg, step)
                 writer.add_scalar("Train/Bpp", bpp_meter.avg, step)
+                writer.add_scalar("Train/Rate_Warmup", warmup_meter.avg, step)
                 writer.add_scalar("Train/H_col_bits", col_H_meter.avg, step)
                 writer.add_scalar("Train/H_row_bits", row_H_meter.avg, step)
                 writer.add_scalar("Train/Alignment_hinge", align_meter.avg, step)
                 writer.add_scalar("Train/Dict_Penalty", dict_pen_meter.avg, step)
 
-    return rd_meter.avg
+    return rd_meter.avg, global_step_offset + len(train_dataloader)
 
 
 # ---------------------------------------------------------------------------
@@ -397,80 +388,57 @@ def _sync():
 
 
 def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> float:
-    """
-    PSNR gap between the EXACT signal seen by the optimiser and the EXACT
-    signal produced by the deployed codec.
-
-        gap = psnr_train_forward  −  psnr_compressed
-
-    where
-      • psnr_train_forward  : model.train(), use_ste=False  → additive uniform
-                              noise quantisation (the gradient path).
-      • psnr_compressed     : model.eval(),                  → real arithmetic
-                              encode → decode → reconstruct (the bitstream).
-
-    Why this signature
-    ------------------
-    The pre-refactor implementation compared model.eval()+STE (hard rounding)
-    against compress/decompress (also hard rounding) — by construction the
-    two paths use the SAME quantiser, so the gap was reported as 0.000 dB
-    every val while the true train-vs-eval gap was ~1.7 dB.  Comparing
-    train()+noise against eval()+arith makes the metric report the gap that
-    the audit found:  the cost of training under a relaxed quantiser.
-
-    Returns
-    -------
-    gap_db : float (positive → optimiser is more optimistic than deployment)
-    """
     d = batch.to(device).float()
-
     prev_training = model.training
     prev_use_ste = model.use_ste
 
     try:
-        # ── Pass 1: training-mode forward (noise quantisation) ───────────
-        # This is the EXACT pipeline the optimiser sees.  No torch.no_grad
-        # wrapper around the forward itself would be fine for PSNR-only
-        # measurement, but we keep grad off to avoid building the graph.
         model.train(True)
         model.use_ste = False
         with torch.no_grad():
             out_train = model(d)
             x_hat_train = out_train["x_hat"].clamp(0, 1)
+            if torch.isnan(x_hat_train).any():
+                return float("nan")
             mse_train = F.mse_loss(d, x_hat_train).item()
             psnr_train = -10.0 * math.log10(mse_train) if mse_train > 0 else 100.0
 
-        # ── Pass 2: eval-mode compress / decompress (real arith coding) ──
         model.eval()
         model.use_ste = False
         with torch.no_grad():
-            model.update(force=True)  # rebuild CDF tables before any compress()
+            model.update(force=True)
             _sync()
             out_enc = model.compress(d)
             _sync()
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
             x_hat_dec = out_dec["x_hat"].clamp(0, 1)
+            if torch.isnan(x_hat_dec).any():
+                return float("nan")
             mse_dec = F.mse_loss(d, x_hat_dec).item()
             psnr_dec = -10.0 * math.log10(mse_dec) if mse_dec > 0 else 100.0
 
     finally:
-        # Always restore original state — even on exception
         model.train(prev_training)
         model.use_ste = prev_use_ste
 
     return psnr_train - psnr_dec
 
 
-def _bytes_from_strings(strings) -> int:
-    """Sum byte length over the nested 'strings' structure returned by compress()."""
-    n = 0
-    for s_or_list in strings:
-        if isinstance(s_or_list, (list, tuple)):
-            for s in s_or_list:
-                n += len(s)
-        else:
-            n += len(s_or_list)
-    return n
+def _bytes_from_strings(obj) -> int:
+    """
+    Recursively sum byte-lengths of all bytes objects in nested structure.
+    Structure of out_enc["strings"]:
+        [y_strings, z_strings]
+        y_strings = [[b_s0_img0, b_s0_img1, ...],   # slice 0
+                     [b_s1_img0, b_s1_img1, ...],   # slice 1
+                     ...]                             # num_slices lists
+        z_strings = [b_z_img0, b_z_img1, ...]
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return len(obj)
+    if isinstance(obj, (list, tuple)):
+        return sum(_bytes_from_strings(item) for item in obj)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -489,45 +457,24 @@ def test_epoch(
     gap_check: bool = False,
     real_bytes_batches: int = 5,
 ):
-    """
-    Validation epoch with TWO measurements per batch:
-
-      • Fast pass (every batch): forward() in eval mode → PSNR_est, BPP_est
-        from likelihood entropy.  This is what the original implementation
-        reported and what the val log used to track.  Cheap, gradient-free.
-
-      • Real pass (first `real_bytes_batches` batches only):
-            compress(d) → arithmetic encode → byte_strings, shape
-            decompress(strings, shape) → x_hat_real
-            BPP_real = total_bits / num_pixels
-            PSNR_real = −10·log10(MSE(x, x_hat_real))
-        This is the EXACT bitstream the deployed codec produces and is
-        what eval.py reports — putting it inside the val loop closes the
-        feedback loop on the optimiser (the audit found a 1.66 dB gap
-        between the fast PSNR and the real one).
-
-    real_bytes_batches=0 disables the slow pass entirely.
-    """
     model.eval()
     criterion.eval()
 
-    psnr_meter = AverageMeter()  # forward (estimated) PSNR
-    bpp_meter = AverageMeter()  # estimated BPP from likelihoods
+    psnr_meter = AverageMeter()
+    bpp_meter = AverageMeter()
     loss_meter = AverageMeter()
-    col_H_meter = AverageMeter()  # H_col
-    row_H_meter = AverageMeter()  # H_row
-    align_meter = AverageMeter()  # alignment hinge
+    col_H_meter = AverageMeter()
+    row_H_meter = AverageMeter()
+    align_meter = AverageMeter()
     dict_pen_meter = AverageMeter()
 
-    # Real-bytes meters (rank-0 only, since compress is sequential per image)
     real_psnr_meter = AverageMeter()
     real_bpp_meter = AverageMeter()
-    bpp_gap_meter = AverageMeter()  # real_bpp − est_bpp (sign of mis-cal)
+    bpp_gap_meter = AverageMeter()
 
     gap_psnr: float = float("nan")
+    nan_batches: int = 0
 
-    # Rebuild entropy tables on the underlying model on every rank.
-    # Required before ANY compress()/decompress() call below.
     accelerator.unwrap_model(model).update(force=True)
 
     real_done = 0
@@ -539,10 +486,20 @@ def test_epoch(
                 desc=f"Val Epoch {epoch}",
                 disable=not accelerator.is_local_main_process,
             ):
-                # ── Fast pass: forward only, on every rank ────────────────
+                # Fast pass
                 out_net = model(d)
-                out_criterion = criterion(out_net, d)
+                out_criterion = criterion(
+                    out_net,
+                    d,
+                    rate_warmup=1.0,  # full rate in val
+                    current_epoch=epoch,
+                )
                 x_hat = out_net["x_hat"].clamp_(0, 1)
+
+                # NaN guard: if decoder produces NaN, skip quality metrics
+                if torch.isnan(x_hat).any():
+                    nan_batches += 1
+                    continue
 
                 if i == 0 and accelerator.is_main_process and writer is not None:
                     n = min(d.size(0), 4)
@@ -561,6 +518,7 @@ def test_epoch(
 
                 bpp_val = out_criterion["bpp_loss"].item()
                 loss_val = out_criterion["loss"].item()
+
                 if "column_neg_entropy" in out_criterion:
                     col_H_meter.update(
                         -out_criterion["column_neg_entropy"].item(), d.size(0)
@@ -589,14 +547,17 @@ def test_epoch(
                 bpp_meter.update(gathered[:, 1].mean().item(), gathered.size(0))
                 loss_meter.update(gathered[:, 2].mean().item(), gathered.size(0))
 
-                # ── Slow pass: arithmetic-coded round-trip ────────────────
-                # Run on every rank; gather later.  The first
-                # `real_bytes_batches` batches per rank participate.
+                # Slow pass: real arithmetic codec round-trip
                 if real_done < real_bytes_batches:
                     unwrapped = accelerator.unwrap_model(model)
                     out_enc = unwrapped.compress(d)
                     out_dec = unwrapped.decompress(out_enc["strings"], out_enc["shape"])
                     x_hat_real = out_dec["x_hat"].clamp(0, 1)
+
+                    if torch.isnan(x_hat_real).any():
+                        real_done += 1
+                        continue
+
                     mse_real = F.mse_loss(x_hat_real, d, reduction="none").mean(
                         dim=(1, 2, 3)
                     )
@@ -650,22 +611,34 @@ def test_epoch(
     if accelerator.is_main_process:
         real_str = ""
         if real_psnr_meter.count > 0:
+            delta_sign = "+" if bpp_gap_meter.avg >= 0 else ""
             real_str = (
                 f" | REAL PSNR: {real_psnr_meter.avg:.2f} dB"
                 f" | REAL BPP: {real_bpp_meter.avg:.4f}"
-                f" | ΔBPP(real-est): {bpp_gap_meter.avg:+.4f}"
+                f" | ΔBPP(real-est): {delta_sign}{bpp_gap_meter.avg:.4f}"
             )
+        nan_str = f" | NaN batches: {nan_batches}" if nan_batches > 0 else ""
         gap_str = (
             f" | Train/Infer ΔPSNR: {gap_psnr:+.3f} dB"
             if not math.isnan(gap_psnr)
             else ""
         )
+
+        # Sanity check: ΔBPP(real-est) must be positive (real ≥ estimated)
+        if real_bpp_meter.count > 0 and bpp_gap_meter.avg < -0.05:
+            if logger:
+                logger.warning(
+                    f"ΔBPP(real-est) = {bpp_gap_meter.avg:.4f} < 0. "
+                    "This indicates _bytes_from_strings is undercounting. "
+                    "Check that the recursive version is in use."
+                )
+
         if logger:
             logger.info(
                 f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} "
                 f"| PSNR(est): {psnr_meter.avg:.2f} dB "
                 f"| BPP(est): {bpp_meter.avg:.4f}"
-                f"{real_str}{gap_str}"
+                f"{real_str}{gap_str}{nan_str}"
             )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
@@ -675,6 +648,7 @@ def test_epoch(
             writer.add_scalar("Val/H_row_bits", row_H_meter.avg, epoch)
             writer.add_scalar("Val/Alignment_hinge", align_meter.avg, epoch)
             writer.add_scalar("Val/Dict_Penalty", dict_pen_meter.avg, epoch)
+            writer.add_scalar("Val/NaN_batches", nan_batches, epoch)
             if real_psnr_meter.count > 0:
                 writer.add_scalar("Val/PSNR_real", real_psnr_meter.avg, epoch)
                 writer.add_scalar("Val/Bpp_real", real_bpp_meter.avg, epoch)
@@ -706,96 +680,55 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     p.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
-    p.add_argument(
-        "--lambda",
-        dest="lmbda",
-        type=float,
-        required=True,
-        help=(
-            "RD tradeoff λ.\n"
-            "  MSE    (--metric mse)    : 0.0018, 0.0035, 0.013, 0.05\n"
-            "  MS-SSIM (--metric ms-ssim): 2.4, 4.58, 8.73, 16.64, 31.73, 115.37\n"
-            "WARNING: using a wrong λ range silently trains a broken model."
-        ),
-    )
+    p.add_argument("--lambda", dest="lmbda", type=float, required=True)
     p.add_argument("--patch-size", type=int, default=256)
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--metric", type=str, default="mse", choices=["mse", "ms-ssim"])
+
+    # Dictionary-routing regularisers
+    p.add_argument("--column-entropy-weight", type=float, default=0.01)
+    p.add_argument("--row-entropy-weight", type=float, default=0.05)
+    p.add_argument("--alignment-weight", type=float, default=0.2)
+    p.add_argument("--dict-penalty-weight", type=float, default=0.1)
+
+    # Training stability
     p.add_argument(
-        "--metric",
-        type=str,
-        default="mse",
-        choices=["mse", "ms-ssim"],
-    )
-    # ── Dictionary-routing regularisers ─────────────────────────────────
-    # All four are in commensurate units (bits or [0,1]) so the weights are
-    # fixed — no EMA adaptive scaling.  See RateDistortionLoss docstring for
-    # the mutual-information derivation.
-    p.add_argument(
-        "--column-entropy-weight",
-        type=float,
-        default=0.01,
+        "--warmup-steps",
+        type=int,
+        default=2000,
+        dest="warmup_steps",
         help=(
-            "β_col: weight on column_neg_entropy = −H_col (bits). "
-            "Positive → MAXIMISE H_col (anti-dead-code).  Set 0 to disable."
+            "Number of global steps over which to ramp the BPP loss weight "
+            "from 0.1× to 1.0×. Prevents cc_scale_transforms from collapsing "
+            "to min_clamp in early training. Default: 2000."
         ),
     )
     p.add_argument(
-        "--row-entropy-weight",
-        type=float,
-        default=0.05,
+        "--alignment-delay-epochs",
+        type=int,
+        default=50,
+        dest="alignment_delay_epochs",
         help=(
-            "β_row: weight on row_entropy = H_row (bits). "
-            "Positive → MINIMISE H_row (sparse per-pixel selection).  "
-            "Together with β_col this maximises I(pixel ; token) and was "
-            "MISSING in the pre-refactor loss → dictionary collapsed to "
-            "100% utilisation on every slice.  Set 0 to disable."
+            "Epoch at which to activate the anti-leakage alignment loss. "
+            "Keep at 0 to disable the delay. Default: 50."
         ),
     )
-    p.add_argument(
-        "--alignment-weight",
-        type=float,
-        default=0.2,
-        help=(
-            "γ: weight on the anti-leakage hinge "
-            "ReLU(−Pearson(row_mass, complexity)).  Penalises only the "
-            "wrong-sign correlation — zero on data already aligned. "
-            "The failed checkpoint had corr = −0.66 (UEOT leakage).  "
-            "Set 0 to disable."
-        ),
-    )
-    p.add_argument(
-        "--dict-penalty-weight",
-        type=float,
-        default=0.1,
-        help=(
-            "δ: weight on the off-diagonal cosine-similarity penalty on the "
-            "dictionary tokens (∈ [0, 1] by construction).  Encourages "
-            "TOKEN diversity (orthogonal basis vectors) — orthogonal concern "
-            "from per-pixel sparsity.  Set 0 to disable."
-        ),
-    )
+
+    # Model architecture
     p.add_argument("--ot-eps", type=float, default=0.1)
-    p.add_argument(
-        "--marginal-div",
-        type=str,
-        default="kl",
-        choices=["kl", "tv"],
-        help="Marginal divergence for unbalanced_eot: 'kl' (smooth) or 'tv' (sharp gating).",
-    )
+    p.add_argument("--marginal-div", type=str, default="kl", choices=["kl", "tv"])
     p.add_argument(
         "--backbone",
         type=str,
         default="fdm",
         choices=["fdm", "cnn", "swin", "ss2d", "fdm_reversed"],
-        help="Encoder/decoder backbone block (default: fdm = FrequencyDisentangledMamba).",
     )
     p.add_argument(
         "--use-dense-concat",
         action="store_true",
         default=False,
         dest="use_dense_concat",
-        help="Replace stateful Markov memory with dense channel-autoregressive concat.",
     )
     p.add_argument(
         "--memory-init",
@@ -803,30 +736,24 @@ def parse_args():
         default="bootstrap",
         choices=["bootstrap", "zero"],
         dest="memory_init",
-        help="How to initialise M_1: 'bootstrap' (learned Conv projection) or 'zero'.",
     )
     p.add_argument(
         "--content-adaptive",
         action="store_true",
         default=False,
         dest="use_content_adaptive",
-        help="Use content-adaptive K-means token permutation in Mamba blocks.",
     )
-    p.add_argument(
-        "--cluster-num",
-        type=int,
-        default=8,
-        dest="cluster_num",
-        help="Number of clusters for content-adaptive K-means tokenization.",
-    )
+    p.add_argument("--cluster-num", type=int, default=8, dest="cluster_num")
     p.add_argument("--sinkhorn-iters", type=int, default=20)
+
+    # LR schedule
     p.add_argument("--lr-milestones", type=int, nargs="+", default=[360, 380])
     p.add_argument("--lr-gamma", type=float, default=0.1)
     p.add_argument(
         "--last-epochs-with-ste",
         type=int,
         default=20,
-        help="Final epochs to train with STE instead of noise relaxation. 0=disabled.",
+        help="Final N epochs to train with STE. 0=disabled.",
     )
     p.add_argument(
         "--gap-check-interval",
@@ -838,20 +765,20 @@ def parse_args():
         "--real-bytes-batches",
         type=int,
         default=5,
-        help=(
-            "Number of val batches PER RANK on which to run the full "
-            "compress→decompress arithmetic-coding round-trip during "
-            "every val epoch.  Reports REAL bpp and REAL PSNR alongside "
-            "the entropy-estimate metrics so the audit-blindness fixed "
-            "by this refactor stays fixed.  Set 0 to disable (faster val)."
-        ),
+        help="Val batches per rank for full compress→decompress round-trip. 0=disabled.",
     )
     p.add_argument("--seed", type=int, default=2026)
     return p.parse_args()
 
 
 def worker_init_fn(worker_id: int):
-    worker_seed = torch.initial_seed() % 2**32
+    """
+    Add worker_id offset so each DataLoader worker
+    gets a distinct seed. Without the offset, torch.initial_seed() returns
+    the same value for all workers → identical augmentation sequences →
+    effective dataset diversity reduced by num_workers×.
+    """
+    worker_seed = (torch.initial_seed() + worker_id) % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
     torch.manual_seed(worker_seed)
@@ -873,9 +800,6 @@ def main():
         raise ValueError(
             f"--patch-size must be a multiple of 64, got {args.patch_size}."
         )
-    # After the routing-mode-aware parameter cleanup, ALL registered params
-    # are reached by the forward graph regardless of regulariser weights, so
-    # find_unused_parameters=False is correct (and ~10-15% faster on DDP).
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
 
@@ -958,6 +882,8 @@ def main():
         row_entropy_weight=args.row_entropy_weight,
         alignment_weight=args.alignment_weight,
         dict_penalty_weight=args.dict_penalty_weight,
+        warmup_steps=args.warmup_steps,
+        alignment_delay_epochs=args.alignment_delay_epochs,
     ).to(accelerator.device)
 
     (
@@ -980,22 +906,16 @@ def main():
 
     start_epoch = 0
     best_loss = float("inf")
+    global_step = 0  # tracks total training steps across epochs for rate_warmup
 
     # ── Resume ────────────────────────────────────────────────────────────────
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        # strict=False: routing-mode-aware parameter cleanup means a checkpoint
-        # trained as 'unbalanced_eot' has log_rho_col / rho_predictors keys that
-        # are unexpected for a 'softmax' resume (and vice versa).  Surface the
-        # delta as a warning instead of aborting.
         missing, unexpected = accelerator.unwrap_model(model).load_state_dict(
             ckpt["state_dict"], strict=False
         )
         if accelerator.is_main_process and (missing or unexpected):
-            print(
-                f"[resume] missing={len(missing)} unexpected={len(unexpected)} "
-                f"(routing-mode change between checkpoint and current args?)"
-            )
+            print(f"[resume] missing={len(missing)} unexpected={len(unexpected)}")
         optimizer.load_state_dict(ckpt["optimizer"])
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
@@ -1003,23 +923,34 @@ def main():
             aux_scheduler.load_state_dict(ckpt["aux_scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("best_loss", float("inf"))
+        global_step = ckpt.get("global_step", start_epoch * len(train_loader))
         if "criterion" in ckpt:
-            # strict=False: old checkpoints stored EMA buffers (ema_bpp,
-            # ema_disp, ema_steps) that the refactored criterion no longer
-            # owns.  Drop them silently rather than aborting the resume.
             criterion.load_state_dict(ckpt["criterion"], strict=False)
         if logger:
             logger.info(
-                f"Resumed from epoch {start_epoch - 1} (best_loss={best_loss:.4f})"
+                f"Resumed from epoch {start_epoch - 1} "
+                f"(best_loss={best_loss:.4f}, global_step={global_step})"
             )
 
-    # ── Per-lambda summary ─────────────────────────────────────────────────────
     summary_path = os.path.join(save_dir, "training_summary.json")
     summary: dict = {}
 
+    # ── Log training config ───────────────────────────────────────────────────
+    if accelerator.is_main_process and logger:
+        logger.info(
+            f"Training config: λ={args.lmbda}, metric={args.metric}, "
+            f"routing={args.routing_mode}, backbone={args.backbone}, "
+            f"warmup_steps={args.warmup_steps}, "
+            f"alignment_delay={args.alignment_delay_epochs} epochs"
+        )
+
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
-        ste_active = epoch >= args.epochs - args.last_epochs_with_ste
+        # STE activation
+        ste_active = (
+            args.last_epochs_with_ste > 0
+            and epoch >= args.epochs - args.last_epochs_with_ste
+        )
         accelerator.unwrap_model(model).use_ste = ste_active
         if (
             accelerator.is_main_process
@@ -1031,7 +962,7 @@ def main():
                 f"(epoch {epoch} → {args.epochs - 1})."
             )
 
-        train_one_epoch(
+        _, global_step = train_one_epoch(
             model,
             criterion,
             train_loader,
@@ -1042,6 +973,7 @@ def main():
             logger,
             writer,
             accelerator,
+            global_step_offset=global_step,
         )
 
         run_gap = (
@@ -1066,6 +998,7 @@ def main():
             state = {
                 "epoch": epoch,
                 "best_loss": best_loss,
+                "global_step": global_step,
                 "state_dict": accelerator.unwrap_model(model).state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "aux_optimizer": aux_optimizer.state_dict(),
@@ -1087,6 +1020,7 @@ def main():
                 summary[f"epoch_{epoch}"] = {
                     "test_loss": round(test_loss, 4),
                     "gap_psnr_db": round(gap_psnr, 3),
+                    "global_step": global_step,
                 }
                 with open(summary_path, "w") as f:
                     json.dump(
