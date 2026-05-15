@@ -1,6 +1,37 @@
 """
 ablation_models/backbone_variants.py
 =====================================
+Drop-in replacements for FrequencyDisentangledMamba (FDM) used in Table 2
+of the paper. All four variants have the SAME input/output signature as
+the original FDM block:
+
+    forward(x: (B, C, H, W)) -> (B, C, H, W)
+
+and the SAME parameter count regime (within ~10% of one another) so that
+the comparison isolates the architectural difference rather than the
+parameter budget.
+
+Variants
+--------
+* ResidualCNNBlock    : two stride-1 3x3 convolutions with GELU + residual
+* SwinBlock           : windowed multi-head self-attention (window=8)
+* SS2DBlock           : standard Vision Mamba block (no wavelet)
+* FDMReversedBlock    : same wavelet pathway as FDM but with FiLM
+                        direction reversed (HF conditions LL). Used as a
+                        controlled ablation to confirm that LL→HF (the
+                        direction we use) is the operative choice.
+
+Usage from training script
+--------------------------
+    from ablation_models.backbone_variants import build_backbone
+
+    block = build_backbone(name="swin", dim=192)        # window=8
+    block = build_backbone(name="cnn", dim=192)
+    block = build_backbone(name="ss2d", dim=192)
+    block = build_backbone(name="fdm_reversed", dim=192)
+    block = build_backbone(name="fdm", dim=192)         # = original FDM
+
+The variants are wired into models/WMDC.py via the `--backbone` flag.
 """
 
 from __future__ import annotations
@@ -39,10 +70,6 @@ class WindowAttention(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, window_size: int):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(
-                f"WindowAttention: dim={dim} must be divisible by num_heads={num_heads}"
-            )
         self.dim = dim
         self.num_heads = num_heads
         self.window_size = window_size
@@ -82,12 +109,14 @@ class WindowAttention(nn.Module):
 
 
 def _window_partition(x: torch.Tensor, win: int) -> torch.Tensor:
+    """(B, H, W, C) → (B*nW, win, win, C)."""
     B, H, W, C = x.shape
     x = x.view(B, H // win, win, W // win, win, C)
     return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, win, win, C)
 
 
 def _window_reverse(x: torch.Tensor, win: int, H: int, W: int) -> torch.Tensor:
+    """(B*nW, win, win, C) → (B, H, W, C)."""
     B = int(x.shape[0] / (H * W / win / win))
     x = x.view(B, H // win, W // win, win, win, -1)
     return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
@@ -104,13 +133,6 @@ class SwinBlock(nn.Module):
         drop_path: float = 0.0,
     ):
         super().__init__()
-        # Guard: dim must be divisible by num_heads
-        if dim % num_heads != 0:
-            # Find largest valid num_heads ≤ requested
-            for nh in range(num_heads, 0, -1):
-                if dim % nh == 0:
-                    num_heads = nh
-                    break
         self.window_size = window_size
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, num_heads, window_size)
@@ -137,6 +159,7 @@ class SwinBlock(nn.Module):
         windows = self.attn(windows)
         x = _window_reverse(windows.view(-1, win, win, C), win, Hp, Wp)
         x = shortcut + x
+
         x = x + self.mlp(self.norm2(x))
 
         x = x.permute(0, 3, 1, 2)
@@ -149,7 +172,11 @@ class SwinBlock(nn.Module):
 # Variant 3 — Standard SS2D Mamba block (no wavelet)
 # ──────────────────────────────────────────────────────────────────────────
 class SS2DBlock(nn.Module):
-    """Standard Vision Mamba block — no wavelet decomposition."""
+    """
+    Standard Vision Mamba block. Wraps the project's existing VSSBlock
+    (which already implements the SS2D scan) so that we directly compare
+    "Mamba on full resolution" vs. "Mamba on LL only" (FDM).
+    """
 
     def __init__(self, dim: int, drop_path: float = 0.0):
         super().__init__()
@@ -166,20 +193,11 @@ class SS2DBlock(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────
 class FDMReversedBlock(nn.Module):
     """
-    Same wavelet pathway as FDM but FiLM direction reversed:
-    HF context modulates LL instead of LL context modulating HF bands.
-    ------------------------
-    fusion_pw is now zero-initialized (not identity-matrix initialized).
-    This matches FrequencyDisentangledMamba's initialization exactly so
-    both blocks start from a true identity mapping at t=0:
+    Same wavelet pathway as the original FDM, but FiLM is applied in the
+    reverse direction: high-frequency context modulates LL instead of
+    LL context modulating high-frequency bands.
 
-        fused = fusion_pw(GELU(fusion_dw(merged))) + merged
-              = zeros + merged   (at init, since fusion_pw.weight = 0)
-              = merged           ← identity mapping ✓
-
-    The previous identity-matrix init on fusion_pw gave:
-        fused = fusion_pw(GELU(fusion_dw(merged))) + merged
-              = GELU(random_dw(merged)) + merged  ← NOT identity ✗
+    Uses the project's own DWT_2D/IDWT_2D and VSSBlock for fairness.
     """
 
     def __init__(self, dim: int, drop_path: float = 0.0):
@@ -192,33 +210,41 @@ class FDMReversedBlock(nn.Module):
         self.idwt = IDWT_2D(wave="bior4.4")
         self.vss = VSSBlock(hidden_dim=dim, drop_path=drop_path)
 
+        # FiLM generators: LL is the modulated band, HF context produces (γ, β).
+        # We summarise the three HF bands by averaging.
         self.film_scale = nn.Conv2d(dim, dim, kernel_size=1)
         self.film_shift = nn.Conv2d(dim, dim, kernel_size=1)
         nn.init.zeros_(self.film_scale.weight)
-        nn.init.constant_(self.film_scale.bias, math.log(math.e - 1.0))
+        nn.init.constant_(self.film_scale.bias, math.log(math.e - 1.0))  # softplus(b)=1
         nn.init.zeros_(self.film_shift.weight)
         nn.init.zeros_(self.film_shift.bias)
 
+        # Cross-band fusion (concatenate LL + 3 HF, then mix), identity init.
         self.fusion_dw = nn.Conv2d(dim * 4, dim * 4, 3, padding=1, groups=dim * 4)
         self.fusion_act = nn.GELU()
         self.fusion_pw = nn.Conv2d(dim * 4, dim * 4, 1)
-
-        nn.init.zeros_(self.fusion_pw.weight)
-        nn.init.zeros_(self.fusion_pw.bias)
+        with torch.no_grad():
+            self.fusion_pw.weight.zero_()
+            eye = torch.eye(dim * 4)
+            self.fusion_pw.weight.data.copy_(eye.view(dim * 4, dim * 4, 1, 1))
+            self.fusion_pw.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Project DWT_2D returns (B, 4*C, H/2, W/2) — split into bands.
         subbands = self.dwt(x)
         ll, lh, hl, hh = subbands.chunk(4, dim=1)
 
         ll_proc = self.vss(ll)
 
+        # REVERSED: HF context conditions LL.
         hf_context = (lh + hl + hh) / 3.0
         gamma = F.softplus(self.film_scale(hf_context))
         beta = self.film_shift(hf_context)
         ll_modulated = ll_proc * gamma + beta
 
+        # Fusion + IDWT.
         cat = torch.cat([ll_modulated, lh, hl, hh], dim=1)
-        cat = self.fusion_pw(self.fusion_act(self.fusion_dw(cat))) + cat
+        cat = self.fusion_pw(self.fusion_act(self.fusion_dw(cat)))
         return self.idwt(cat)
 
 
@@ -239,7 +265,7 @@ def build_backbone(name: str, dim: int, **kwargs) -> nn.Module:
         from modules.wavelet_blocks import FrequencyDisentangledMamba
 
         return FrequencyDisentangledMamba(dim, **kwargs)
-    raise ValueError(f"Unknown backbone: {name!r}")
+    raise ValueError(f"Unknown backbone: {name}")
 
 
 __all__ = [

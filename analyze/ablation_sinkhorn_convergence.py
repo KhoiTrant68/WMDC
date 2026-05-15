@@ -199,13 +199,6 @@ def main():
     p.add_argument("-o", "--output", type=str, default="sinkhorn_convergence.pdf")
     p.add_argument("--json-out", type=str, default=None)
     p.add_argument("--cuda", action="store_true")
-    p.add_argument(
-        "--content-adaptive",
-        action="store_true",
-        dest="use_content_adaptive",
-        help="Match checkpoint trained with ContentAdaptiveVSSBlock.",
-    )
-    p.add_argument("--cluster-num", type=int, default=8, dest="cluster_num")
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -216,8 +209,6 @@ def main():
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.max_iters,
-        use_content_adaptive=args.use_content_adaptive,
-        cluster_num=args.cluster_num,
         update_for_inference=True,
     )
     _x, x_padded, _H, _W = load_image(args.image, device=device)

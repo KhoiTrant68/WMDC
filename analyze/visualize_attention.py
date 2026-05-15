@@ -83,8 +83,6 @@ def main():
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
-        use_content_adaptive=args.use_content_adaptive,
-        cluster_num=args.cluster_num,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device)

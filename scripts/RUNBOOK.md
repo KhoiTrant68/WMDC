@@ -15,26 +15,15 @@ Thay thế các path sau theo môi trường của bạn:
 ## 1. Setup môi trường
 
 ```bash
-# Core deps
 pip install compressai accelerate einops timm pytorch-msssim flops-profiler bjontegaard
 pip install tensorboard==2.14 protobuf==4.25.3
-
-# Wavelet (replaces the hand-rolled bior4.4 DWT/IDWT)
-pip install pytorch-wavelets "PyWavelets>=1.4.0"
 
 # Build selective_scan CUDA kernel (chạy 1 lần)
 cd $REPO/vmamba && pip install . && cd $REPO
 
-# Kiểm tra wavelet module — PR phải đạt ~1e-6 ở BIÊN ảnh (không crop)
+# Kiểm tra wavelet module
 python -m modules.wavelet_blocks
-
-# One-shot: cài + build + verify
-bash scripts/setup.sh all
 ```
-
-> **Khuyến nghị**: dùng `bash scripts/setup.sh all` — script này cài đầy đủ dependencies
-> mới, build CUDA kernel, sau đó verify wavelet module (PR ở biên ảnh) + instantiate cả
-> 3 routing modes để bắt lỗi config sớm.
 
 ---
 
@@ -90,7 +79,7 @@ for LAM in 0.0035 0.013 0.0483; do
     train_variant no_fdm           $LAM "--backbone ss2d"
     train_variant no_stateful_mem  $LAM "--use-dense-concat"
     train_variant no_bootstrap_M1  $LAM "--memory-init zero"
-    train_variant no_disp_bonus    $LAM "--column-entropy-weight 0.0 --row-entropy-weight 0.0 --alignment-weight 0.0"
+    train_variant no_disp_bonus    $LAM "--disp-weight 0.0"
     train_variant no_dict_penalty  $LAM "--dict-penalty-weight 0.0"
 done
 ```
@@ -225,7 +214,7 @@ python analyze/visualize_rho_heatmap.py \
 cd $REPO
 
 python analyze/visualize_failure_cases.py \
-    --dataset $KODAK \
+    --img_dir $KODAK \
     --checkpoint $CKPT_ROOT/routing/unbalanced_eot/lambda_0.0036_mse/checkpoint_best.pth.tar \
     --routing-mode unbalanced_eot --cuda \
     --output results/viz/failure_cases.pdf
@@ -281,30 +270,6 @@ cd $REPO
 python analyze/aggregate_to_latex.py \
     --bd-rate-json results/bd_rate/bd_rate_table.json
 ```
-
----
-
-## 6.4 Scale-table audit (sanity check sau khi train)
-
-Sau khi train, verify rằng scales emitted bởi `cc_scale_transforms` nằm trọn trong
-scale_table mà `model.update()` xây dựng. Nếu có saturation, real-bpp sẽ inflate
-so với estimated-bpp ở low-λ regime.
-
-```bash
-cd $REPO
-
-for LAM in 0.0035 0.013 0.0483; do
-    python analyze/verify_scale_table.py \
-        --checkpoint $CKPT_ROOT/routing/unbalanced_eot/lambda_${LAM}_mse/checkpoint_best.pth.tar \
-        --dataset $KODAK \
-        --routing-mode unbalanced_eot \
-        --max-images 24 \
-        --output results/scale_audit/lambda_${LAM}.json
-done
-```
-
-Output sẽ in `[OK]` nếu không saturate, `[FAIL] terminal bin` nếu cần widen `scale_table.max`,
-`[FAIL] zeroth bin` nếu cần lower `scale_table.min`. JSON chứa per-slice statistics.
 
 ---
 

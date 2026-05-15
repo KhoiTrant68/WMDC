@@ -144,7 +144,6 @@ run_evaluate() {
             --output "$out" \
             --routing-mode unbalanced_eot \
             $eval_flags \
-            $CA_FLAGS \
             --cuda
 
         echo "[done] $variant → $out"

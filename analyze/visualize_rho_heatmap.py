@@ -125,13 +125,6 @@ def main():
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument("--output", type=str, default="rho_heatmap.pdf")
     p.add_argument("--cuda", action="store_true")
-    p.add_argument(
-        "--content-adaptive",
-        action="store_true",
-        dest="use_content_adaptive",
-        help="Match checkpoint trained with ContentAdaptiveVSSBlock.",
-    )
-    p.add_argument("--cluster-num", type=int, default=8, dest="cluster_num")
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -141,8 +134,6 @@ def main():
         device,
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
-        use_content_adaptive=args.use_content_adaptive,
-        cluster_num=args.cluster_num,
         update_for_inference=True,
     )
 

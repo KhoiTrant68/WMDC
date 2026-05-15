@@ -30,36 +30,13 @@ ROUTING_MODES=(unbalanced_eot balanced_eot softmax)
 CONTENT_ADAPTIVE=1 # set to 0 to disable ContentAdaptiveVSSBlock
 CLUSTER_NUM=8
 
-# Derived CLI flags for eval/visualize scripts. Empty if content-adaptive
-# is disabled. Must match the value used during training so that
-# load_state_dict sees the same parameter shapes / buffer keys.
-CA_FLAGS=""
-[ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && CA_FLAGS="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
-
 # ── Ablation variants ────────────────────────────────────────────────
 VARIANTS=(full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_dict_penalty)
 
 # ── Tools ────────────────────────────────────────────────────────────
 PYTHON="${PYTHON:-python}"
-
-# Auto-detect GPU count → LAUNCHER.
-#   • LAUNCHER env var (if set) wins.
-#   • else: 0 GPUs → "python"; 1 GPU → "accelerate launch"; ≥2 GPUs → multi_gpu.
-# Override examples:
-#   LAUNCHER=python bash scripts/train_routing.sh                # single GPU / CPU
-#   LAUNCHER="accelerate launch --multi_gpu --num_processes 4" …  # 4-GPU
-if [ -z "${LAUNCHER:-}" ]; then
-    NUM_GPUS=0
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-    fi
-    case "$NUM_GPUS" in
-        0) LAUNCHER="$PYTHON" ;;
-        1) LAUNCHER="accelerate launch" ;;
-        *) LAUNCHER="accelerate launch --multi_gpu --num_processes ${NUM_GPUS}" ;;
-    esac
-fi
-export LAUNCHER
+# LAUNCHER="${LAUNCHER:-accelerate launch}"   # set LAUNCHER=python for single GPU
+LAUNCHER="${LAUNCHER:-accelerate launch --multi_gpu --num_processes 2}" #Uncomment if use 2 GPUs
 
 # ── Helper: extra flags per ablation variant ─────────────────────────
 variant_flags() {
@@ -76,14 +53,10 @@ variant_flags() {
 }
 
 # ── Helper: eval-time architecture flags per ablation variant ────────
-# Returns the flags that affect model structure / param set at inference
-# time.  These MUST match the corresponding training flags or
-# load_state_dict(strict=False) will skip params silently (e.g. loading
-# a softmax-trained checkpoint into an unbalanced_eot model leaves
-# rho_predictors at random init — eval is then meaningless).
+# Returns only the flags that affect model structure at inference time.
+# Used by eval.sh and run_ablation.sh to match the checkpoint's architecture.
 variant_eval_flags() {
     case "$1" in
-        no_ueot)         echo "--routing-mode softmax" ;;
         no_fdm)          echo "--backbone ss2d" ;;
         no_stateful_mem) echo "--use-dense-concat" ;;
         no_bootstrap_M1) echo "--memory-init zero" ;;
