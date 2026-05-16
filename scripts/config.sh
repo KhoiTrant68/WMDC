@@ -12,7 +12,7 @@ CHECKPOINT_ROOT="$REPO/wmdc_runs"
 RESULTS_DIR="$REPO/results"
 
 # ── Training hyperparams ─────────────────────────────────────────────
-EPOCHS=2
+EPOCHS=6
 BATCH_SIZE=4
 LR_MILESTONES="1"
 LAST_EPOCHS_STE=1
