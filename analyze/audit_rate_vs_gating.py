@@ -253,6 +253,20 @@ def main():
     p.add_argument("--sinkhorn-iters", type=int, default=20)
     p.add_argument("--output-dir", type=str, default="results/audit_gating")
     p.add_argument("--cuda", action="store_true")
+    p.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    p.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
     args = p.parse_args()
 
     if args.routing_mode != "unbalanced_eot":
@@ -271,6 +285,8 @@ def main():
         routing_mode=args.routing_mode,
         ot_eps=args.ot_eps,
         sinkhorn_iters=args.sinkhorn_iters,
+        use_content_adaptive=args.use_content_adaptive,
+        cluster_num=args.cluster_num,
         update_for_inference=False,  # forward() only
     )
 
