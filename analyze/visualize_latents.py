@@ -47,6 +47,13 @@ def main():
         dest="cluster_num",
         help="Number of clusters for content-adaptive K-means tokenization.",
     )
+    parser.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
+    )
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -60,6 +67,7 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
         use_content_adaptive=args.use_content_adaptive,
         cluster_num=args.cluster_num,
+        use_wls_shortcut=args.use_wls_shortcut,
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("state_dict", ckpt))

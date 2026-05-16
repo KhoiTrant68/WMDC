@@ -267,6 +267,13 @@ def main():
         dest="cluster_num",
         help="Number of clusters for content-adaptive K-means tokenization.",
     )
+    p.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
+    )
     args = p.parse_args()
 
     if args.routing_mode != "unbalanced_eot":
@@ -287,6 +294,7 @@ def main():
         sinkhorn_iters=args.sinkhorn_iters,
         use_content_adaptive=args.use_content_adaptive,
         cluster_num=args.cluster_num,
+        use_wls_shortcut=args.use_wls_shortcut,
         update_for_inference=False,  # forward() only
     )
 

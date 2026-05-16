@@ -139,6 +139,13 @@ def main():
         dest="cluster_num",
         help="Number of clusters for content-adaptive K-means tokenization.",
     )
+    p.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
+    )
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -150,6 +157,7 @@ def main():
         ot_eps=args.ot_eps,
         use_content_adaptive=args.use_content_adaptive,
         cluster_num=args.cluster_num,
+        use_wls_shortcut=args.use_wls_shortcut,
         update_for_inference=True,
     )
 
