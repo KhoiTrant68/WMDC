@@ -700,7 +700,9 @@ def test_epoch(
                 writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
             writer.add_scalar("Val/Sinkhorn_fallback_rate", sk["fallback_rate"], epoch)
             writer.add_scalar("Val/Sinkhorn_total_calls", sk["total_calls"], epoch)
-            writer.add_scalar("Val/Sinkhorn_total_fallbacks", sk["total_fallbacks"], epoch)
+            writer.add_scalar(
+                "Val/Sinkhorn_total_fallbacks", sk["total_fallbacks"], epoch
+            )
 
     return loss_meter.avg, gap_psnr
 

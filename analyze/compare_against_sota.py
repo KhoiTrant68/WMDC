@@ -69,9 +69,7 @@ def _extract_curve(rd_points: list) -> Tuple[List[float], List[float]]:
     return [r["bpp"] for r in pts], [r["psnr"] for r in pts]
 
 
-def _overlap_ratio(
-    bpp_a: List[float], bpp_b: List[float]
-) -> float:
+def _overlap_ratio(bpp_a: List[float], bpp_b: List[float]) -> float:
     lo = max(min(bpp_a), min(bpp_b))
     hi = min(max(bpp_a), max(bpp_b))
     span_b = max(bpp_b) - min(bpp_b)
@@ -105,15 +103,19 @@ def main():
         anchors = json.load(f)
 
     wmdc_bpp, wmdc_psnr = _extract_curve(wmdc["rd_points"])
-    print(f"WMDC RD curve: {len(wmdc_bpp)} points, "
-          f"bpp ∈ [{min(wmdc_bpp):.3f}, {max(wmdc_bpp):.3f}], "
-          f"psnr ∈ [{min(wmdc_psnr):.2f}, {max(wmdc_psnr):.2f}]")
+    print(
+        f"WMDC RD curve: {len(wmdc_bpp)} points, "
+        f"bpp ∈ [{min(wmdc_bpp):.3f}, {max(wmdc_bpp):.3f}], "
+        f"psnr ∈ [{min(wmdc_psnr):.2f}, {max(wmdc_psnr):.2f}]"
+    )
 
     if len(wmdc_bpp) < 4:
         print("[WARN] BD-rate needs ≥4 RD points; <4 is unreliable.")
 
-    print(f"\n{'Anchor':<20s} {'#pts':>4s} {'overlap':>8s} "
-          f"{'BD-rate(%)':>11s} {'BD-PSNR(dB)':>12s}  verdict")
+    print(
+        f"\n{'Anchor':<20s} {'#pts':>4s} {'overlap':>8s} "
+        f"{'BD-rate(%)':>11s} {'BD-PSNR(dB)':>12s}  verdict"
+    )
     print("─" * 70)
 
     rows = []
@@ -150,24 +152,30 @@ def main():
             f"{bd_rate:>+10.3f}% {bd_psnr:>+11.3f} dB  {verdict}"
         )
 
-        rows.append({
-            "anchor": name,
-            "anchor_cite": entry.get("_cite", ""),
-            "n_anchor_points": len(a_bpp),
-            "bpp_overlap": overlap,
-            "wmdc_vs_anchor_bd_rate_pct": bd_rate,
-            "wmdc_vs_anchor_bd_psnr_db": bd_psnr,
-            "wmdc_wins": bd_rate < 0,
-        })
+        rows.append(
+            {
+                "anchor": name,
+                "anchor_cite": entry.get("_cite", ""),
+                "n_anchor_points": len(a_bpp),
+                "bpp_overlap": overlap,
+                "wmdc_vs_anchor_bd_rate_pct": bd_rate,
+                "wmdc_vs_anchor_bd_psnr_db": bd_psnr,
+                "wmdc_wins": bd_rate < 0,
+            }
+        )
 
     # Headline result vs the chosen "main" anchor.
     main_row = next((r for r in rows if r["anchor"] == args.vs_anchor), None)
     print("\n" + "═" * 70)
     if main_row is not None:
-        print(f"HEADLINE (vs {args.vs_anchor}): "
-              f"BD-rate = {main_row['wmdc_vs_anchor_bd_rate_pct']:+.2f}%")
-    print(f"VERDICT: WMDC wins {wins}/{wins + losses} comparisons "
-          f"({100.0 * wins / max(wins + losses, 1):.0f}%)")
+        print(
+            f"HEADLINE (vs {args.vs_anchor}): "
+            f"BD-rate = {main_row['wmdc_vs_anchor_bd_rate_pct']:+.2f}%"
+        )
+    print(
+        f"VERDICT: WMDC wins {wins}/{wins + losses} comparisons "
+        f"({100.0 * wins / max(wins + losses, 1):.0f}%)"
+    )
 
     if main_row and main_row["wmdc_vs_anchor_bd_rate_pct"] < -13.0:
         cvpr_call = "STRONG — comparable to / better than MLIC++ (-13.4%)"

@@ -97,9 +97,8 @@ class TokenClustering(nn.Module):
         nonempty = counts > 0
         if nonempty.any():
             new_means = sums[nonempty] / counts[nonempty].unsqueeze(1)
-            self.means[nonempty] = (
-                self.means[nonempty] * self.momentum
-                + new_means * (1.0 - self.momentum)
+            self.means[nonempty] = self.means[nonempty] * self.momentum + new_means * (
+                1.0 - self.momentum
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

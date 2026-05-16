@@ -130,7 +130,7 @@ def load_legacy_checkpoint(
         for pref in olp_prefixes:
             if not key.startswith(pref):
                 continue
-            tail = key[len(pref):]
+            tail = key[len(pref) :]
             # k_projs.X.{weight,bias}: insert 'linear.' after the numeric index.
             if pref in ("k_projs.", "v_projs."):
                 idx, _, rest = tail.partition(".")
@@ -327,9 +327,7 @@ class WMDC(CompressionModel):
         # Adds a wavelet-domain auxiliary path that injects detail at every
         # encoder/decoder scale.  Channel-matched to g_a/g_s downsample stages.
         if use_wls_shortcut:
-            self.aux_enc = nn.ModuleList(
-                [WLS(3, N), WLS(N, N), WLS(N, N), WLS(N, M)]
-            )
+            self.aux_enc = nn.ModuleList([WLS(3, N), WLS(N, N), WLS(N, N), WLS(N, M)])
             self.aux_dec = nn.ModuleList(
                 [iWLS(M, N), iWLS(N, N), iWLS(N, N), iWLS(N, 3)]
             )
@@ -561,13 +559,21 @@ class WMDC(CompressionModel):
         if not self.use_wls_shortcut:
             return self.g_a(x)
         aux = x
-        h = self.g_a[0](x);   aux = self.aux_enc[0](aux); h = h + aux
+        h = self.g_a[0](x)
+        aux = self.aux_enc[0](aux)
+        h = h + aux
         h = self.g_a[1](h)
-        h = self.g_a[2](h);   aux = self.aux_enc[1](aux); h = h + aux
+        h = self.g_a[2](h)
+        aux = self.aux_enc[1](aux)
+        h = h + aux
         h = self.g_a[3](h)
-        h = self.g_a[4](h);   aux = self.aux_enc[2](aux); h = h + aux
+        h = self.g_a[4](h)
+        aux = self.aux_enc[2](aux)
+        h = h + aux
         h = self.g_a[5](h)
-        h = self.g_a[6](h);   aux = self.aux_enc[3](aux); h = h + aux
+        h = self.g_a[6](h)
+        aux = self.aux_enc[3](aux)
+        h = h + aux
         return h
 
     def _decode_latent(self, y_hat: torch.Tensor) -> torch.Tensor:
@@ -579,13 +585,21 @@ class WMDC(CompressionModel):
         if not self.use_wls_shortcut:
             return self.g_s(y_hat)
         aux = y_hat
-        h = self.g_s[0](y_hat); aux = self.aux_dec[0](aux); h = h + aux
+        h = self.g_s[0](y_hat)
+        aux = self.aux_dec[0](aux)
+        h = h + aux
         h = self.g_s[1](h)
-        h = self.g_s[2](h);     aux = self.aux_dec[1](aux); h = h + aux
+        h = self.g_s[2](h)
+        aux = self.aux_dec[1](aux)
+        h = h + aux
         h = self.g_s[3](h)
-        h = self.g_s[4](h);     aux = self.aux_dec[2](aux); h = h + aux
+        h = self.g_s[4](h)
+        aux = self.aux_dec[2](aux)
+        h = h + aux
         h = self.g_s[5](h)
-        h = self.g_s[6](h);     aux = self.aux_dec[3](aux); h = h + aux
+        h = self.g_s[6](h)
+        aux = self.aux_dec[3](aux)
+        h = h + aux
         return h
 
     def sinkhorn_telemetry(self) -> dict:
@@ -861,8 +875,10 @@ class WMDC(CompressionModel):
             # is required for the rate term to remain differentiable.
             if self.training and self.use_ste:
                 y_hat_slice = (
-                    torch.round(y_slice - mu) + mu
-                ) - y_hat_slice.detach() + y_hat_slice
+                    (torch.round(y_slice - mu) + mu)
+                    - y_hat_slice.detach()
+                    + y_hat_slice
+                )
 
             # ── LRP with STE proxy ───────────────────────────────────────────
             # During training we feed a hard-rounded proxy to the LRP network

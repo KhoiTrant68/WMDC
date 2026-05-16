@@ -48,9 +48,7 @@ class OLP(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         eye_dim = min(in_features, out_features)
-        self.register_buffer(
-            "identity_matrix", torch.eye(eye_dim), persistent=False
-        )
+        self.register_buffer("identity_matrix", torch.eye(eye_dim), persistent=False)
 
     def loss(self) -> torch.Tensor:
         W = self.linear.weight  # (out, in)

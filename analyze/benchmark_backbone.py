@@ -249,7 +249,10 @@ def main():
         help="Use content-adaptive K-means token permutation in Mamba blocks.",
     )
     p.add_argument(
-        "--cluster-num", type=int, default=8, dest="cluster_num",
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
         help="Number of clusters for content-adaptive K-means tokenization.",
     )
     p.add_argument(

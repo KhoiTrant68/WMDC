@@ -142,7 +142,9 @@ class UnifiedDictionaryAttention(nn.Module):
             "_sinkhorn_fallbacks", torch.zeros(1, dtype=torch.long), persistent=False
         )
         self.register_buffer(
-            "_last_eps_at_fallback", torch.zeros(1, dtype=torch.float32), persistent=False
+            "_last_eps_at_fallback",
+            torch.zeros(1, dtype=torch.float32),
+            persistent=False,
         )
         self.register_buffer(
             "_last_rho_col_at_fallback",

@@ -339,7 +339,7 @@ class WLS(nn.Module):
                 torch.full((1, 1, in_dim), 0.5),  # LL
                 torch.full((1, 1, in_dim), 0.5),  # LH
                 torch.full((1, 1, in_dim), 0.5),  # HL
-                torch.zeros(1, 1, in_dim),        # HH (zero-init)
+                torch.zeros(1, 1, in_dim),  # HH (zero-init)
             ],
             dim=2,
         )
