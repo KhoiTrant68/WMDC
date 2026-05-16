@@ -49,8 +49,7 @@ train_mode() {
     mkdir -p "$save_dir"
     cd "$REPO"
 
-    local ca_flags=""
-    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && ca_flags="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+    local arch_flags; arch_flags="$(common_arch_flags)"
 
     # shellcheck disable=SC2086
     $LAUNCHER train.py \
@@ -63,7 +62,8 @@ train_mode() {
         --batch-size "$BATCH_SIZE" \
         --lr-milestones $LR_MILESTONES \
         --last-epochs-with-ste "$LAST_EPOCHS_STE" \
-        $ca_flags \
+        --ortho-weight "${ORTHO_WEIGHT:-0.01}" \
+        $arch_flags \
         $resume_flag
 
     echo "[done] $mode → $save_dir"

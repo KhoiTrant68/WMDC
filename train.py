@@ -134,6 +134,7 @@ class RateDistortionLoss(nn.Module):
         row_entropy_weight: float = 0.05,
         alignment_weight: float = 0.2,
         dict_penalty_weight: float = 0.1,
+        ortho_weight: float = 0.01,
     ):
         super().__init__()
         self.mse = nn.MSELoss()
@@ -143,6 +144,7 @@ class RateDistortionLoss(nn.Module):
         self.row_entropy_weight = float(row_entropy_weight)
         self.alignment_weight = float(alignment_weight)
         self.dict_penalty_weight = float(dict_penalty_weight)
+        self.ortho_weight = float(ortho_weight)
 
         if metric == "ms-ssim" and lmbda < 1.0:
             warnings.warn(
@@ -268,6 +270,13 @@ class RateDistortionLoss(nn.Module):
             out["tv_loss"] = tv.detach() if tv.requires_grad else tv
             if self.training:
                 loss = loss + tv  # tv_weight is baked in
+
+        # ── Orthogonality regulariser on OLP projections (CMIC-style) ──────
+        ortho = output.get("ortho_loss")
+        if ortho is not None:
+            out["ortho_loss"] = ortho.detach() if ortho.requires_grad else ortho
+            if self.training and self.ortho_weight > 0.0:
+                loss = loss + self.ortho_weight * ortho
 
         out["loss"] = loss
         return out
@@ -784,6 +793,16 @@ def parse_args():
             "from per-pixel sparsity.  Set 0 to disable."
         ),
     )
+    p.add_argument(
+        "--ortho-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Weight on the OLP orthogonality regulariser ||W Wᵀ − I||² applied "
+            "to every OLP module (dictionary projection, K/V projections). "
+            "CMIC-style; reduces projection collapse. Set 0 to disable."
+        ),
+    )
     p.add_argument("--ot-eps", type=float, default=0.1)
     p.add_argument(
         "--marginal-div",
@@ -805,6 +824,13 @@ def parse_args():
         default=False,
         dest="use_dense_concat",
         help="Replace stateful Markov memory with dense channel-autoregressive concat.",
+    )
+    p.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale wavelet shortcuts in encoder/decoder (CMIC-style).",
     )
     p.add_argument(
         "--memory-init",
@@ -952,6 +978,7 @@ def main():
         memory_init=args.memory_init,
         use_content_adaptive=args.use_content_adaptive,
         cluster_num=args.cluster_num,
+        use_wls_shortcut=args.use_wls_shortcut,
     )
 
     optimizer, aux_optimizer = configure_optimizers(model, args)
@@ -969,6 +996,7 @@ def main():
         row_entropy_weight=args.row_entropy_weight,
         alignment_weight=args.alignment_weight,
         dict_penalty_weight=args.dict_penalty_weight,
+        ortho_weight=args.ortho_weight,
     ).to(accelerator.device)
 
     (

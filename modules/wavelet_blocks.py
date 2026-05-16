@@ -308,5 +308,75 @@ class FrequencyDisentangledMamba(nn.Module):
         return self.idwt(fused)
 
 
+# ==============================================================================
+# 4.  WLS / iWLS  (Wavelet Linear Scaling — CMIC-style multi-scale shortcut)
+# ==============================================================================
+
+
+class WLS(nn.Module):
+    """Wavelet Linear Scaling (analysis side, CMIC-style).
+
+    Haar DWT → per-band learnable scaling → 1×1 OLP projection.  Used as an
+    auxiliary shortcut path from the input image down through each encoder
+    scale, injecting wavelet detail directly at every spatial resolution.
+    The HH band is zero-initialised so the shortcut starts as a low-pass
+    summary and learns to add high-frequency detail over training.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        from modules.utils import OLP
+
+        self.dwt = DWT_2D(wave="haar")
+        self.proj = OLP(in_dim * 4, out_dim)
+        factors = torch.cat(
+            [
+                torch.full((1, 1, in_dim), 0.5),  # LL
+                torch.full((1, 1, in_dim), 0.5),  # LH
+                torch.full((1, 1, in_dim), 0.5),  # HL
+                torch.zeros(1, 1, in_dim),        # HH (zero-init)
+            ],
+            dim=2,
+        )
+        self.scaling_factors = nn.Parameter(factors)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dwt(x)  # (B, 4C, H/2, W/2)
+        b, _, h, w = x.shape
+        x = x.view(b, -1, h * w).permute(0, 2, 1)  # (B, HW, 4C)
+        x = x * torch.exp(self.scaling_factors)
+        x = self.proj(x)
+        return x.view(b, h, w, -1).permute(0, 3, 1, 2).contiguous()
+
+
+class iWLS(nn.Module):
+    """Inverse WLS (synthesis side, CMIC-style)."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        from modules.utils import OLP
+
+        self.idwt = IDWT_2D(wave="haar")
+        self.proj = OLP(in_dim, out_dim * 4)
+        factors = torch.cat(
+            [
+                torch.full((1, 1, out_dim), 0.5),
+                torch.full((1, 1, out_dim), 0.5),
+                torch.full((1, 1, out_dim), 0.5),
+                torch.zeros(1, 1, out_dim),
+            ],
+            dim=2,
+        )
+        self.scaling_factors = nn.Parameter(factors)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+        x = x.view(b, -1, h * w).permute(0, 2, 1)
+        x = self.proj(x)
+        x = x / torch.exp(self.scaling_factors)
+        x = x.view(b, h, w, -1).permute(0, 3, 1, 2).contiguous()
+        return self.idwt(x)
+
+
 if __name__ == "__main__":
     test_dwt_idwt()

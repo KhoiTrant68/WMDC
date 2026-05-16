@@ -24,9 +24,9 @@ CONV_IMG="$KODAK_DIR/kodim04.png"   # used for sinkhorn (textured image)
 
 ckpt_routing() { echo "$CHECKPOINT_ROOT/routing/$1/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar"; }
 
-# Content-adaptive flags shared by every analyze script (gated by config.sh)
-CA_FLAGS=""
-[ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && CA_FLAGS="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+# Shared architecture flags for every analyze script (content-adaptive + WLS,
+# gated by env vars in config.sh).
+CA_FLAGS="$(common_arch_flags)"
 
 # ── attention maps ───────────────────────────────────────────────────
 run_attention() {

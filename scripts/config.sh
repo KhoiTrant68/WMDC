@@ -29,9 +29,15 @@ ROUTING_MODE="unbalanced_eot"
 ROUTING_MODES=(unbalanced_eot balanced_eot softmax)
 CONTENT_ADAPTIVE=1 # set to 0 to disable ContentAdaptiveVSSBlock
 CLUSTER_NUM=8
+USE_WLS_SHORTCUT=1 # CMIC-style wavelet multi-scale shortcut (1=on, 0=off)
+ORTHO_WEIGHT=0.01  # OLP orthogonality regulariser weight (0 to disable)
 
 # ── Ablation variants ────────────────────────────────────────────────
-VARIANTS=(full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_dict_penalty)
+# Original 7 (Table 4) + 3 new CMIC-related ablations:
+#   no_wls       — disable WLS/iWLS shortcuts
+#   no_olp       — disable OLP orthogonality regulariser
+#   no_ste_y     — disable STE on y in the last training epochs
+VARIANTS=(full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_dict_penalty no_wls no_olp no_ste_y)
 
 # ── Tools ────────────────────────────────────────────────────────────
 PYTHON="${PYTHON:-python}"
@@ -48,6 +54,9 @@ variant_flags() {
         no_bootstrap_M1)  echo "--memory-init zero" ;;
         no_disp_bonus)    echo "--column-entropy-weight 0.0 --row-entropy-weight 0.0 --alignment-weight 0.0" ;;
         no_dict_penalty)  echo "--dict-penalty-weight 0.0" ;;
+        no_wls)           echo "__SKIP_WLS__" ;;     # consumed by ca_flags logic
+        no_olp)           echo "--ortho-weight 0.0" ;;
+        no_ste_y)         echo "--last-epochs-with-ste 0" ;;
         *) echo "ERROR: unknown variant $1" >&2; return 1 ;;
     esac
 }
@@ -60,8 +69,23 @@ variant_eval_flags() {
         no_fdm)          echo "--backbone ss2d" ;;
         no_stateful_mem) echo "--use-dense-concat" ;;
         no_bootstrap_M1) echo "--memory-init zero" ;;
+        no_wls)          echo "__SKIP_WLS__" ;;
         *)               echo "" ;;
     esac
+}
+
+# ── Helper: shared content-adaptive + WLS flags (gated by env) ───────
+# Returns the flags every script should pass to train.py / eval.py /
+# analyze scripts so model architecture matches the checkpoint.
+# Special token __SKIP_WLS__ from variant_*_flags removes the WLS flag.
+common_arch_flags() {
+    local variant_extra="${1:-}"
+    local out=""
+    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && out="$out --content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+    if [ "${USE_WLS_SHORTCUT:-0}" -eq 1 ] && [[ "$variant_extra" != *"__SKIP_WLS__"* ]]; then
+        out="$out --use-wls-shortcut"
+    fi
+    echo "$out"
 }
 
 # ── Helper: checkpoint path for a given variant + lambda ─────────────

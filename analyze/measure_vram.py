@@ -43,6 +43,7 @@ def _build_model(
     checkpoint: str | None,
     use_content_adaptive: bool = False,
     cluster_num: int = 8,
+    use_wls_shortcut: bool = False,
 ):
     """
     Build a model in the given variant. Variant ∈ {"stateful", "dense"}.
@@ -55,6 +56,7 @@ def _build_model(
         num_slices=5,
         use_content_adaptive=use_content_adaptive,
         cluster_num=cluster_num,
+        use_wls_shortcut=use_wls_shortcut,
     )
 
     if variant == "dense":
@@ -111,6 +113,7 @@ def measure_one(
     checkpoint: str | None,
     use_content_adaptive: bool = False,
     cluster_num: int = 8,
+    use_wls_shortcut: bool = False,
 ) -> dict:
     print(f"\n=== variant={variant}  resolution={H}x{W}  mode={mode} ===")
     # Reset CUDA state for clean measurement.
@@ -125,6 +128,7 @@ def measure_one(
         checkpoint,
         use_content_adaptive=use_content_adaptive,
         cluster_num=cluster_num,
+        use_wls_shortcut=use_wls_shortcut,
     )
     model.train() if mode == "train" else model.eval()
 
@@ -208,6 +212,13 @@ def main():
         dest="cluster_num",
         help="Number of clusters for content-adaptive K-means tokenization.",
     )
+    p.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
+    )
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -232,6 +243,7 @@ def main():
                     checkpoint=args.checkpoint,
                     use_content_adaptive=args.use_content_adaptive,
                     cluster_num=args.cluster_num,
+                    use_wls_shortcut=args.use_wls_shortcut,
                 )
             except torch.cuda.OutOfMemoryError as e:
                 row = {

@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from modules.utils import OLP
+
 # ---------------------------------------------------------------------------
 # QueryDictionaryGenerator
 # ---------------------------------------------------------------------------
@@ -38,9 +40,9 @@ class QueryDictionaryGenerator(nn.Module):
         )
         self.norm = nn.LayerNorm(in_dim)
         self.proj = nn.Sequential(
-            nn.Linear(in_dim, dict_dim),
+            OLP(in_dim, dict_dim),
             nn.GELU(),
-            nn.Linear(dict_dim, dict_dim),
+            OLP(dict_dim, dict_dim),
         )
 
     def forward(self, z_hat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

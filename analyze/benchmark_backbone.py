@@ -24,17 +24,32 @@ except ImportError:
         _HAS_THOP = False
 
 
-def _build_model_with_backbone(backbone: str, device: str) -> nn.Module:
+def _build_model_with_backbone(
+    backbone: str,
+    device: str,
+    *,
+    use_content_adaptive: bool = False,
+    cluster_num: int = 8,
+    use_wls_shortcut: bool = False,
+) -> nn.Module:
     from models.WMDC import WMDC
 
+    common = dict(
+        N=192,
+        M=320,
+        num_slices=5,
+        use_content_adaptive=use_content_adaptive,
+        cluster_num=cluster_num,
+        use_wls_shortcut=use_wls_shortcut,
+    )
     try:
-        model = WMDC(N=192, M=320, num_slices=5, backbone=backbone).to(device)
+        model = WMDC(backbone=backbone, **common).to(device)
     except TypeError:
         print(
             f"[INFO] WMDC.__init__ does not accept `backbone=`. "
             f"Falling back to in-place module swap for backbone={backbone}."
         )
-        model = WMDC(N=192, M=320, num_slices=5).to(device)
+        model = WMDC(**common).to(device)
         _swap_backbones(model, backbone)
     return model.eval()
 
@@ -162,7 +177,13 @@ def _count_flops(model: nn.Module, x: torch.Tensor) -> dict:
 
 def benchmark_one(backbone: str, args, device: str) -> dict:
     print(f"\n=== Backbone: {backbone} ===")
-    model = _build_model_with_backbone(backbone, device)
+    model = _build_model_with_backbone(
+        backbone,
+        device,
+        use_content_adaptive=getattr(args, "use_content_adaptive", False),
+        cluster_num=getattr(args, "cluster_num", 8),
+        use_wls_shortcut=getattr(args, "use_wls_shortcut", False),
+    )
 
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -220,6 +241,24 @@ def main():
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--output", type=str, default="backbone_benchmark.json")
     p.add_argument("--cuda", action="store_true")
+    p.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation in Mamba blocks.",
+    )
+    p.add_argument(
+        "--cluster-num", type=int, default=8, dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
+    p.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
+    )
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"

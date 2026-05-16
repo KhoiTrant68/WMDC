@@ -83,6 +83,9 @@ def cmd_evaluate(args):
             backbone=args.backbone,
             use_dense_concat=args.use_dense_concat,
             memory_init=args.memory_init,
+            use_content_adaptive=args.use_content_adaptive,
+            cluster_num=args.cluster_num,
+            use_wls_shortcut=args.use_wls_shortcut,
             update_for_inference=True,
             strict_load=False,
         )
@@ -233,6 +236,27 @@ def main():
         default="bootstrap",
         choices=["bootstrap", "zero"],
         help="Memory initialisation strategy matching the checkpoint.",
+    )
+    p_eval.add_argument(
+        "--content-adaptive",
+        action="store_true",
+        default=False,
+        dest="use_content_adaptive",
+        help="Use content-adaptive K-means token permutation (must match checkpoint).",
+    )
+    p_eval.add_argument(
+        "--cluster-num",
+        type=int,
+        default=8,
+        dest="cluster_num",
+        help="Number of clusters for content-adaptive K-means tokenization.",
+    )
+    p_eval.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
     )
     p_eval.add_argument("--ot-eps", type=float, default=0.1)
     p_eval.add_argument("--sinkhorn-iters", type=int, default=20)

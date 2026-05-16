@@ -211,6 +211,13 @@ def main():
         help="Build the dense-concat variant (no stateful memory).",
     )
     parser.add_argument(
+        "--use-wls-shortcut",
+        action="store_true",
+        default=False,
+        dest="use_wls_shortcut",
+        help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
+    )
+    parser.add_argument(
         "--memory-init",
         type=str,
         default="bootstrap",
@@ -266,6 +273,7 @@ def main():
         backbone=args.backbone,
         use_dense_concat=args.use_dense_concat,
         memory_init=args.memory_init,
+        use_wls_shortcut=args.use_wls_shortcut,
         use_content_adaptive=args.use_content_adaptive,
         cluster_num=args.cluster_num,
     ).to(device)

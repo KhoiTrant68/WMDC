@@ -11,9 +11,14 @@ from modules.dictionary_blocks import (
     QueryDictionaryGenerator,
     UnifiedDictionaryAttention,
 )
-from modules.utils import conv, deconv
+from modules.utils import OLP, conv, deconv
 from modules.VSS_module import VSSBlock
-from modules.wavelet_blocks import FrequencyDisentangledMamba, GatedMemoryUpdater
+from modules.wavelet_blocks import (
+    WLS,
+    FrequencyDisentangledMamba,
+    GatedMemoryUpdater,
+    iWLS,
+)
 
 
 def _make_backbone(
@@ -111,6 +116,31 @@ def load_legacy_checkpoint(
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     sd = ckpt.get("state_dict", ckpt)
 
+    # Module paths whose nn.Linear became OLP (which wraps a .linear).
+    # If the old key ends at the Linear itself (no .linear), prepend .linear.
+    olp_prefixes = (
+        "k_projs.",
+        "v_projs.",
+        "hyper_to_dict.proj.0.",
+        "hyper_to_dict.proj.2.",
+    )
+
+    def _migrate_to_olp(key: str) -> str:
+        """For old keys like 'k_projs.3.weight' → 'k_projs.3.linear.weight'."""
+        for pref in olp_prefixes:
+            if not key.startswith(pref):
+                continue
+            tail = key[len(pref):]
+            # k_projs.X.{weight,bias}: insert 'linear.' after the numeric index.
+            if pref in ("k_projs.", "v_projs."):
+                idx, _, rest = tail.partition(".")
+                if rest in ("weight", "bias"):
+                    return f"{pref}{idx}.linear.{rest}"
+            # hyper_to_dict.proj.X.{weight,bias}: insert 'linear.' before suffix.
+            elif tail in ("weight", "bias"):
+                return f"{pref}linear.{tail}"
+        return key
+
     remap: dict = {}
     for k, v in sd.items():
         # ── Layout 1: original h_scale_s / h_mean_s ──────────────────────
@@ -145,6 +175,11 @@ def load_legacy_checkpoint(
                 remap[k] = v
         else:
             remap[k] = v
+
+    # ── OLP migration: nn.Linear → OLP(.linear) for dict projections ─────
+    # Apply AFTER the layout-1/2 mapping so it catches both legacy and current
+    # keys that point at projections we've since wrapped in OLP.
+    remap = {_migrate_to_olp(k): v for k, v in remap.items()}
 
     missing, unexpected = model.load_state_dict(remap, strict=False)
     if missing:
@@ -207,6 +242,7 @@ class WMDC(CompressionModel):
         memory_init: str = "bootstrap",
         use_content_adaptive: bool = False,
         cluster_num: int = 8,
+        use_wls_shortcut: bool = False,
     ):
         super().__init__()
         self.N = N
@@ -221,6 +257,7 @@ class WMDC(CompressionModel):
         self.memory_init = memory_init
         self.use_content_adaptive = use_content_adaptive
         self.cluster_num = cluster_num
+        self.use_wls_shortcut = use_wls_shortcut
 
         # DDP-safe, never silently reset on checkpoint resume.
         self.register_buffer("_use_ste_flag", torch.zeros(1, dtype=torch.bool))
@@ -286,6 +323,17 @@ class WMDC(CompressionModel):
             deconv(N, 3, kernel_size=5, stride=2),
         )
 
+        # ── WLS / iWLS multi-scale shortcuts (CMIC-style, opt-in) ─────────────
+        # Adds a wavelet-domain auxiliary path that injects detail at every
+        # encoder/decoder scale.  Channel-matched to g_a/g_s downsample stages.
+        if use_wls_shortcut:
+            self.aux_enc = nn.ModuleList(
+                [WLS(3, N), WLS(N, N), WLS(N, N), WLS(N, M)]
+            )
+            self.aux_dec = nn.ModuleList(
+                [iWLS(M, N), iWLS(N, N), iWLS(N, N), iWLS(N, 3)]
+            )
+
         # ── Hyper-encoder ─────────────────────────────────────────────────────
         self.h_a = nn.Sequential(
             conv(M, N, kernel_size=5, stride=2),
@@ -347,10 +395,10 @@ class WMDC(CompressionModel):
         # Independent linear projections keep each slice's dictionary view
         # disentangled, preventing a shared bottleneck across slices.
         self.k_projs = nn.ModuleList(
-            [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
+            [OLP(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
         )
         self.v_projs = nn.ModuleList(
-            [nn.Linear(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
+            [OLP(self.dict_dim, self.dict_dim) for _ in range(num_slices)]
         )
 
         # ── Per-slice EOT dictionary attention ────────────────────────────────
@@ -496,6 +544,49 @@ class WMDC(CompressionModel):
     def aux_loss(self) -> torch.Tensor:
         """Auxiliary loss for entropy bottleneck CDF approximation."""
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
+
+    def ortho_loss(self) -> torch.Tensor:
+        """Aggregate ‖W Wᵀ − I‖² over every OLP module (CMIC-style)."""
+        terms = [m.loss() for m in self.modules() if isinstance(m, OLP)]
+        if not terms:
+            return torch.zeros((), device=next(self.parameters()).device)
+        return torch.stack(terms).mean()
+
+    def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        """Run g_a, optionally with WLS multi-scale shortcuts.
+
+        g_a layout: [down0, bb0, down1, bb1, down2, bb2, down3].  Aux WLS
+        path is added AFTER each downsample (so spatial size matches).
+        """
+        if not self.use_wls_shortcut:
+            return self.g_a(x)
+        aux = x
+        h = self.g_a[0](x);   aux = self.aux_enc[0](aux); h = h + aux
+        h = self.g_a[1](h)
+        h = self.g_a[2](h);   aux = self.aux_enc[1](aux); h = h + aux
+        h = self.g_a[3](h)
+        h = self.g_a[4](h);   aux = self.aux_enc[2](aux); h = h + aux
+        h = self.g_a[5](h)
+        h = self.g_a[6](h);   aux = self.aux_enc[3](aux); h = h + aux
+        return h
+
+    def _decode_latent(self, y_hat: torch.Tensor) -> torch.Tensor:
+        """Run g_s, optionally with iWLS multi-scale shortcuts.
+
+        g_s layout: [up0, bb0, up1, bb1, up2, bb2, up3].  Aux iWLS path
+        starts from y_hat and is added AFTER each up-sample stage.
+        """
+        if not self.use_wls_shortcut:
+            return self.g_s(y_hat)
+        aux = y_hat
+        h = self.g_s[0](y_hat); aux = self.aux_dec[0](aux); h = h + aux
+        h = self.g_s[1](h)
+        h = self.g_s[2](h);     aux = self.aux_dec[1](aux); h = h + aux
+        h = self.g_s[3](h)
+        h = self.g_s[4](h);     aux = self.aux_dec[2](aux); h = h + aux
+        h = self.g_s[5](h)
+        h = self.g_s[6](h);     aux = self.aux_dec[3](aux); h = h + aux
+        return h
 
     def sinkhorn_telemetry(self) -> dict:
         """
@@ -668,7 +759,7 @@ class WMDC(CompressionModel):
         self.slice_attn_probs.clear()
 
         # ── Encode ────────────────────────────────────────────────────────────
-        y = self.g_a(x)
+        y = self._encode_image(x)
         z = self.h_a(y)
 
         # Entropy bottleneck: additive noise relaxation or STE
@@ -764,6 +855,15 @@ class WMDC(CompressionModel):
                 y_slice, scale, means=mu
             )
 
+            # ── STE for y (CMIC-style): when use_ste=True, replace the noisy
+            # y_hat_slice with a hard-rounded identity-backward proxy. The
+            # likelihood above still uses noise-relaxed quantisation, which
+            # is required for the rate term to remain differentiable.
+            if self.training and self.use_ste:
+                y_hat_slice = (
+                    torch.round(y_slice - mu) + mu
+                ) - y_hat_slice.detach() + y_hat_slice
+
             # ── LRP with STE proxy ───────────────────────────────────────────
             # During training we feed a hard-rounded proxy to the LRP network
             # so LRP learns to correct quantisation error rather than noise.
@@ -790,7 +890,7 @@ class WMDC(CompressionModel):
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         # ── Decode ────────────────────────────────────────────────────────────
-        x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
+        x_hat = self._decode_latent(torch.cat(y_hat_slices, dim=1))
 
         # ── Slice-averaged entropy signals + stacked row_mass ────────────────
         S = float(self.num_slices)
@@ -806,6 +906,7 @@ class WMDC(CompressionModel):
                 "z": z_likelihoods,
             },
             "aux_loss": self.aux_loss(),
+            "ortho_loss": self.ortho_loss(),
             "column_neg_entropy": column_neg_entropy,
             "row_entropy": row_entropy,
             "row_mass": row_mass,
@@ -840,7 +941,7 @@ class WMDC(CompressionModel):
 
         self.slice_attn_probs.clear()
 
-        y = self.g_a(x)
+        y = self._encode_image(x)
         z = self.h_a(y)
 
         # Encode z with entropy bottleneck
@@ -1007,5 +1108,5 @@ class WMDC(CompressionModel):
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(y_hat).clamp_(0, 1)
+        x_hat = self._decode_latent(y_hat).clamp_(0, 1)
         return {"x_hat": x_hat}

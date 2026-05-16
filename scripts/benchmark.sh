@@ -24,9 +24,12 @@ run_vram() {
     local ck="$CHECKPOINT_ROOT/routing/unbalanced_eot/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar"
     [ -f "$ck" ] || { echo "[skip] checkpoint not found: $ck"; return; }
 
+    local arch_flags; arch_flags="$(common_arch_flags)"
+
+    # shellcheck disable=SC2086
     $PYTHON analyze/measure_vram.py \
         --checkpoint "$ck" \
-        --cuda \
+        --cuda $arch_flags \
         --output "$BENCH_DIR/vram_report.json"
 
     echo "[done] VRAM report → $BENCH_DIR/vram_report.json"
@@ -38,8 +41,11 @@ run_flops() {
     cd "$REPO"
     mkdir -p "$BENCH_DIR"
 
+    local arch_flags; arch_flags="$(common_arch_flags)"
+
+    # shellcheck disable=SC2086
     $PYTHON analyze/benchmark_backbone.py \
-        --cuda \
+        --cuda $arch_flags \
         --output "$BENCH_DIR/flops_report.json"
 
     echo "[done] FLOPs report → $BENCH_DIR/flops_report.json"

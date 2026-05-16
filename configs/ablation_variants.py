@@ -70,6 +70,21 @@ VARIANTS: dict[str, dict] = {
         # Set fixed dictionary-penalty weight to zero.
         "--dict-penalty-weight": 0.0,
     },
+    # ── CMIC-derived components (added Phase 1–3) ─────────────────────
+    "no_wls": {
+        # Disable WLS/iWLS multi-scale wavelet shortcuts.  In config.sh
+        # this is realised by stripping --use-wls-shortcut via the
+        # __SKIP_WLS__ sentinel token rather than by adding a flag.
+    },
+    "no_olp": {
+        # Disable the OLP orthogonality regulariser (still keeps the OLP
+        # module as a drop-in nn.Linear; only the ‖W Wᵀ−I‖² term goes).
+        "--ortho-weight": 0.0,
+    },
+    "no_ste_y": {
+        # Train without the STE-on-y schedule (matches pre-Phase-1 behaviour).
+        "--last-epochs-with-ste": 0,
+    },
 }
 
 # Order in which to run the variants (full first as the reference).
@@ -81,6 +96,9 @@ RUN_ORDER = [
     "no_bootstrap_M1",
     "no_disp_bonus",
     "no_dict_penalty",
+    "no_wls",
+    "no_olp",
+    "no_ste_y",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────

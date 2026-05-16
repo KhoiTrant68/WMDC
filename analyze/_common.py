@@ -55,6 +55,7 @@ def load_model(
     memory_init: str = "bootstrap",
     use_content_adaptive: bool = False,
     cluster_num: int = 8,
+    use_wls_shortcut: bool = False,
     update_for_inference: bool = True,
     strict_load: bool = True,
 ) -> WMDC:
@@ -81,6 +82,7 @@ def load_model(
         memory_init=memory_init,
         use_content_adaptive=use_content_adaptive,
         cluster_num=cluster_num,
+        use_wls_shortcut=use_wls_shortcut,
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)

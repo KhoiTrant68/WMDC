@@ -25,12 +25,12 @@ run_train_job() {
     local dry="${3:-0}"
     local extra_flags
     extra_flags="$(variant_flags "$variant")"
+    local arch_flags
+    arch_flags="$(common_arch_flags "$extra_flags")"
+    extra_flags="${extra_flags//__SKIP_WLS__/}"
     local out_dir="$CHECKPOINT_ROOT/ablation/$variant/lam_$lam"
 
     mkdir -p "$out_dir"
-    local ca_flags=""
-    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && ca_flags="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
-
 
     # Build the command
     local cmd="$LAUNCHER train.py \
@@ -41,10 +41,11 @@ run_train_job() {
         --epochs $EPOCHS \
         --batch-size $BATCH_SIZE \
         --lr-milestones $LR_MILESTONES \
-        --last-epochs-with-ste $LAST_EPOCHS_STE"
+        --last-epochs-with-ste $LAST_EPOCHS_STE \
+        --ortho-weight ${ORTHO_WEIGHT:-0.01}"
 
     [ -n "$extra_flags" ] && cmd="$cmd $extra_flags"
-    [ -n "$ca_flags" ] && cmd="$cmd $ca_flags"
+    [ -n "$arch_flags" ] && cmd="$cmd $arch_flags"
 
     if [ "$dry" -eq 1 ]; then
         echo "[dry-run] $variant @ λ=$lam"
@@ -75,6 +76,9 @@ submit_slurm_job() {
     local lam="$2"
     local extra_flags
     extra_flags="$(variant_flags "$variant")"
+    local arch_flags
+    arch_flags="$(common_arch_flags "$extra_flags")"
+    extra_flags="${extra_flags//__SKIP_WLS__/}"
     local out_dir="$CHECKPOINT_ROOT/ablation/$variant/lam_$lam"
 
     mkdir -p "$out_dir"
@@ -101,7 +105,8 @@ $LAUNCHER train.py \\
     --batch-size $BATCH_SIZE \\
     --lr-milestones $LR_MILESTONES \\
     --last-epochs-with-ste $LAST_EPOCHS_STE \\
-    $extra_flags
+    --ortho-weight ${ORTHO_WEIGHT:-0.01} \\
+    $extra_flags $arch_flags
 EOF
 
     echo "[submit] $variant @ λ=$lam → $out_dir"
@@ -133,6 +138,8 @@ run_evaluate() {
 
         local out="$RESULTS_DIR/bd_rate/${variant}.json"
         local eval_flags; eval_flags="$(variant_eval_flags "$variant")"
+        local arch_flags; arch_flags="$(common_arch_flags "$eval_flags")"
+        eval_flags="${eval_flags//__SKIP_WLS__/}"
         echo ""
         echo "-- $variant (${#ckpts[@]} checkpoints)"
 
@@ -143,7 +150,7 @@ run_evaluate() {
             --dataset "$KODAK_DIR" \
             --output "$out" \
             --routing-mode unbalanced_eot \
-            $eval_flags \
+            $eval_flags $arch_flags \
             --cuda
 
         echo "[done] $variant → $out"

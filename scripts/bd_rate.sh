@@ -40,15 +40,20 @@ run_evaluate() {
         fi
 
         local out="$BD_DIR/${variant}.json"
+        local eval_flags; eval_flags="$(variant_eval_flags "$variant")"
+        local arch_flags; arch_flags="$(common_arch_flags "$eval_flags")"
+        eval_flags="${eval_flags//__SKIP_WLS__/}"
         echo ""
         echo "-- $variant (${#ckpts[@]} checkpoints)"
 
+        # shellcheck disable=SC2086  # word-split intentional for flags
         $PYTHON analyze/compute_bd_rate.py evaluate \
             --variant-name "$variant" \
             --checkpoints "${ckpts[@]}" \
             --dataset "$KODAK_DIR" \
             --output "$out" \
             --routing-mode unbalanced_eot \
+            $eval_flags $arch_flags \
             --cuda
 
         echo "[done] $variant → $out"
