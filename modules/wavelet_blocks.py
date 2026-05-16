@@ -316,18 +316,23 @@ class FrequencyDisentangledMamba(nn.Module):
 class WLS(nn.Module):
     """Wavelet Linear Scaling (analysis side, CMIC-style).
 
-    Haar DWT → per-band learnable scaling → 1×1 OLP projection.  Used as an
+    DWT → per-band learnable scaling → 1×1 OLP projection.  Used as an
     auxiliary shortcut path from the input image down through each encoder
     scale, injecting wavelet detail directly at every spatial resolution.
     The HH band is zero-initialised so the shortcut starts as a low-pass
     summary and learns to add high-frequency detail over training.
+
+    Uses bior4.4 by default to match the project's DWT_2D infrastructure
+    (which assumes odd-length filters; Haar's 2-tap filters break that
+    assumption).  The wavelet choice does not change the topology or the
+    expected gain — the architectural value comes from the shortcut itself.
     """
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, wave: str = "bior4.4"):
         super().__init__()
         from modules.utils import OLP
 
-        self.dwt = DWT_2D(wave="haar")
+        self.dwt = DWT_2D(wave=wave)
         self.proj = OLP(in_dim * 4, out_dim)
         factors = torch.cat(
             [
@@ -352,11 +357,11 @@ class WLS(nn.Module):
 class iWLS(nn.Module):
     """Inverse WLS (synthesis side, CMIC-style)."""
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, wave: str = "bior4.4"):
         super().__init__()
         from modules.utils import OLP
 
-        self.idwt = IDWT_2D(wave="haar")
+        self.idwt = IDWT_2D(wave=wave)
         self.proj = OLP(in_dim, out_dim * 4)
         factors = torch.cat(
             [
