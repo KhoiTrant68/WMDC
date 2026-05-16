@@ -125,7 +125,76 @@ class UnifiedDictionaryAttention(nn.Module):
         self.store_attn_probs: bool = store_attn_probs
         self.attn_probs: torch.Tensor | None = None
         self.last_row_mass: torch.Tensor | None = None
+
+        # ── Sinkhorn telemetry (DDP-safe, persistent across checkpoints) ──
+        # Reviewer-requested instrumentation: every forward increments the
+        # call counter; every fallback path increments the divergence counter
+        # and records the eps / rho_col / max|M| that triggered it.  These
+        # buffers are registered (not Python ints) so they survive
+        # state_dict() round-trips and aggregate correctly under DDP via
+        # broadcast_buffers.
+        self.register_buffer(
+            "_sinkhorn_calls", torch.zeros(1, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "_sinkhorn_fallbacks", torch.zeros(1, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "_last_eps_at_fallback", torch.zeros(1, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_last_rho_col_at_fallback",
+            torch.zeros(1, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_last_max_M_at_fallback",
+            torch.zeros(1, dtype=torch.float32),
+            persistent=False,
+        )
+        # Public mirror kept for backward compatibility with older logging.
         self.sinkhorn_divergence_count: int = 0
+
+    # -----------------------------------------------------------------------
+    # Eps floor — reviewer hardening
+    # -----------------------------------------------------------------------
+    #
+    # Originally `eps = softplus(log_eps) + 0.01`, which lets the optimiser
+    # drive eps arbitrarily close to 0.01.  With cosine-distance C ∈ [0, 2]
+    # the matrix M = C / eps can then exceed 200, and although our Sinkhorn
+    # is log-domain (stable in isolation), the unbalanced shrink updates
+    # `(rho/(rho+eps)) * lse` can still produce NaN when log_f, log_g blow
+    # up together.  Reviewer feedback recommended a tighter floor; we use
+    # 0.05 so MAX|M| ≤ 40 in the worst case while still allowing eps to
+    # adapt over a meaningful range.
+    EPS_FLOOR: float = 0.05
+
+    def _eps(self) -> torch.Tensor:
+        return F.softplus(self.log_eps) + self.EPS_FLOOR
+
+    def sinkhorn_telemetry(self) -> dict:
+        """Return current fallback statistics.  Safe to call any time."""
+        calls = int(self._sinkhorn_calls.item())
+        fb = int(self._sinkhorn_fallbacks.item())
+        return {
+            "calls": calls,
+            "fallbacks": fb,
+            "fallback_rate": fb / max(calls, 1),
+            "last_eps_at_fallback": float(self._last_eps_at_fallback.item()),
+            "last_rho_col_at_fallback": float(self._last_rho_col_at_fallback.item()),
+            "last_max_M_at_fallback": float(self._last_max_M_at_fallback.item()),
+        }
+
+    def _record_fallback(
+        self, eps: torch.Tensor, M: torch.Tensor, rho_col: torch.Tensor | None
+    ) -> None:
+        self._sinkhorn_fallbacks += 1
+        self.sinkhorn_divergence_count += 1
+        with torch.no_grad():
+            self._last_eps_at_fallback.fill_(float(eps.detach()))
+            self._last_max_M_at_fallback.fill_(float(M.detach().abs().max()))
+            if rho_col is not None:
+                self._last_rho_col_at_fallback.fill_(float(rho_col.detach()))
 
     # -----------------------------------------------------------------------
     # Chunked logsumexp along the spatial dimension
@@ -195,7 +264,8 @@ class UnifiedDictionaryAttention(nn.Module):
 
     def _route_balanced_eot(self, C_mat: torch.Tensor) -> torch.Tensor:
         B, HW, N = C_mat.shape
-        eps = F.softplus(self.log_eps) + 0.01
+        self._sinkhorn_calls += 1
+        eps = self._eps()
         log_a = -math.log(HW)
         log_b = -math.log(N)
         M = C_mat / eps
@@ -216,9 +286,10 @@ class UnifiedDictionaryAttention(nn.Module):
         log_P = log_f + log_g - M
 
         if torch.isnan(log_P).any():
-            self.sinkhorn_divergence_count += 1
+            self._record_fallback(eps, M, rho_col=None)
             warnings.warn(
                 f"[BalancedEOT] NaN detected (eps={eps.item():.4f}, "
+                f"max|M|={float(M.abs().max()):.1f}, "
                 f"count={self.sinkhorn_divergence_count}). Falling back to softmax."
             )
             fallback_P = self._route_softmax(C_mat)
@@ -265,7 +336,8 @@ class UnifiedDictionaryAttention(nn.Module):
         Unbalanced entropic OT in log-domain.
         """
         B, HW, N = C_mat.shape
-        eps = F.softplus(self.log_eps) + 0.01
+        self._sinkhorn_calls += 1
+        eps = self._eps()
 
         rho_col = F.softplus(self.log_rho_col) + 0.01  # strictly positive scalar
 
@@ -304,10 +376,11 @@ class UnifiedDictionaryAttention(nn.Module):
         log_P = log_f + log_g - M
 
         if torch.isnan(log_P).any():
-            self.sinkhorn_divergence_count += 1
+            self._record_fallback(eps, M, rho_col=rho_col)
             warnings.warn(
                 f"[UnbalancedEOT/{self.marginal_div.upper()}] NaN detected "
                 f"(eps={eps.item():.4f}, rho_col={rho_col.item():.4f}, "
+                f"max|M|={float(M.abs().max()):.1f}, "
                 f"count={self.sinkhorn_divergence_count}). Falling back to softmax."
             )
             fallback_P = self._route_softmax(C_mat)

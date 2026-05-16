@@ -660,12 +660,18 @@ def test_epoch(
             if not math.isnan(gap_psnr)
             else ""
         )
+        # Sinkhorn telemetry — reviewers want fallback rate reported, not buried.
+        sk = accelerator.unwrap_model(model).sinkhorn_telemetry()
+        sk_str = (
+            f" | Sinkhorn fb: {sk['total_fallbacks']}/{sk['total_calls']} "
+            f"({100.0 * sk['fallback_rate']:.3f}%)"
+        )
         if logger:
             logger.info(
                 f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} "
                 f"| PSNR(est): {psnr_meter.avg:.2f} dB "
                 f"| BPP(est): {bpp_meter.avg:.4f}"
-                f"{real_str}{gap_str}"
+                f"{real_str}{gap_str}{sk_str}"
             )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
@@ -683,6 +689,9 @@ def test_epoch(
                 )
             if not math.isnan(gap_psnr):
                 writer.add_scalar("Val/TrainInfer_PSNR_gap", gap_psnr, epoch)
+            writer.add_scalar("Val/Sinkhorn_fallback_rate", sk["fallback_rate"], epoch)
+            writer.add_scalar("Val/Sinkhorn_total_calls", sk["total_calls"], epoch)
+            writer.add_scalar("Val/Sinkhorn_total_fallbacks", sk["total_fallbacks"], epoch)
 
     return loss_meter.avg, gap_psnr
 

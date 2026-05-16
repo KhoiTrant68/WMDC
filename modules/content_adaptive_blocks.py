@@ -4,10 +4,18 @@ from functools import partial
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from modules.VSS_module import VSSBlock
+
+
+def _dist_active() -> bool:
+    """True only when a real NCCL/Gloo process group is up. Cheap and safe to
+    call on every forward — avoids the AttributeError that `dist.is_initialized`
+    raises in environments where torch.distributed was never imported."""
+    return dist.is_available() and dist.is_initialized()
 
 
 class TokenClustering(nn.Module):
@@ -16,6 +24,20 @@ class TokenClustering(nn.Module):
 
     Falls back to identity ordering when HW < 8*cluster_num (too few tokens).
     Centroids are bootstrapped lazily from the first batch seen.
+
+    DDP semantics
+    -------------
+    `means` is registered as a buffer. PyTorch DDP broadcasts buffers from
+    rank 0 at the start of every forward (broadcast_buffers=True by default),
+    so per-rank EMA updates on local shards would be silently discarded on
+    every step except rank 0's — wasting (N-1)/N of the effective batch for
+    centroid estimation. To use the full global batch:
+
+      * Bootstrap is performed on rank 0 only, then broadcast to all ranks
+        before the buffer flag is flipped (guarantees byte-identical init).
+      * `_center_iter` all-reduces the per-cluster sum and count across ranks
+        before applying the EMA update, so every rank applies the SAME global
+        update — matching DDP's broadcast-from-rank-0 contract.
     """
 
     def __init__(
@@ -37,19 +59,48 @@ class TokenClustering(nn.Module):
 
     @torch.no_grad()
     def _bootstrap_from_batch(self, x_flat: torch.Tensor) -> None:
-        n = x_flat.shape[0]
-        idx = torch.randperm(n, device=x_flat.device)[: self.cluster_num]
-        self.means.copy_(x_flat[idx].detach())
+        if _dist_active():
+            if dist.get_rank() == 0:
+                n = x_flat.shape[0]
+                idx = torch.randperm(n, device=x_flat.device)[: self.cluster_num]
+                self.means.copy_(x_flat[idx].detach())
+            dist.broadcast(self.means, src=0)
+        else:
+            n = x_flat.shape[0]
+            idx = torch.randperm(n, device=x_flat.device)[: self.cluster_num]
+            self.means.copy_(x_flat[idx].detach())
         self.initted.fill_(True)
 
     @torch.no_grad()
     def _center_iter(self, x_flat: torch.Tensor, assign_flat: torch.Tensor) -> None:
-        """Single hard-assignment EMA centroid update — in-place, no graph."""
-        for k in range(self.cluster_num):
-            mask = assign_flat == k
-            if mask.sum() > 0:
-                new_mean = x_flat[mask].mean(dim=0)
-                self.means[k].mul_(self.momentum).add_(new_mean * (1.0 - self.momentum))
+        """Single hard-assignment EMA centroid update — in-place, no graph.
+
+        Aggregates sums and counts across ranks so the EMA uses the full
+        global batch rather than only rank 0's local shard (which is what
+        broadcast_buffers=True would otherwise enforce).
+        """
+        D = x_flat.shape[1]
+        device = x_flat.device
+        K = self.cluster_num
+
+        sums = x_flat.new_zeros(K, D)
+        counts = torch.zeros(K, device=device, dtype=torch.float32)
+        sums.index_add_(0, assign_flat, x_flat)
+        counts.index_add_(
+            0, assign_flat, torch.ones_like(assign_flat, dtype=torch.float32)
+        )
+
+        if _dist_active():
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+        nonempty = counts > 0
+        if nonempty.any():
+            new_means = sums[nonempty] / counts[nonempty].unsqueeze(1)
+            self.means[nonempty] = (
+                self.means[nonempty] * self.momentum
+                + new_means * (1.0 - self.momentum)
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

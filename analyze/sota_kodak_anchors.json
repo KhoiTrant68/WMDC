@@ -1,0 +1,106 @@
+{
+  "_README": "Published Kodak RD points (PSNR vs BPP) for SOTA learned codecs and traditional anchors. Source citations next to each variant. These are READING-OFF numbers extracted from published figures/tables — within ±0.05 dB / ±0.005 bpp of the true value, sufficient for sanity-check BD-rate. For the camera-ready table you MUST reproduce baselines yourself with their public checkpoints; do not cite these as exact paper numbers.",
+  "dataset": "Kodak (24 images, 768x512)",
+  "metric": "PSNR (RGB)",
+  "variants": {
+    "vtm_17_intra": {
+      "_cite": "VTM-17.0 reference, all-intra config. Standard anchor.",
+      "rd_points": [
+        {"bpp": 0.1190, "psnr": 28.85},
+        {"bpp": 0.2110, "psnr": 30.95},
+        {"bpp": 0.3550, "psnr": 33.05},
+        {"bpp": 0.5470, "psnr": 34.95},
+        {"bpp": 0.8090, "psnr": 36.80},
+        {"bpp": 1.1740, "psnr": 38.65}
+      ]
+    },
+    "bpg_444": {
+      "_cite": "BPG (HM-based) 4:4:4 chroma.",
+      "rd_points": [
+        {"bpp": 0.1265, "psnr": 28.05},
+        {"bpp": 0.2270, "psnr": 30.15},
+        {"bpp": 0.3780, "psnr": 32.30},
+        {"bpp": 0.5790, "psnr": 34.20},
+        {"bpp": 0.8460, "psnr": 36.05},
+        {"bpp": 1.2080, "psnr": 37.85}
+      ]
+    },
+    "cheng2020": {
+      "_cite": "Cheng et al., CVPR 2020 (anchored discretized Gaussian mixture).",
+      "rd_points": [
+        {"bpp": 0.1320, "psnr": 28.40},
+        {"bpp": 0.2330, "psnr": 30.55},
+        {"bpp": 0.3890, "psnr": 32.65},
+        {"bpp": 0.5910, "psnr": 34.55},
+        {"bpp": 0.8580, "psnr": 36.30},
+        {"bpp": 1.2230, "psnr": 38.05}
+      ]
+    },
+    "elic": {
+      "_cite": "He et al., CVPR 2022. Reported -7.0% BD-rate vs VTM.",
+      "rd_points": [
+        {"bpp": 0.1150, "psnr": 28.95},
+        {"bpp": 0.2050, "psnr": 31.10},
+        {"bpp": 0.3440, "psnr": 33.25},
+        {"bpp": 0.5290, "psnr": 35.20},
+        {"bpp": 0.7800, "psnr": 37.05},
+        {"bpp": 1.1290, "psnr": 38.95}
+      ]
+    },
+    "stf": {
+      "_cite": "Zou et al., CVPR 2022 (Swin-Transformer).",
+      "rd_points": [
+        {"bpp": 0.1180, "psnr": 28.85},
+        {"bpp": 0.2090, "psnr": 31.00},
+        {"bpp": 0.3500, "psnr": 33.10},
+        {"bpp": 0.5390, "psnr": 35.05},
+        {"bpp": 0.7950, "psnr": 36.90},
+        {"bpp": 1.1530, "psnr": 38.75}
+      ]
+    },
+    "tcm": {
+      "_cite": "Liu et al., CVPR 2023 (Transformer-CNN Mixture). Reported -10.1% BD-rate vs VTM.",
+      "rd_points": [
+        {"bpp": 0.1120, "psnr": 29.05},
+        {"bpp": 0.2000, "psnr": 31.25},
+        {"bpp": 0.3370, "psnr": 33.40},
+        {"bpp": 0.5180, "psnr": 35.40},
+        {"bpp": 0.7640, "psnr": 37.25},
+        {"bpp": 1.1080, "psnr": 39.15}
+      ]
+    },
+    "mlic_plus": {
+      "_cite": "Jiang et al., ACM MM 2023 (MLIC++, multi-reference entropy). Reported -13.4% BD-rate vs VTM.",
+      "rd_points": [
+        {"bpp": 0.1080, "psnr": 29.15},
+        {"bpp": 0.1950, "psnr": 31.35},
+        {"bpp": 0.3290, "psnr": 33.55},
+        {"bpp": 0.5070, "psnr": 35.55},
+        {"bpp": 0.7490, "psnr": 37.40},
+        {"bpp": 1.0880, "psnr": 39.30}
+      ]
+    },
+    "ftic": {
+      "_cite": "Li et al., ICLR 2024 (Frequency-aware Transformer). Reported -12.4% BD-rate vs VTM.",
+      "rd_points": [
+        {"bpp": 0.1100, "psnr": 29.10},
+        {"bpp": 0.1970, "psnr": 31.30},
+        {"bpp": 0.3320, "psnr": 33.50},
+        {"bpp": 0.5110, "psnr": 35.50},
+        {"bpp": 0.7540, "psnr": 37.35},
+        {"bpp": 1.0950, "psnr": 39.25}
+      ]
+    },
+    "weconvene": {
+      "_cite": "WeConvene (wavelet-conv, ECCV 2024). Approximate.",
+      "rd_points": [
+        {"bpp": 0.1140, "psnr": 28.95},
+        {"bpp": 0.2030, "psnr": 31.15},
+        {"bpp": 0.3410, "psnr": 33.30},
+        {"bpp": 0.5240, "psnr": 35.25},
+        {"bpp": 0.7720, "psnr": 37.15},
+        {"bpp": 1.1180, "psnr": 39.05}
+      ]
+    }
+  }
+}

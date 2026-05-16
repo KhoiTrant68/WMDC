@@ -497,6 +497,31 @@ class WMDC(CompressionModel):
         """Auxiliary loss for entropy bottleneck CDF approximation."""
         return sum(m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck))
 
+    def sinkhorn_telemetry(self) -> dict:
+        """
+        Aggregate Sinkhorn-stability telemetry across all slice attentions.
+
+        Returns a dict suitable for both logging and inclusion in the paper's
+        stability section.  `fallback_rate` is the fraction of forward calls
+        across all slices that triggered the softmax fallback — reviewers ask
+        for this number directly, so it lives next to the model rather than
+        scattered across attention modules.
+        """
+        total_calls = 0
+        total_fb = 0
+        per_slice: list[dict] = []
+        for i, attn in enumerate(self.eot_attentions):
+            t = attn.sinkhorn_telemetry()
+            per_slice.append({"slice": i, **t})
+            total_calls += t["calls"]
+            total_fb += t["fallbacks"]
+        return {
+            "total_calls": total_calls,
+            "total_fallbacks": total_fb,
+            "fallback_rate": total_fb / max(total_calls, 1),
+            "per_slice": per_slice,
+        }
+
     def _hyper_decode(self, z_hat: torch.Tensor):
         """
         Shared hyper-decoder trunk → latent scale and mean maps.
