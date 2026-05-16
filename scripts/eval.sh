@@ -20,6 +20,9 @@ eval_routing() {
     echo "=== Evaluating routing-mode ablation ==="
     cd "$REPO"
 
+    local ca_flags=""
+    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && ca_flags="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
+
     for mode in "${ROUTING_MODES[@]}"; do
         local ckpt="$CHECKPOINT_ROOT/routing/$mode/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar"
         local out="$RESULTS_DIR/routing/$mode"
@@ -33,11 +36,13 @@ eval_routing() {
         echo "-- routing-mode=$mode"
         mkdir -p "$out"
 
+        # shellcheck disable=SC2086  # word-split intentional for flags
         $PYTHON eval.py \
             --dataset "$KODAK_DIR" \
             --checkpoint "$ckpt" \
             --output "$out" \
             --routing-mode "$mode" \
+            $ca_flags \
             --cuda \
             --measure-dict-util
 
@@ -49,6 +54,9 @@ eval_ablation() {
     echo ""
     echo "=== Evaluating component-removal ablation ==="
     cd "$REPO"
+
+    local ca_flags=""
+    [ "${CONTENT_ADAPTIVE:-0}" -eq 1 ] && ca_flags="--content-adaptive --cluster-num ${CLUSTER_NUM:-8}"
 
     for variant in "${VARIANTS[@]}"; do
         for lam in "${LAMBDAS_ABLATION[@]}"; do
@@ -73,6 +81,7 @@ eval_ablation() {
                 --output "$out" \
                 --routing-mode unbalanced_eot \
                 $eval_flags \
+                $ca_flags \
                 --cuda \
                 --measure-dict-util
 
