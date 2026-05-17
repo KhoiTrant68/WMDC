@@ -334,12 +334,13 @@ class WLS(nn.Module):
 
         self.dwt = DWT_2D(wave=wave)
         self.proj = OLP(in_dim * 4, out_dim)
+        # Direct (non-exp) parameterisation so HH=0 actually zeros the band.
         factors = torch.cat(
             [
-                torch.full((1, 1, in_dim), 0.5),  # LL
-                torch.full((1, 1, in_dim), 0.5),  # LH
-                torch.full((1, 1, in_dim), 0.5),  # HL
-                torch.zeros(1, 1, in_dim),  # HH (zero-init)
+                torch.full((1, 1, in_dim), 1.0),  # LL
+                torch.full((1, 1, in_dim), 1.0),  # LH
+                torch.full((1, 1, in_dim), 1.0),  # HL
+                torch.zeros(1, 1, in_dim),  # HH — actually zero at init
             ],
             dim=2,
         )
@@ -349,7 +350,7 @@ class WLS(nn.Module):
         x = self.dwt(x)  # (B, 4C, H/2, W/2)
         b, _, h, w = x.shape
         x = x.view(b, -1, h * w).permute(0, 2, 1)  # (B, HW, 4C)
-        x = x * torch.exp(self.scaling_factors)
+        x = x * self.scaling_factors
         x = self.proj(x)
         return x.view(b, h, w, -1).permute(0, 3, 1, 2).contiguous()
 
@@ -365,9 +366,9 @@ class iWLS(nn.Module):
         self.proj = OLP(in_dim, out_dim * 4)
         factors = torch.cat(
             [
-                torch.full((1, 1, out_dim), 0.5),
-                torch.full((1, 1, out_dim), 0.5),
-                torch.full((1, 1, out_dim), 0.5),
+                torch.full((1, 1, out_dim), 1.0),
+                torch.full((1, 1, out_dim), 1.0),
+                torch.full((1, 1, out_dim), 1.0),
                 torch.zeros(1, 1, out_dim),
             ],
             dim=2,
@@ -378,7 +379,9 @@ class iWLS(nn.Module):
         b, _, h, w = x.shape
         x = x.view(b, -1, h * w).permute(0, 2, 1)
         x = self.proj(x)
-        x = x / torch.exp(self.scaling_factors)
+        # Symmetric to WLS: forward applies `* factor`; here scale by factor too
+        # (no exp). HH=0 at init ⇒ no HH contribution from the synthesis branch.
+        x = x * self.scaling_factors
         x = x.view(b, h, w, -1).permute(0, 3, 1, 2).contiguous()
         return self.idwt(x)
 

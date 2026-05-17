@@ -61,7 +61,12 @@ class QueryDictionaryGenerator(nn.Module):
         if self.training:
             sim_matrix = torch.bmm(dt, dt.transpose(1, 2))
             I = torch.eye(self.dict_num, device=dt.device).unsqueeze(0)
-            penalty = F.relu(sim_matrix - I).pow(2).mean()
+            # Symmetric coherence penalty: off-diagonals should be near 0,
+            # both positive (near-duplicate atoms) and negative (anti-aligned
+            # near-duplicates) hurt incoherence equally.  ‖sim − I‖² minimises
+            # |off-diag| without favouring sign — identical to a Welch-bound
+            # / RIP-style frame-coherence loss.
+            penalty = (sim_matrix - I).pow(2).mean()
 
         return dt * self._sqrt_dict_dim, penalty
 
@@ -160,21 +165,33 @@ class UnifiedDictionaryAttention(nn.Module):
         self.sinkhorn_divergence_count: int = 0
 
     # -----------------------------------------------------------------------
-    # Eps floor — reviewer hardening
+    # Bounded eps — fixes the "log_eps collapse" failure mode
     # -----------------------------------------------------------------------
     #
-    # Originally `eps = softplus(log_eps) + 0.01`, which lets the optimiser
-    # drive eps arbitrarily close to 0.01.  With cosine-distance C ∈ [0, 2]
-    # the matrix M = C / eps can then exceed 200, and although our Sinkhorn
-    # is log-domain (stable in isolation), the unbalanced shrink updates
-    # `(rho/(rho+eps)) * lse` can still produce NaN when log_f, log_g blow
-    # up together.  Reviewer feedback recommended a tighter floor; we use
-    # 0.05 so MAX|M| ≤ 40 in the worst case while still allowing eps to
-    # adapt over a meaningful range.
+    # Original parameterisation:    eps = softplus(log_eps) + 0.05
+    # ------------------------------------------------------------
+    # softplus is monotone and the optimiser is always rewarded for shrinking
+    # eps (sharper Sinkhorn ⇒ peaked routing ⇒ lower rate).  After a few
+    # thousand steps `softplus(log_eps)` saturates at 0, `log_eps` drifts to
+    # −∞, and the *gradient* through log_eps becomes vanishingly small.  The
+    # parameter is effectively dead, eps is pinned to the floor, and we have
+    # no eps adaptation at all.
+    #
+    # New parameterisation:        eps = EPS_FLOOR + EPS_RANGE · sigmoid(log_eps)
+    # -------------------------------------------------------------------------
+    # eps is bounded in [EPS_FLOOR, EPS_FLOOR + EPS_RANGE] = [0.05, 1.0], and
+    # sigmoid keeps a strictly positive derivative everywhere (no saturation
+    # rail).  log_eps stays trainable for the lifetime of the run.
+    #
+    # Default init log_eps = log(0.1) ≈ −2.30 gives:
+    #   sigmoid(-2.30) ≈ 0.091  →  eps ≈ 0.05 + 0.95·0.091 ≈ 0.137
+    # (within ~6 % of the legacy initial eps ≈ 0.146, so resumed checkpoints
+    # behave nearly identically.)
     EPS_FLOOR: float = 0.05
+    EPS_RANGE: float = 0.95  # so eps ∈ [0.05, 1.00]
 
     def _eps(self) -> torch.Tensor:
-        return F.softplus(self.log_eps) + self.EPS_FLOOR
+        return self.EPS_FLOOR + self.EPS_RANGE * torch.sigmoid(self.log_eps)
 
     def sinkhorn_telemetry(self) -> dict:
         """Return current fallback statistics.  Safe to call any time."""
@@ -266,12 +283,24 @@ class UnifiedDictionaryAttention(nn.Module):
     # Balanced Sinkhorn (log-domain)
     # -----------------------------------------------------------------------
 
-    def _route_balanced_eot(self, C_mat: torch.Tensor) -> torch.Tensor:
+    def _route_balanced_eot(
+        self,
+        C_mat: torch.Tensor,
+        log_b_override: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        log_b_override : optional (B, 1, N) tensor that *replaces* the uniform
+                         column target marginal. Used by the multi-marginal /
+                         conditional-OT slice loop to make later slices avoid
+                         dictionary atoms already heavily used by earlier ones.
+                         When None (default), behaves identically to balanced
+                         Sinkhorn with uniform b = 1/N.
+        """
         B, HW, N = C_mat.shape
         self._sinkhorn_calls += 1
         eps = self._eps()
         log_a = -math.log(HW)
-        log_b = -math.log(N)
+        log_b = log_b_override if log_b_override is not None else -math.log(N)
         M = C_mat / eps
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
@@ -334,10 +363,16 @@ class UnifiedDictionaryAttention(nn.Module):
     # -----------------------------------------------------------------------
 
     def _route_unbalanced_eot(
-        self, C_mat: torch.Tensor, rho_flat: torch.Tensor
+        self,
+        C_mat: torch.Tensor,
+        rho_flat: torch.Tensor,
+        log_b_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Unbalanced entropic OT in log-domain.
+
+        log_b_override : optional (B, 1, N) tensor that *replaces* the uniform
+                         column target marginal.  See `_route_balanced_eot`.
         """
         B, HW, N = C_mat.shape
         self._sinkhorn_calls += 1
@@ -346,7 +381,7 @@ class UnifiedDictionaryAttention(nn.Module):
         rho_col = F.softplus(self.log_rho_col) + 0.01  # strictly positive scalar
 
         log_a = -math.log(HW)
-        log_b = -math.log(N)
+        log_b = log_b_override if log_b_override is not None else -math.log(N)
         M = C_mat / eps
 
         log_f = C_mat.new_zeros(B, HW, 1)
@@ -440,7 +475,18 @@ class UnifiedDictionaryAttention(nn.Module):
         v: torch.Tensor,
         rho_spatial: torch.Tensor | None,
         calc_disp: bool = False,
+        log_b_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
+        """
+        log_b_override : optional (B, 1, N) tensor.  When supplied, the column
+                         target marginal `b` in the Sinkhorn iterations is set
+                         to `exp(log_b_override)` instead of the uniform 1/N.
+                         Used by the multi-marginal slice loop in WMDC: the
+                         previous slices' column usage shifts later slices'
+                         routing targets, enforcing cross-slice dictionary
+                         specialisation.  Ignored by softmax routing (which
+                         has no column-marginal concept).
+        """
         B, _, H, W = x.shape
         HW = H * W
 
@@ -449,12 +495,14 @@ class UnifiedDictionaryAttention(nn.Module):
         if self.routing_mode == "softmax":
             P = self._route_softmax(C_mat)
         elif self.routing_mode == "balanced_eot":
-            P = self._route_balanced_eot(C_mat)
+            P = self._route_balanced_eot(C_mat, log_b_override=log_b_override)
             P = P * HW
         elif self.routing_mode == "unbalanced_eot":
             assert rho_spatial is not None, "rho_spatial required for unbalanced_eot"
             rho_flat = rho_spatial.view(B, HW).float().clamp(min=0.01)
-            P = self._route_unbalanced_eot(C_mat, rho_flat)
+            P = self._route_unbalanced_eot(
+                C_mat, rho_flat, log_b_override=log_b_override
+            )
             P = P * HW
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode!r}")
@@ -499,10 +547,18 @@ class UnifiedDictionaryAttention(nn.Module):
             column_neg_entropy = zero
             row_entropy = zero
 
+        # Detached column marginal — used by the multi-marginal slice loop
+        # to build log_b_override for the next slice.  Cheap to compute and
+        # adds no gradient surface (it is consumed only as a no-grad prior).
+        with torch.no_grad():
+            col_sum = P.sum(dim=1)  # (B, N)
+            col_mass = col_sum / col_sum.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
         aux = {
             "column_neg_entropy": column_neg_entropy,
             "row_entropy": row_entropy,
             "row_mass": row_mass,
+            "col_mass": col_mass,
             "tv_loss": tv_loss,
         }
         return self.out_proj(out), aux

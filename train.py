@@ -133,6 +133,7 @@ class RateDistortionLoss(nn.Module):
         column_entropy_weight: float = 0.01,
         row_entropy_weight: float = 0.05,
         alignment_weight: float = 0.2,
+        alignment_margin: float = 0.2,
         dict_penalty_weight: float = 0.1,
         ortho_weight: float = 0.01,
     ):
@@ -143,6 +144,7 @@ class RateDistortionLoss(nn.Module):
         self.column_entropy_weight = float(column_entropy_weight)
         self.row_entropy_weight = float(row_entropy_weight)
         self.alignment_weight = float(alignment_weight)
+        self.alignment_margin = float(alignment_margin)
         self.dict_penalty_weight = float(dict_penalty_weight)
         self.ortho_weight = float(ortho_weight)
 
@@ -168,16 +170,20 @@ class RateDistortionLoss(nn.Module):
     # Anti-leakage alignment regulariser
     # -----------------------------------------------------------------------
 
-    @staticmethod
     def _alignment_loss(
-        row_mass: torch.Tensor, complexity: torch.Tensor
+        self, row_mass: torch.Tensor, complexity: torch.Tensor
     ) -> torch.Tensor:
         """
-        Hinge on the NEGATIVE Pearson correlation between per-pixel row mass
-        and per-pixel content complexity:
+        Margin-hinge on Pearson correlation between per-pixel row mass and
+        per-pixel content complexity:
 
-            L_align = E_batch,slice [ ReLU( −corr(row_mass, complexity) ) ]
-                    ∈ [0, 1]
+            L_align = E_batch,slice [ ReLU( margin − corr(row_mass, complexity) ) ]
+                    ∈ [0, 1 + margin]
+
+        margin = 0 reproduces the original sign-only constraint (corr ≥ 0).
+        margin > 0 demands a STRICTLY positive correlation; values below the
+        margin are linearly penalised.  Stronger than the sign hinge: a
+        statistically insignificant +0.02 correlation is no longer "free".
 
         Parameters
         ----------
@@ -204,7 +210,7 @@ class RateDistortionLoss(nn.Module):
         num = (rm * co).sum(dim=-1)
         den = rm.norm(dim=-1) * co.norm(dim=-1) + 1e-8
         corr = num / den  # (B*S,)
-        return F.relu(-corr).mean()
+        return F.relu(self.alignment_margin - corr).mean()
 
     # -----------------------------------------------------------------------
     # Forward
@@ -777,11 +783,21 @@ def parse_args():
         type=float,
         default=0.2,
         help=(
-            "γ: weight on the anti-leakage hinge "
-            "ReLU(−Pearson(row_mass, complexity)).  Penalises only the "
-            "wrong-sign correlation — zero on data already aligned. "
-            "The failed checkpoint had corr = −0.66 (UEOT leakage).  "
-            "Set 0 to disable."
+            "γ: weight on the margin hinge "
+            "ReLU(margin − Pearson(row_mass, complexity)).  Penalises any "
+            "correlation below `--alignment-margin`. The failed checkpoint "
+            "had corr = −0.66 (UEOT leakage).  Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--alignment-margin",
+        type=float,
+        default=0.2,
+        help=(
+            "Margin used inside the alignment hinge.  0 reproduces the "
+            "sign-only constraint (corr ≥ 0).  0.2 demands strictly "
+            "positive correlation ≥ 0.2 — discourages 'safe but useless' "
+            "near-zero alignments."
         ),
     )
     p.add_argument(
@@ -833,6 +849,29 @@ def parse_args():
         default=False,
         dest="use_wls_shortcut",
         help="Enable WLS/iWLS multi-scale wavelet shortcuts in encoder/decoder (CMIC-style).",
+    )
+    p.add_argument(
+        "--use-conditional-marginals",
+        action="store_true",
+        default=False,
+        dest="use_conditional_marginals",
+        help=(
+            "Enable multi-marginal OT across slices: later slices' column "
+            "target marginal b_i is shifted by the cumulative usage of "
+            "earlier slices, so the dictionary is treated as a shared budget. "
+            "Only meaningful with --routing-mode={balanced_eot,unbalanced_eot}."
+        ),
+    )
+    p.add_argument(
+        "--cond-alpha",
+        type=float,
+        default=0.5,
+        dest="cond_alpha",
+        help=(
+            "Strength of the conditional column-marginal shift α ∈ [0, 1). "
+            "0 = uniform b (no cross-slice coupling), 1 = atoms used by "
+            "any prior slice are floored at b_unif·1e-2.  Default 0.5."
+        ),
     )
     p.add_argument(
         "--memory-init",
@@ -981,6 +1020,8 @@ def main():
         use_content_adaptive=args.use_content_adaptive,
         cluster_num=args.cluster_num,
         use_wls_shortcut=args.use_wls_shortcut,
+        use_conditional_marginals=args.use_conditional_marginals,
+        cond_alpha=args.cond_alpha,
     )
 
     optimizer, aux_optimizer = configure_optimizers(model, args)
@@ -997,6 +1038,7 @@ def main():
         column_entropy_weight=args.column_entropy_weight,
         row_entropy_weight=args.row_entropy_weight,
         alignment_weight=args.alignment_weight,
+        alignment_margin=args.alignment_margin,
         dict_penalty_weight=args.dict_penalty_weight,
         ortho_weight=args.ortho_weight,
     ).to(accelerator.device)

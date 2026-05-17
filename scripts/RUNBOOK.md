@@ -79,8 +79,10 @@ for LAM in 0.0035 0.013 0.0483; do
     train_variant no_fdm           $LAM "--backbone ss2d"
     train_variant no_stateful_mem  $LAM "--use-dense-concat"
     train_variant no_bootstrap_M1  $LAM "--memory-init zero"
-    train_variant no_disp_bonus    $LAM "--disp-weight 0.0"
+    train_variant no_disp_bonus    $LAM "--column-entropy-weight 0.0 --row-entropy-weight 0.0 --alignment-weight 0.0"
     train_variant no_dict_penalty  $LAM "--dict-penalty-weight 0.0"
+    train_variant no_cond_marg     $LAM ""          # default: --use-conditional-marginals OFF
+    train_variant full_cond_marg   $LAM "--use-conditional-marginals --cond-alpha 0.5"
 done
 ```
 

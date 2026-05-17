@@ -58,13 +58,36 @@ VARIANTS: dict[str, dict] = {
     },
     "no_disp_bonus": {
         # Ablate the ENTIRE dictionary-routing regularisation block:
-        # column-entropy bonus, row-entropy sparsity penalty, AND the
-        # anti-leakage alignment hinge.  This mirrors the original
-        # ablation intent ("remove the −α·H entropy bonus") but is
-        # adapted to the refactored MI-decomposition loss.
+        # column-entropy bonus + row-entropy sparsity penalty + anti-leakage
+        # alignment hinge.  KEPT for backwards compatibility with the
+        # original Table 4; use the three split variants below
+        # (no_col_entropy / no_row_entropy / no_alignment) for the diagnostic
+        # breakdown — reviewers consistently ask "which of the three matters?"
         "--column-entropy-weight": 0.0,
         "--row-entropy-weight": 0.0,
         "--alignment-weight": 0.0,
+    },
+    # ── Split version of no_disp_bonus — Phase-2 diagnostic ──────────
+    "no_col_entropy": {
+        # Drop only the −H_col bonus.  Tests the "every atom is used"
+        # claim in isolation.
+        "--column-entropy-weight": 0.0,
+    },
+    "no_row_entropy": {
+        # Drop only the +H_row penalty.  Tests the "per-pixel sparsity"
+        # claim in isolation.
+        "--row-entropy-weight": 0.0,
+    },
+    "no_alignment": {
+        # Drop only the complexity-alignment hinge.  Tests the "anti-
+        # leakage" claim in isolation.
+        "--alignment-weight": 0.0,
+    },
+    "no_alignment_margin": {
+        # Keep the alignment loss but set margin=0 (legacy sign-only hinge).
+        # Tests whether the strictly-positive correlation requirement
+        # (κ = 0.2) actually buys anything over the sign hinge.
+        "--alignment-margin": 0.0,
     },
     "no_dict_penalty": {
         # Set fixed dictionary-penalty weight to zero.
@@ -73,8 +96,12 @@ VARIANTS: dict[str, dict] = {
     # ── CMIC-derived components (added Phase 1–3) ─────────────────────
     "no_wls": {
         # Disable WLS/iWLS multi-scale wavelet shortcuts.  In config.sh
-        # this is realised by stripping --use-wls-shortcut via the
-        # __SKIP_WLS__ sentinel token rather than by adding a flag.
+        # this is realised by STRIPPING `--use-wls-shortcut` from the
+        # baseline command line via the `__SKIP_WLS__` sentinel that the
+        # bash helper recognises (see config.sh::common_arch_flags).
+        # The Python config has no flag to add because the baseline
+        # passes `--use-wls-shortcut` and we *remove* it — there is no
+        # corresponding "no-wls-shortcut" flag to add.
     },
     "no_olp": {
         # Disable the OLP orthogonality regulariser (still keeps the OLP
@@ -84,6 +111,19 @@ VARIANTS: dict[str, dict] = {
     "no_ste_y": {
         # Train without the STE-on-y schedule (matches pre-Phase-1 behaviour).
         "--last-epochs-with-ste": 0,
+    },
+    # ── Multi-marginal OT ablation (Phase B8) ─────────────────────────
+    # The full model defaults to use_conditional_marginals=False; the
+    # *positive* ablation toggles it ON to measure the cross-slice
+    # dictionary-specialisation gain.
+    "full_cond_marg": {
+        "--use-conditional-marginals": True,
+        "--cond-alpha": 0.5,
+    },
+    "full_cond_marg_strong": {
+        # Higher cross-slice coupling (α = 0.9, near-maximum).
+        "--use-conditional-marginals": True,
+        "--cond-alpha": 0.9,
     },
 }
 
@@ -95,10 +135,16 @@ RUN_ORDER = [
     "no_stateful_mem",
     "no_bootstrap_M1",
     "no_disp_bonus",
+    "no_col_entropy",
+    "no_row_entropy",
+    "no_alignment",
+    "no_alignment_margin",
     "no_dict_penalty",
     "no_wls",
     "no_olp",
     "no_ste_y",
+    "full_cond_marg",
+    "full_cond_marg_strong",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -107,13 +153,16 @@ RUN_ORDER = [
 # train.py / models/WMDC.py must accept the following CLI flags:
 #
 #   --routing-mode {softmax, balanced_eot, unbalanced_eot}
-#   --backbone {fdm, cnn, swin, ss2d, fdm_reversed}    (NEW; see ablation_models/backbone_variants.py)
-#   --use-dense-concat                                  (NEW; see analyze/measure_vram.py footer)
-#   --memory-init {bootstrap, zero}                     (NEW; trivial — see WMDC.init_memory)
+#   --backbone {fdm, cnn, swin, ss2d, fdm_reversed}    (ablation_models/backbone_variants.py)
+#   --use-dense-concat                                  (analyze/measure_vram.py footer)
+#   --memory-init {bootstrap, zero}                     (see WMDC.init_memory)
 #   --column-entropy-weight <float>                     (β_col: −H_col bonus)
 #   --row-entropy-weight    <float>                     (β_row: H_row penalty)
-#   --alignment-weight      <float>                     (γ: anti-leakage hinge)
+#   --alignment-weight      <float>                     (γ: alignment hinge)
+#   --alignment-margin      <float>                     (κ: margin inside the hinge)
 #   --dict-penalty-weight   <float>                     (δ: token diversity)
+#   --use-conditional-marginals                         (B8: multi-marginal OT)
+#   --cond-alpha            <float>                     (α: cross-slice coupling)
 #
 # When in doubt about a flag's effect, search train.py for the existing
 # wiring in RateDistortionLoss and follow the same pattern.

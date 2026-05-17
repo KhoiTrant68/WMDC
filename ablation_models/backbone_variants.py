@@ -7,9 +7,29 @@ the original FDM block:
 
     forward(x: (B, C, H, W)) -> (B, C, H, W)
 
-and the SAME parameter count regime (within ~10% of one another) so that
-the comparison isolates the architectural difference rather than the
-parameter budget.
+Parameter-count note (be honest with reviewers)
+-----------------------------------------------
+The variants are NOT param-matched to FDM out of the box.  At dim=192:
+
+    Variant            Approx params per block (dim=192)
+    ------------------ ---------------------------------
+    FDMReversedBlock   ~ FDM (1 VSS + 4 FiLM + fusion)        ≈ 0.85 M
+    FDM (reference)    2 VSSBlock + 4 FiLM + fusion           ≈ 0.85 M
+    SwinBlock          window-attn(8) + 2-layer MLP           ≈ 0.29 M
+    ResidualCNNBlock   two 3×3 convs, dim→dim, identity init  ≈ 0.66 M
+    SS2DBlock          a single VSSBlock                       ≈ 0.05 M
+
+If the goal is to isolate the *architectural* choice (wavelet vs not) at
+fixed capacity, the comparison should be **FLOPs-matched** at training
+time, not param-matched at construction time:
+
+    * Stack two ResidualCNNBlock or two SS2DBlock in a row, or
+    * Bump hidden_mult on ResidualCNNBlock until param count matches FDM,
+    * Or compare BD-rate / Mparam across these blocks (report both axes).
+
+The current factory builds the **literal** variants for compatibility with
+existing checkpoints; the bench / ablation script is expected to layer
+the FLOPs / param-matching on top.
 
 Variants
 --------
@@ -20,6 +40,7 @@ Variants
                         direction reversed (HF conditions LL). Used as a
                         controlled ablation to confirm that LL→HF (the
                         direction we use) is the operative choice.
+                        THIS one IS param-matched to FDM ≈ 0.85 M.
 
 Usage from training script
 --------------------------

@@ -243,6 +243,8 @@ class WMDC(CompressionModel):
         use_content_adaptive: bool = False,
         cluster_num: int = 8,
         use_wls_shortcut: bool = False,
+        use_conditional_marginals: bool = False,
+        cond_alpha: float = 0.5,
     ):
         super().__init__()
         self.N = N
@@ -258,6 +260,22 @@ class WMDC(CompressionModel):
         self.use_content_adaptive = use_content_adaptive
         self.cluster_num = cluster_num
         self.use_wls_shortcut = use_wls_shortcut
+        # ── Conditional multi-marginal OT across slices ──────────────────
+        # When enabled, the column target marginal b for slice i is shifted
+        # by the cumulative column usage of slices 0..i-1, so later slices
+        # avoid dictionary atoms heavily used by earlier ones.  Theoretical
+        # rationale: the dictionary is a shared budget across the
+        # autoregressive slice loop; cross-slice specialisation should be
+        # enforced by the routing layer itself, not just by independent
+        # per-slice K/V projections.  See THEORY.md §2 for the derivation.
+        self.use_conditional_marginals = use_conditional_marginals
+        self.cond_alpha = float(cond_alpha)
+        # Routing modes that have a column-marginal concept.  Softmax does
+        # not, so the conditional override is a no-op there.
+        self._cond_active = use_conditional_marginals and routing_mode in {
+            "balanced_eot",
+            "unbalanced_eot",
+        }
 
         # DDP-safe, never silently reset on checkpoint resume.
         self.register_buffer("_use_ste_flag", torch.zeros(1, dtype=torch.bool))
@@ -682,9 +700,53 @@ class WMDC(CompressionModel):
         edge = torch.sqrt(gx * gx + gy * gy + 1e-12)  # (B, 1, H, W)
 
         edge_z = F.adaptive_avg_pool2d(edge, target_size).flatten(1)  # (B, Hz*Wz)
-        mn = edge_z.amin(dim=1, keepdim=True)
-        mx = edge_z.amax(dim=1, keepdim=True)
-        return (edge_z - mn) / (mx - mn + 1e-8)
+        # Robust percentile normalisation (5 % – 95 %).  A single bright
+        # pixel can dominate amin/amax and flatten the rest of the map; the
+        # quantile-based version is invariant to <5 % outliers and keeps the
+        # bulk of the histogram in [0, 1].
+        lo = torch.quantile(edge_z, 0.05, dim=1, keepdim=True)
+        hi = torch.quantile(edge_z, 0.95, dim=1, keepdim=True)
+        return ((edge_z - lo) / (hi - lo + 1e-8)).clamp_(0.0, 1.0)
+
+    def _conditional_log_b(
+        self,
+        cum_col_usage: torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """
+        Build the per-slice column-target marginal `log_b_override` from the
+        cumulative column usage of previously-decoded slices.
+
+        Math
+        ----
+        For uniform target `b_unif = 1/N` and cumulative usage `u` (already
+        a probability vector over atoms) we set
+
+            b_i  ∝  max(b_unif − α · u, b_floor)            (un-normalised)
+            b_i  ← b_i / Σ_j b_i_j                          (re-normalised)
+            log_b_override = log b_i                        (shape (B, 1, N))
+
+        Edge cases
+        ----------
+        - First slice (no prior usage)   → return None (uniform b is used).
+        - Conditional mode disabled       → return None.
+        - α = 0                           → b_i = b_unif exactly; we still
+                                            return None to skip the override
+                                            (numerically identical, cheaper).
+        """
+        if not self._cond_active:
+            return None
+        if cum_col_usage is None or self.cond_alpha == 0.0:
+            return None
+
+        N = self.dict_num
+        b_unif = 1.0 / N
+        b_floor = b_unif * 1e-2  # never let an atom be fully blocked
+        b = (b_unif - self.cond_alpha * cum_col_usage).clamp(min=b_floor)  # (B, N)
+        b = b / b.sum(dim=-1, keepdim=True)
+        return b.to(device=device, dtype=dtype).log().unsqueeze(1)  # (B, 1, N)
 
     def _compute_rho_spatial(
         self,
@@ -818,6 +880,9 @@ class WMDC(CompressionModel):
         total_row_H = zero
         total_tv = zero
         row_mass_list: list[torch.Tensor] = []
+        # Running mean of column marginals over previously-decoded slices
+        # (no_grad — only used to build log_b for the next slice).
+        cum_col_usage: torch.Tensor | None = None
 
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
@@ -845,9 +910,26 @@ class WMDC(CompressionModel):
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, attn_aux = self.eot_attentions[i](
-                query, k_dict, v_dict, rho_spatial, calc_disp=self.training
+            log_b_override = self._conditional_log_b(
+                cum_col_usage, query.size(0), query.device, query.dtype
             )
+            dict_info, attn_aux = self.eot_attentions[i](
+                query,
+                k_dict,
+                v_dict,
+                rho_spatial,
+                calc_disp=self.training,
+                log_b_override=log_b_override,
+            )
+
+            # Update cumulative column usage (no-grad).  Running average so it
+            # stays a probability vector regardless of slice count.
+            if self._cond_active and "col_mass" in attn_aux:
+                col_mass_i = attn_aux["col_mass"].detach()  # (B, N)
+                if cum_col_usage is None:
+                    cum_col_usage = col_mass_i
+                else:
+                    cum_col_usage = (cum_col_usage * i + col_mass_i) / (i + 1)
 
             # Accumulate routing-entropy signals (per-slice averages).
             total_col_neg_H = total_col_neg_H + attn_aux["column_neg_entropy"]
@@ -987,6 +1069,8 @@ class WMDC(CompressionModel):
                 dtype=hyper_prior.dtype,
             )
 
+        cum_col_usage: torch.Tensor | None = None
+
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
             rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
@@ -1002,9 +1086,25 @@ class WMDC(CompressionModel):
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _aux = self.eot_attentions[i](
-                query, k_dict, v_dict, rho_spatial, calc_disp=False
+            log_b_override = self._conditional_log_b(
+                cum_col_usage, query.size(0), query.device, query.dtype
             )
+            dict_info, _aux = self.eot_attentions[i](
+                query,
+                k_dict,
+                v_dict,
+                rho_spatial,
+                calc_disp=False,
+                log_b_override=log_b_override,
+            )
+
+            if self._cond_active and "col_mass" in _aux:
+                col_mass_i = _aux["col_mass"].detach()
+                cum_col_usage = (
+                    col_mass_i
+                    if cum_col_usage is None
+                    else (cum_col_usage * i + col_mass_i) / (i + 1)
+                )
 
             if self.eot_attentions[i].attn_probs is not None:
                 self.slice_attn_probs.append(self.eot_attentions[i].attn_probs)
@@ -1081,6 +1181,8 @@ class WMDC(CompressionModel):
                 dtype=hyper_prior.dtype,
             )
 
+        cum_col_usage: torch.Tensor | None = None
+
         for i in range(self.num_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
             rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
@@ -1096,9 +1198,25 @@ class WMDC(CompressionModel):
             else:
                 query = torch.cat([hyper_prior, memory_state], dim=1)
 
-            dict_info, _aux = self.eot_attentions[i](
-                query, k_dict, v_dict, rho_spatial, calc_disp=False
+            log_b_override = self._conditional_log_b(
+                cum_col_usage, query.size(0), query.device, query.dtype
             )
+            dict_info, _aux = self.eot_attentions[i](
+                query,
+                k_dict,
+                v_dict,
+                rho_spatial,
+                calc_disp=False,
+                log_b_override=log_b_override,
+            )
+
+            if self._cond_active and "col_mass" in _aux:
+                col_mass_i = _aux["col_mass"].detach()
+                cum_col_usage = (
+                    col_mass_i
+                    if cum_col_usage is None
+                    else (cum_col_usage * i + col_mass_i) / (i + 1)
+                )
 
             if self.eot_attentions[i].attn_probs is not None:
                 self.slice_attn_probs.append(self.eot_attentions[i].attn_probs)
