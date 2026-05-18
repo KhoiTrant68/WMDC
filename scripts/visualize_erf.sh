@@ -23,10 +23,23 @@ CENTER_RADIUS="${CENTER_RADIUS:-1}"
 CMAP="${CMAP:-viridis}"
 ALPHA="${ALPHA:-0.6}"
 
-VIZ_DIR="$RESULTS_DIR/viz"
-IMAGES=("${IMAGES[@]:-kodim17.png kodim21.png kodim19.png kodim18.png kodim06.png}")
+DEFAULT_IMAGES=(
+    kodim17.png
+    kodim21.png
+    kodim19.png
+    kodim18.png
+    kodim06.png
+)
 
-# CKPT="$CHECKPOINT_ROOT/routing/$ROUTING_MODE/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar"
+if [ -n "${IMAGES:-}" ]; then
+    read -r -a IMAGES <<< "$IMAGES"
+else
+    IMAGES=("${DEFAULT_IMAGES[@]}")
+fi
+
+VIZ_DIR="$RESULTS_DIR/viz"
+
+# CKPT="${CKPT:-$CHECKPOINT_ROOT/routing/$ROUTING_MODE/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar}"
 CKPT="/kaggle/input/datasets/khitrnminh/18052026/checkpoint_best.pth.tar"
 CA_FLAGS="$(common_arch_flags)"
 
@@ -36,6 +49,9 @@ if [ ! -f "$CKPT" ]; then
 fi
 
 mkdir -p "$VIZ_DIR"
+
+OUT="$VIZ_DIR/erf_wmdc_${LAYOUT}_lambda_${LAMBDA}.pdf"
+
 cd "$REPO"
 
 echo "=== Per-image ERF visualization ==="
@@ -44,8 +60,6 @@ echo "  routing mode : $ROUTING_MODE"
 echo "  layout       : $LAYOUT"
 echo "  images       : ${IMAGES[*]}"
 echo "  center radius: $CENTER_RADIUS"
-
-OUT="$VIZ_DIR/erf_wmdc_${LAYOUT}_lambda_${LAMBDA}.pdf"
 
 # shellcheck disable=SC2086
 $PYTHON analyze/visualize_erf.py \
