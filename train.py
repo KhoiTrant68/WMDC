@@ -399,6 +399,12 @@ def train_one_epoch(
                 writer.add_scalar("Train/Alignment_hinge", align_meter.avg, step)
                 writer.add_scalar("Train/Dict_Penalty", dict_pen_meter.avg, step)
 
+    # Barrier so all ranks finish the epoch's NCCL ops before val/RNG-sync.
+    # Without this, slower ranks lag and the next epoch's broadcast in
+    # accelerate.synchronize_rng_states can overlap with leftover grad
+    # all-reduces from this epoch — producing out-of-order collectives
+    # and a 10-min watchdog timeout.
+    accelerator.wait_for_everyone()
     return rd_meter.avg
 
 
@@ -542,9 +548,15 @@ def test_epoch(
 
     gap_psnr: float = float("nan")
 
+    # Barrier before the expensive per-rank CDF rebuild — keeps ranks in
+    # lock-step entering val so the gather_for_metrics calls inside the loop
+    # match up cleanly.
+    accelerator.wait_for_everyone()
+
     # Rebuild entropy tables on the underlying model on every rank.
     # Required before ANY compress()/decompress() call below.
     accelerator.unwrap_model(model).update(force=True)
+    accelerator.wait_for_everyone()
 
     real_done = 0
     try:
@@ -662,6 +674,10 @@ def test_epoch(
 
     finally:
         criterion.train()
+
+    # Barrier so the slow per-rank measure_train_inference_gap / writer.add_*
+    # on rank 0 doesn't leave other ranks idle while rank 0 lags.
+    accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         real_str = ""
@@ -1138,6 +1154,11 @@ def main():
         )
         lr_scheduler.step()
         aux_scheduler.step()
+
+        # Final barrier per epoch — ensures rank 0's checkpoint save below
+        # doesn't race with other ranks already starting next epoch's
+        # synchronize_rng_states broadcast.
+        accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
             state = {
