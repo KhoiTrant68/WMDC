@@ -352,18 +352,21 @@ def train_one_epoch(
         out_net = model(d)
         out_criterion = criterion(out_net, d)
 
-        # ── Pass 1: RD loss ────────────────────────────────────────────────
-        accelerator.backward(out_criterion["loss"])
+        # ── Single combined backward ───────────────────────────────────────
+        # Gộp RD loss + aux loss vào 1 backward để DDP chỉ chạy 1 reducer
+        # cycle/iter, tránh trường hợp 2 chu kỳ reducer rơi vào thứ tự khác
+        # nhau giữa các ranks → ALLREDUCE out-of-order → NCCL timeout.
+        # Aux loss chỉ có grad qua các .quantiles params (param-set rời với
+        # main_params), nên gộp vào tổng không ảnh hưởng trị số gradient
+        # của bất kỳ param nào.
+        aux_loss = accelerator.unwrap_model(model).aux_loss()
+        accelerator.backward(out_criterion["loss"] + aux_loss)
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
             ]
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
         optimizer.step()
-
-        # ── Pass 2: aux loss (entropy bottleneck CDF) ──────────────────────
-        aux_loss = accelerator.unwrap_model(model).aux_loss()
-        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         rd_meter.update(out_criterion["loss"].item())
@@ -660,17 +663,33 @@ def test_epoch(
                     )
                     real_done += 1
 
-        if gap_check and accelerator.is_main_process:
+        if gap_check:
+            # Run on ALL ranks (not just rank 0).  Rationale: the function
+            # mutates `model.use_ste`, runs forwards that consume torch RNG,
+            # and calls `model.update(force=True)` which rebuilds CDF buffers.
+            # If only rank 0 does this, the RNG state and the CDF buffers
+            # on rank 0 diverge from the other ranks, which then causes
+            # accelerate.synchronize_rng_states at the next epoch's start
+            # to broadcast a state that the other ranks have not "earned",
+            # producing the silent hang at the epoch 9 → 10 boundary.
+            #
+            # All ranks compute their own gap_psnr; only rank 0's value is
+            # logged (others discard).  Barriers bracket the call so any
+            # straggler rank can't drag the next NCCL op out of order.
+            accelerator.wait_for_everyone()
             try:
                 sample = d[:1]
-                gap_psnr = measure_train_inference_gap(
+                gap_local = measure_train_inference_gap(
                     accelerator.unwrap_model(model),
                     sample,
                     device=str(accelerator.device),
                 )
+                if accelerator.is_main_process:
+                    gap_psnr = gap_local
             except Exception as e:
-                if logger:
+                if accelerator.is_main_process and logger:
                     logger.warning(f"Gap check failed: {e}")
+            accelerator.wait_for_everyone()
 
     finally:
         criterion.train()
@@ -973,7 +992,12 @@ def main():
     )
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=find_unused,
-        gradient_as_bucket_view=True,
+        # gradient_as_bucket_view=True cho phép bucket reduce ngay khi grad
+        # sẵn sàng (eager) → thứ tự ALLREDUCE phụ thuộc CUDA stream timing,
+        # có thể khác nhau giữa ranks khi có custom autograd (Mamba selective
+        # scan) → ranks lệch pha → NCCL timeout. Tắt để giữ thứ tự
+        # deterministic theo param index (cost: 1 lần copy grad/iter, ~1% perf).
+        gradient_as_bucket_view=False,
         broadcast_buffers=False,
     )
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
