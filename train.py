@@ -362,11 +362,12 @@ def train_one_epoch(
         optimizer.step()
 
         # ── Pass 2: aux loss (entropy bottleneck CDF) ──────────────────────
-        accelerator.backward(out_net["aux_loss"])
+        aux_loss = accelerator.unwrap_model(model).aux_loss()
+        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         rd_meter.update(out_criterion["loss"].item())
-        aux_meter.update(out_net["aux_loss"].item())
+        aux_meter.update(aux_loss.item())
         bpp_meter.update(out_criterion["bpp_loss"].item())
 
         if "column_neg_entropy" in out_criterion:
@@ -949,12 +950,15 @@ def main():
         raise ValueError(
             f"--patch-size must be a multiple of 64, got {args.patch_size}."
         )
-    find_unused = (
-        args.column_entropy_weight == 0.0
-        or args.row_entropy_weight == 0.0
-        or args.alignment_weight == 0.0
+    # find_unused = (
+    #     args.column_entropy_weight == 0.0
+    #     or args.row_entropy_weight == 0.0
+    #     or args.alignment_weight == 0.0
+    # )
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=True,
+        gradient_as_bucket_view=False,
     )
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
 
     save_dir = os.path.join(args.save_path, f"lambda_{args.lmbda}_{args.metric}")
