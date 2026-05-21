@@ -292,7 +292,7 @@ class FrequencyDisentangledMamba(nn.Module):
         x_ll_out = self.ll_mamba(x_ll)
         ctx = self.context_mamba(
             self.pre_context_proj(torch.cat([x_ll_out, x_lh, x_hl, x_hh], dim=1))
-        )
+        ).contiguous()
 
         merged = torch.cat(
             [
