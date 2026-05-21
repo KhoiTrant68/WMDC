@@ -353,7 +353,7 @@ def train_one_epoch(
         out_criterion = criterion(out_net, d)
 
         # ── Pass 1: RD loss ────────────────────────────────────────────────
-        accelerator.backward(out_criterion["loss"])
+        accelerator.backward(out_criterion["loss"], retain_graph=True)
         if clip_max_norm > 0:
             main_params = [
                 p for n, p in model.named_parameters() if not n.endswith(".quantiles")
@@ -362,11 +362,12 @@ def train_one_epoch(
         optimizer.step()
 
         # ── Pass 2: aux loss (entropy bottleneck CDF) ──────────────────────
-        accelerator.backward(out_net["aux_loss"])
+        aux_loss = accelerator.unwrap_model(model).aux_loss()
+        accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         rd_meter.update(out_criterion["loss"].item())
-        aux_meter.update(out_net["aux_loss"].item())
+        aux_meter.update(aux_loss.item())
         bpp_meter.update(out_criterion["bpp_loss"].item())
 
         if "column_neg_entropy" in out_criterion:
