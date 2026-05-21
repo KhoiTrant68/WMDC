@@ -950,14 +950,15 @@ def main():
         raise ValueError(
             f"--patch-size must be a multiple of 64, got {args.patch_size}."
         )
-    # find_unused = (
-    #     args.column_entropy_weight == 0.0
-    #     or args.row_entropy_weight == 0.0
-    #     or args.alignment_weight == 0.0
-    # )
+    find_unused = (
+        args.column_entropy_weight == 0.0
+        or args.row_entropy_weight == 0.0
+        or args.alignment_weight == 0.0
+    )
     ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=True,
-        gradient_as_bucket_view=False,
+        find_unused_parameters=find_unused,
+        gradient_as_bucket_view=True,
+        broadcast_buffers=False,
     )
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], mixed_precision="no")
 
