@@ -232,7 +232,7 @@ Let `W ∈ ℝ^{HW × HW}` denote the orthogonal DWT matrix (separable
 
     y = OLP( concat( s_LL · x_LL, s_LH · x_LH, s_HL · x_HL, s_HH · x_HH ) ).
 
-With `s_{HH} = 0` at init (after the fix in commit X), the synthesis
+With `s_{HH} = 0` at init (after the fix in commit `53febe4`), the synthesis
 branch ignores the HH band entirely, so the encoder shortcut starts as
 a **low-pass auxiliary** and learns the high-frequency contribution
 during training.  The original code used `s_HH = 0` *combined with*
@@ -290,7 +290,199 @@ curves and higher variance.
 
 ---
 
-## 5. References
+## 5. Why OT helps image compression (mathematical impact)
+
+This section connects each OT design choice in WMDC to a concrete rate
+or distortion term, so that the per-component ablation in
+`configs/ablation_variants.py` has an explicit hypothesis to refute.
+
+### 5.1 Setup: dictionary side-info as a channel
+
+Let `ŷ` be the quantised analysis latent and let `hyper` denote the
+hyperprior context.  The entropy model parameterises
+
+    p( ŷ_i  |  hyper_i,  d_i )                                        (9)
+
+where `d_i = (P V)_i = Σ_j P_{i,j} v_j` is the per-pixel dictionary
+side-info produced by the routing layer.  The rate per pixel is
+
+    R_i = H( ŷ_i  |  hyper_i, d_i )
+        = H( ŷ_i  |  hyper_i ) − I( ŷ_i ; d_i  |  hyper_i )           (10)
+
+so **OT reduces rate exactly through the conditional mutual information
+`I(ŷ; d | hyper)`**.  The pieces below say *how* each OT design choice
+moves that MI.
+
+### 5.2 Why balanced column marginals — channel capacity
+
+For a fixed dictionary `D = (v_1, …, v_N)`, `d_i` lies in the
+N-dimensional simplex of mixtures of `v_j`'s.  The mutual information
+`I(ŷ; d | hyper)` is upper-bounded by the entropy of the routing index
+`J` used to produce `d`:
+
+    I( ŷ ; d  |  hyper )  ≤  H(J)  =  H(p_col)                        (11)
+
+where `p_col(j) = (1/HW) Σ_i P_{i,j}` is the column marginal of `P`
+(§1).  So:
+
+> **Proposition 5.1.**  *The maximum side-info MI any dictionary of N
+> atoms can supply to the entropy model is `log N`, attained iff
+> `p_col` is uniform.*
+
+Plain softmax routing has *no* constraint on `p_col` and empirically
+collapses to a small effective support `N_eff ≪ N` ("code collapse").
+Balanced Sinkhorn enforces `p_col = 1/N` by construction, so it
+**saturates the bound**.  This is why the `no_ueot` ablation (softmax
+routing) is expected to lose the most rate of all the routing
+ablations: it operates at strictly lower channel capacity.
+
+### 5.3 Why unbalanced row marginals — content-adaptive bit allocation
+
+A balanced row marginal `a_i = 1/HW` forces every pixel to draw the
+same amount of side-info mass, regardless of local complexity.  This
+is the OT analogue of *uniform bit allocation*, which classical
+coding theory has long known to be sub-optimal for natural images.
+
+Unbalanced EOT (Séjourné et al. 2019) relaxes the row constraint to a
+KL-divergence penalty `KL{ρ_i}( P 1_N ‖ a )` with **spatially varying**
+`ρ_i`.  At optimum the dual updates give
+
+    Σ_j P^*_{i,j}  =  a_i · exp( f^*_i · (ε / (ρ_i + ε)) )            (12)
+
+so a pixel with large `ρ_i` (high content complexity in WMDC's
+parameterisation, via `_compute_rho_spatial`) tracks the balanced
+marginal closely, while a low-`ρ_i` pixel is allowed to have small
+`Σ_j P_{i,j}` — i.e., the routing layer **suppresses dictionary
+contribution where it would not pay off**.
+
+> **Proposition 5.2.**  *Let `R_bal` be the expected rate of the
+> balanced Sinkhorn plan and `R_unb(ρ)` the rate of the unbalanced plan
+> with spatial penalty `ρ`.  For any cost matrix `C` such that the
+> per-pixel optimal rates have non-zero variance across `i`, there
+> exists a non-constant `ρ` with `R_unb(ρ) < R_bal`.*
+
+The proof sketch: with constant `ρ`, the unbalanced plan reduces to
+balanced.  Perturbing `ρ_i` upward where `H(ŷ_i | hyper_i)` is large
+and downward where it is small redirects probability mass exactly to
+where (10) extracts the most reduction.  This is bit-allocation by OT
+duality.
+
+The `balanced_eot_only` ablation tests Proposition 5.2 directly: if it
+loses ≥ 0.1 BD-rate against `full` on Kodak, the spatial-ρ adaptivity
+is doing genuine work.
+
+### 5.4 Why conditional / multi-marginal OT — the MI chain rule
+
+The autoregressive slice loop produces side-info `D_0, …, D_{S−1}` (10
+slices in WMDC).  The total side-info MI decomposes via the chain rule
+
+    I( ŷ ; D_0, …, D_{S−1} )  =  Σ_{i=0}^{S−1} I( ŷ ; D_i  |  D_{<i} )  (13)
+
+If each slice routes **independently** with uniform `b`, the marginal
+distribution of `D_i` over the dictionary is the same uniform `p_col`
+for every `i`.  Then `D_i` and `D_{<i}` share most of their atoms,
+which makes
+
+    I( ŷ ; D_i  |  D_{<i} )  ≪  I( ŷ ; D_i )                          (14)
+
+— each slice is "telling the entropy model the same thing twice".
+
+Conditional OT (Phase B8) shifts the column target for slice `i` by
+the cumulative previous usage `u_{<i}`:
+
+    b_i  ∝  max( b_unif − α · u_{<i},  b_floor )                      (15)
+
+so the atoms most-used by slices `0..i−1` are *de-prioritised* for
+slice `i`, pushing `D_i` toward the atoms `D_{<i}` did not touch.  In
+the limit `α → 1`, `D_i ⊥ D_{<i}` almost surely, and (14) is replaced
+by
+
+    I( ŷ ; D_i  |  D_{<i} )  ≈  I( ŷ ; D_i )                          (16)
+
+which **restores additivity in (13)**.  Therefore:
+
+> **Proposition 5.3.**  *Under (15), total side-info MI is a
+> monotone non-decreasing function of `α ∈ [0, 1)`, with strict
+> increase whenever the per-slice marginals would otherwise overlap.*
+
+The `cond_alpha_*` sweep (α ∈ {0.1, 0.3, 0.5, 0.9}) measures how fast
+the saturation hits in practice; `α = 0.9` near-maximal coupling lets
+us see whether (16) is achievable on real data or whether the floor
+`b_floor` dominates first.
+
+### 5.5 Why bounded ε — the bias–variance trade-off
+
+Entropic OT solves a relaxed problem with bias `O(ε)` in the cost.
+The Sinkhorn plan satisfies
+
+    H( p(j | i) )  =  Θ(ε)  as ε → 0,                                 (17)
+
+so smaller ε means sharper per-pixel routing and a more informative
+side-info channel.  But Cuturi (2013, Prop. 4) gives gradient norms
+that scale as `O(1/ε)`, so very small ε produces:
+
+  * stiff Sinkhorn dynamics (slow convergence, NaN risk),
+  * gradient explosions on the `(rho/(rho+ε))·lse` update path,
+  * high variance across mini-batches.
+
+Conversely, ε → ∞ collapses `P` to the independent product `a ⊗ b`,
+giving `I(ŷ; d | hyper) = 0` and zero rate gain from the dictionary.
+
+WMDC's bounded parameterisation `ε ∈ [0.05, 1.00]` (commit `53febe4`)
+keeps the model in the regime where:
+
+| Quantity                | Value at ε = 0.05 | Value at ε = 1.00 |
+|-------------------------|-------------------|--------------------|
+| `max\|M\| = max\|C\| / ε` | ≤ 40              | ≤ 2                |
+| Per-pixel routing entropy `H(p(j\|i))` (bits) | ~0.5 | ~log₂N ≈ 7 |
+| Gradient norm (relative)             | × 20            | × 1               |
+
+This is the "useful" region — informative but stable.  The `low_eps`
+and `high_eps` ablations probe both ends to show the curve.
+
+### 5.6 Why KL vs TV — convergence vs sharpness
+
+The two unbalanced-OT divergences correspond to different prox
+operators in the dual (§2.2):
+
+  * **KL{ρ}**:  `aprox(x) = ρ · x / (ρ + ε)`  — smooth shrinkage.
+  * **TV{ρ}**:  `aprox(x) = clip(x, ±ρ)`     — hard gating.
+
+KL is the standard choice in unbalanced OT (Séjourné et al. 2019,
+§4.2) and gives smooth gradients.  TV gives a sharper marginal
+deviation budget — atoms with `|f^*| > ρ` are *exactly* discarded
+from the marginal, which can act as a hard regulariser.  The
+`marg_div_tv` ablation tests whether the harder TV gating beats the
+smoother KL on RD.  Theory does not predict a winner; this is an
+empirical choice the implementation already supports.
+
+### 5.7 Why iteration count matters (and why 20 is enough)
+
+Sinkhorn iterations converge geometrically: at iteration `t`,
+
+    ‖ log_f_t − log_f^* ‖_∞  ≤  q^t · ‖ log_f_0 − log_f^* ‖_∞         (18)
+
+with contraction rate `q < 1` depending on `max|M|/ε`.  For our
+bounded ε regime, `q ≈ 0.5` at the worst case, so 20 iterations gives
+`q^20 ≈ 10^{-6}` — essentially numerically converged.  The
+`sinkhorn_5iter` ablation tests whether under-iterating (e.g. for
+inference speed) actually breaks RD.  Theory predicts only a small
+penalty; if the ablation is silent, we have a free 4× speedup.
+
+### 5.8 Summary table
+
+| OT component                    | Mechanism                                      | Tested by ablation       | Predicted rate impact |
+|---------------------------------|-----------------------------------------------|---------------------------|------------------------|
+| Balanced column marginal        | Saturates `H(p_col) = log N` (Prop 5.1)        | `no_ueot`                 | Large                  |
+| Unbalanced row marginal         | Content-adaptive bit allocation (Prop 5.2)     | `balanced_eot_only`       | Moderate               |
+| Conditional column (cond. OT)   | Restores MI chain-rule additivity (Prop 5.3)   | `cond_alpha_{0.1,0.3,…}`  | Small but monotone     |
+| Bounded ε                       | Bias–variance optimum                          | `low_eps`, `high_eps`     | U-shaped               |
+| Prox choice (KL vs TV)          | Smooth vs hard marginal gating                 | `marg_div_tv`             | Empirical              |
+| Sinkhorn iteration count        | Geometric convergence (Eq. 18)                 | `sinkhorn_5iter`          | Negligible if ≥ 10     |
+
+---
+
+## 6. References
 
 - Séjourné, Feydy, Vialard, Trouvé, Peyré, 2019. **"Sinkhorn Divergences
   for Unbalanced Optimal Transport"**.  Definitions, prox formulas,

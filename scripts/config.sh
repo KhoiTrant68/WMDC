@@ -60,6 +60,9 @@ VARIANTS=(
     no_disp_bonus no_col_entropy no_row_entropy no_alignment no_alignment_margin
     no_dict_penalty no_wls no_olp no_ste_y
     full_cond_marg full_cond_marg_strong
+    # OT-specific (THEORY.md §5)
+    balanced_eot_only marg_div_tv low_eps high_eps sinkhorn_5iter
+    cond_alpha_0p1 cond_alpha_0p3
 )
 
 # ── Tools ────────────────────────────────────────────────────────────
@@ -86,6 +89,14 @@ variant_flags() {
         no_ste_y)                echo "--last-epochs-with-ste 0" ;;
         full_cond_marg)          echo "--use-conditional-marginals --cond-alpha 0.5" ;;
         full_cond_marg_strong)   echo "--use-conditional-marginals --cond-alpha 0.9" ;;
+        # ── OT-specific (THEORY.md §5) ────────────────────────────────
+        balanced_eot_only)       echo "--routing-mode balanced_eot" ;;
+        marg_div_tv)             echo "--marginal-div tv" ;;
+        low_eps)                 echo "--ot-eps 0.06" ;;
+        high_eps)                echo "--ot-eps 0.5" ;;
+        sinkhorn_5iter)          echo "--sinkhorn-iters 5" ;;
+        cond_alpha_0p1)          echo "--use-conditional-marginals --cond-alpha 0.1" ;;
+        cond_alpha_0p3)          echo "--use-conditional-marginals --cond-alpha 0.3" ;;
         *) echo "ERROR: unknown variant $1" >&2; return 1 ;;
     esac
 }
@@ -107,9 +118,19 @@ variant_eval_flags() {
         no_wls)                  echo "__SKIP_WLS__" ;;
         full_cond_marg)          echo "--use-conditional-marginals --cond-alpha 0.5" ;;
         full_cond_marg_strong)   echo "--use-conditional-marginals --cond-alpha 0.9" ;;
-        # Loss-only ablations (no_col_entropy, no_row_entropy, no_alignment,
-        # no_alignment_margin, no_dict_penalty, no_olp, no_ste_y, no_disp_bonus)
-        # do not change inference architecture — empty default is correct.
+        # ── OT-specific that change inference architecture ────────────
+        # balanced_eot_only changes the routing mode → must override at eval.
+        # marg_div_tv changes the unbalanced prox → must override at eval.
+        # low_eps / high_eps change ε initialisation only; the LEARNED value
+        #   is in the checkpoint via log_eps, so eval needs no override —
+        #   the checkpoint's log_eps is loaded directly.  Same for
+        #   sinkhorn_5iter (iters affects training compute, not architecture)
+        #   and cond_alpha_* (architecture flag IS the toggle; CLI must match).
+        balanced_eot_only)       echo "--routing-mode balanced_eot" ;;
+        marg_div_tv)             echo "--marginal-div tv" ;;
+        cond_alpha_0p1)          echo "--use-conditional-marginals --cond-alpha 0.1" ;;
+        cond_alpha_0p3)          echo "--use-conditional-marginals --cond-alpha 0.3" ;;
+        # Loss-only / init-only ablations don't change inference architecture.
         *)                       echo "" ;;
     esac
 }

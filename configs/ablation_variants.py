@@ -125,6 +125,49 @@ VARIANTS: dict[str, dict] = {
         "--use-conditional-marginals": True,
         "--cond-alpha": 0.9,
     },
+    # ── OT-specific ablations (THEORY.md §5) ──────────────────────────
+    # Each variant isolates ONE OT property and maps to a numbered
+    # proposition / table row in THEORY.md §5.
+    "balanced_eot_only": {
+        # §5.3 — disable the unbalanced row-marginal relaxation while
+        # keeping balanced column constraint.  Tests Proposition 5.2:
+        # does spatially-varying ρ actually help?  Reviewer-favourite
+        # ablation since it isolates "unbalanced" from "balanced + ρ=∞".
+        "--routing-mode": "balanced_eot",
+    },
+    "marg_div_tv": {
+        # §5.6 — switch the unbalanced prox from KL{ρ} (smooth) to
+        # TV{ρ} (hard gating).  Empirical, no theoretical winner.
+        "--marginal-div": "tv",
+    },
+    "low_eps": {
+        # §5.5 — pin ε near the floor (initial value, then sigmoid still
+        # adapts upward).  Tests the "small ε = sharp routing but stiff
+        # gradients" hypothesis.  Expected: noisier training, possible
+        # rate gain if it converges.
+        "--ot-eps": 0.06,
+    },
+    "high_eps": {
+        # §5.5 — start ε in the upper range.  Smooth routing, P closer
+        # to a ⊗ b, side-info MI drops.  Expected: rate loss.
+        "--ot-eps": 0.5,
+    },
+    "sinkhorn_5iter": {
+        # §5.7 — reduce Sinkhorn iterations from 20 to 5.  Tests
+        # geometric-convergence claim (Eq. 18): at q ≈ 0.5 we should
+        # still be at 3 % of the optimum, so rate impact ≈ 0.
+        "--sinkhorn-iters": 5,
+    },
+    "cond_alpha_0p1": {
+        # §5.4 — light cross-slice coupling (α = 0.1).  Together with
+        # 0.3 / 0.5 / 0.9 forms a 4-point sweep of Proposition 5.3.
+        "--use-conditional-marginals": True,
+        "--cond-alpha": 0.1,
+    },
+    "cond_alpha_0p3": {
+        "--use-conditional-marginals": True,
+        "--cond-alpha": 0.3,
+    },
 }
 
 # Order in which to run the variants (full first as the reference).
@@ -145,6 +188,14 @@ RUN_ORDER = [
     "no_ste_y",
     "full_cond_marg",
     "full_cond_marg_strong",
+    # OT-specific (THEORY.md §5)
+    "balanced_eot_only",
+    "marg_div_tv",
+    "low_eps",
+    "high_eps",
+    "sinkhorn_5iter",
+    "cond_alpha_0p1",
+    "cond_alpha_0p3",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -163,6 +214,9 @@ RUN_ORDER = [
 #   --dict-penalty-weight   <float>                     (δ: token diversity)
 #   --use-conditional-marginals                         (B8: multi-marginal OT)
 #   --cond-alpha            <float>                     (α: cross-slice coupling)
+#   --marginal-div          {kl, tv}                    (unbalanced prox choice)
+#   --ot-eps                <float>                     (initial Sinkhorn ε)
+#   --sinkhorn-iters        <int>                       (number of Sinkhorn iters)
 #
 # When in doubt about a flag's effect, search train.py for the existing
 # wiring in RateDistortionLoss and follow the same pattern.

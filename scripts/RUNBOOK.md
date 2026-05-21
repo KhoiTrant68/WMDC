@@ -57,7 +57,10 @@ accelerate launch train.py \
 
 ## 3. Training — Component-removal ablation (Table 4)
 
-7 variants × 3 λ = 21 jobs. Xem `configs/ablation_variants.py` để biết ý nghĩa từng variant.
+23 variants × 3 λ = 69 jobs. Xem `configs/ablation_variants.py` để biết
+ý nghĩa từng variant (nguồn duy nhất của truth — RUNBOOK chỉ minh hoạ).
+Các variant `OT-specific` (5.x) phủ THEORY.md §5 và là phần chính của
+phụ lục OT trong rebuttal.
 
 ```bash
 cd $REPO
@@ -73,18 +76,45 @@ train_variant() {
         $EXTRA
 }
 
-for LAM in 0.0035 0.013 0.0483; do
-    train_variant full             $LAM ""
-    train_variant no_ueot          $LAM "--routing-mode softmax"
-    train_variant no_fdm           $LAM "--backbone ss2d"
-    train_variant no_stateful_mem  $LAM "--use-dense-concat"
-    train_variant no_bootstrap_M1  $LAM "--memory-init zero"
-    train_variant no_disp_bonus    $LAM "--column-entropy-weight 0.0 --row-entropy-weight 0.0 --alignment-weight 0.0"
-    train_variant no_dict_penalty  $LAM "--dict-penalty-weight 0.0"
-    train_variant no_cond_marg     $LAM ""          # default: --use-conditional-marginals OFF
-    train_variant full_cond_marg   $LAM "--use-conditional-marginals --cond-alpha 0.5"
+for LAM in 0.0036 0.013 0.0483; do
+    # ── Original 5 (Table 4) ─────────────────────────────────────────
+    train_variant full                  $LAM ""
+    train_variant no_ueot               $LAM "--routing-mode softmax"
+    train_variant no_fdm                $LAM "--backbone ss2d"
+    train_variant no_stateful_mem       $LAM "--use-dense-concat"
+    train_variant no_bootstrap_M1       $LAM "--memory-init zero"
+
+    # ── Routing-loss ablations ──────────────────────────────────────
+    train_variant no_disp_bonus         $LAM "--column-entropy-weight 0.0 --row-entropy-weight 0.0 --alignment-weight 0.0"
+    train_variant no_col_entropy        $LAM "--column-entropy-weight 0.0"
+    train_variant no_row_entropy        $LAM "--row-entropy-weight 0.0"
+    train_variant no_alignment          $LAM "--alignment-weight 0.0"
+    train_variant no_alignment_margin   $LAM "--alignment-margin 0.0"
+    train_variant no_dict_penalty       $LAM "--dict-penalty-weight 0.0"
+
+    # ── CMIC components ─────────────────────────────────────────────
+    train_variant no_wls                $LAM ""                                  # strip --use-wls-shortcut via config.sh sentinel
+    train_variant no_olp                $LAM "--ortho-weight 0.0"
+    train_variant no_ste_y              $LAM "--last-epochs-with-ste 0"
+
+    # ── Phase B8: multi-marginal OT (positive ablation) ─────────────
+    train_variant full_cond_marg        $LAM "--use-conditional-marginals --cond-alpha 0.5"
+    train_variant full_cond_marg_strong $LAM "--use-conditional-marginals --cond-alpha 0.9"
+
+    # ── OT-specific ablations (THEORY.md §5) ────────────────────────
+    train_variant balanced_eot_only     $LAM "--routing-mode balanced_eot"             # §5.3 Prop 5.2
+    train_variant marg_div_tv           $LAM "--marginal-div tv"                       # §5.6 KL vs TV
+    train_variant low_eps               $LAM "--ot-eps 0.06"                           # §5.5 sharp routing
+    train_variant high_eps              $LAM "--ot-eps 0.5"                            # §5.5 smooth routing
+    train_variant sinkhorn_5iter        $LAM "--sinkhorn-iters 5"                      # §5.7 convergence
+    train_variant cond_alpha_0p1        $LAM "--use-conditional-marginals --cond-alpha 0.1"  # §5.4 α sweep
+    train_variant cond_alpha_0p3        $LAM "--use-conditional-marginals --cond-alpha 0.3"  # §5.4 α sweep
 done
 ```
+
+> `full` (without `--use-conditional-marginals`) **is** the no-cond-marg
+> baseline — the `full_cond_marg*` variants are the positive ablation
+> measured against it.  There is no separate `no_cond_marg` variant.
 
 > Trên SLURM: dùng `./scripts/run_ablation.sh launch` sau khi chỉnh `DATA_DIR`, `CHECKPOINT_ROOT`.
 
@@ -231,9 +261,14 @@ python analyze/visualize_failure_cases.py \
 ```bash
 cd $REPO
 
-for VARIANT in full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 no_disp_bonus no_dict_penalty; do
+for VARIANT in full no_ueot no_fdm no_stateful_mem no_bootstrap_M1 \
+               no_disp_bonus no_col_entropy no_row_entropy no_alignment no_alignment_margin \
+               no_dict_penalty no_wls no_olp no_ste_y \
+               full_cond_marg full_cond_marg_strong \
+               balanced_eot_only marg_div_tv low_eps high_eps sinkhorn_5iter \
+               cond_alpha_0p1 cond_alpha_0p3; do
     CKPTS=""
-    for LAM in 0.0035 0.013 0.0483; do
+    for LAM in 0.0036 0.013 0.0483; do
         CKPTS="$CKPTS $CKPT_ROOT/ablation/$VARIANT/lam_$LAM/lambda_${LAM}_mse/checkpoint_best.pth.tar"
     done
 
