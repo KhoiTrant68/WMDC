@@ -24,7 +24,9 @@ CMAP="${CMAP:-viridis}"
 ALPHA="${ALPHA:-0.6}"
 
 VIZ_DIR="$RESULTS_DIR/viz"
-IMAGES=("${IMAGES[@]:-kodim17.png kodim21.png kodim19.png kodim18.png kodim06.png}")
+if [[ ${#IMAGES[@]} -eq 0 ]]; then
+    IMAGES=(kodim17.png kodim21.png kodim19.png kodim18.png kodim06.png)
+fi
 
 CKPT="$CHECKPOINT_ROOT/routing/$ROUTING_MODE/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar"
 CA_FLAGS="$(common_arch_flags)"
