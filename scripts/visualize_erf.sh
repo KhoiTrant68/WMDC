@@ -39,8 +39,7 @@ fi
 
 VIZ_DIR="$RESULTS_DIR/viz"
 
-# CKPT="${CKPT:-$CHECKPOINT_ROOT/routing/$ROUTING_MODE/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar}"
-CKPT="/kaggle/input/datasets/khitrnminh/18052026/checkpoint_best.pth.tar"
+CKPT="${CKPT:-$CHECKPOINT_ROOT/routing/$ROUTING_MODE/lambda_${LAMBDA}_mse/checkpoint_best.pth.tar}"
 CA_FLAGS="$(common_arch_flags)"
 
 if [ ! -f "$CKPT" ]; then
