@@ -784,6 +784,19 @@ def parse_args():
     p.add_argument("--clip_max_norm", type=float, default=1.0)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument(
+        "--finetune",
+        action="store_true",
+        default=False,
+        help=(
+            "Load only the model weights from --checkpoint. Skips resuming "
+            "optimizer state (Adam m/v), LR scheduler state (milestones already "
+            "passed), epoch counter, and best_loss. Use when fine-tuning a "
+            "converged noise-trained checkpoint under a new regime (e.g. STE) "
+            "with fresh LR — full resume would force LR=1e-6 and stale momentum, "
+            "neutralising the fine-tune."
+        ),
+    )
+    p.add_argument(
         "--metric",
         type=str,
         default="mse",
@@ -1113,22 +1126,33 @@ def main():
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         accelerator.unwrap_model(model).load_state_dict(ckpt["state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
-        lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
-        if "aux_scheduler" in ckpt:
-            aux_scheduler.load_state_dict(ckpt["aux_scheduler"])
-        start_epoch = ckpt["epoch"] + 1
-        best_loss = ckpt.get("best_loss", float("inf"))
-        if "criterion" in ckpt:
-            # strict=False: old checkpoints stored EMA buffers (ema_bpp,
-            # ema_disp, ema_steps) that the refactored criterion no longer
-            # owns.  Drop them silently rather than aborting the resume.
-            criterion.load_state_dict(ckpt["criterion"], strict=False)
-        if logger:
-            logger.info(
-                f"Resumed from epoch {start_epoch - 1} (best_loss={best_loss:.4f})"
-            )
+        if args.finetune:
+            # Fine-tune mode: keep only the model weights. Reset optimizer
+            # (Adam momentum from noise-relaxation regime would fight new
+            # gradients), scheduler (LR already drop-decayed → would lock the
+            # fine-tune at ~1e-6), epoch counter, and best_loss.
+            if logger:
+                logger.info(
+                    f"[finetune] Loaded weights from {args.checkpoint}. "
+                    "Skipping optimizer/scheduler/epoch/best_loss state."
+                )
+        else:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+            if "aux_scheduler" in ckpt:
+                aux_scheduler.load_state_dict(ckpt["aux_scheduler"])
+            start_epoch = ckpt["epoch"] + 1
+            best_loss = ckpt.get("best_loss", float("inf"))
+            if "criterion" in ckpt:
+                # strict=False: old checkpoints stored EMA buffers (ema_bpp,
+                # ema_disp, ema_steps) that the refactored criterion no longer
+                # owns.  Drop them silently rather than aborting the resume.
+                criterion.load_state_dict(ckpt["criterion"], strict=False)
+            if logger:
+                logger.info(
+                    f"Resumed from epoch {start_epoch - 1} (best_loss={best_loss:.4f})"
+                )
 
     # ── Per-lambda summary ─────────────────────────────────────────────────────
     summary_path = os.path.join(save_dir, "training_summary.json")
