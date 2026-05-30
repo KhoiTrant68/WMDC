@@ -24,6 +24,17 @@
 #      architecture).
 #   4. Writes to a NEW directory so the original checkpoints are preserved.
 #
+# NOTE on the dict-util fix (2026-05-31):
+# ---------------------------------------
+# After the cost-matrix / eps / entropy-weight refactor, the saved
+# `log_eps` parameter and the cost-matrix scale have CHANGED MEANING.
+# Pre-fix checkpoints will load but the eps mapped from the old `log_eps`
+# is not what the old run was using — this is by design, but it means
+# fine-tuning a pre-fix checkpoint is closer to training-from-warm-init
+# than to a faithful resume.  Expect 10-20 epochs of re-stabilisation
+# before metrics resemble the old run's trajectory.  Also: --eps-warmup
+# is set to 0 below since the saved features are not "random" any more.
+#
 # Usage on Kaggle:
 #   bash scripts/finetune_routing.sh                       # default 40 epochs
 #   bash scripts/finetune_routing.sh --epochs 60           # tune epoch count
@@ -123,6 +134,7 @@ $LAUNCHER train.py \
     --gap-check-interval "$FT_GAP_CHECK_INTERVAL" \
     --real-bytes-batches "$FT_REAL_BYTES_BATCHES" \
     --ortho-weight "${ORTHO_WEIGHT:-0.01}" \
+    --eps-warmup-epochs 0 \
     $arch_flags
 
 echo ""

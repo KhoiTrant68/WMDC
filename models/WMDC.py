@@ -620,6 +620,15 @@ class WMDC(CompressionModel):
         h = h + aux
         return h
 
+    def set_dict_eps_anneal_bias(self, value: float) -> None:
+        """
+        Broadcast a warm-up bias on log_eps to every slice's dictionary
+        attention.  See `UnifiedDictionaryAttention._log_eps_bias` for the
+        rationale; called by the training loop once per epoch.
+        """
+        for attn in self.eot_attentions:
+            attn.set_log_eps_bias(value)
+
     def sinkhorn_telemetry(self) -> dict:
         """
         Aggregate Sinkhorn-stability telemetry across all slice attentions.

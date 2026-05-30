@@ -130,8 +130,8 @@ class RateDistortionLoss(nn.Module):
         self,
         lmbda: float = 1e-2,
         metric: str = "mse",
-        column_entropy_weight: float = 0.01,
-        row_entropy_weight: float = 0.05,
+        column_entropy_weight: float = 0.0,
+        row_entropy_weight: float = 0.3,
         alignment_weight: float = 0.2,
         alignment_margin: float = 0.2,
         dict_penalty_weight: float = 0.1,
@@ -810,22 +810,28 @@ def parse_args():
     p.add_argument(
         "--column-entropy-weight",
         type=float,
-        default=0.01,
+        default=0.0,
         help=(
             "β_col: weight on column_neg_entropy = −H_col (bits). "
-            "Positive → MAXIMISE H_col (anti-dead-code).  Set 0 to disable."
+            "Positive → MAXIMISE H_col (anti-dead-code).  Default 0: with the "
+            "fixed cost matrix (std(C)≈1) and the off-diagonal dictionary "
+            "penalty (--dict-penalty-weight) already preventing token "
+            "collapse, the column-entropy term was actively fighting row "
+            "sparsity (mean utilisation 93.6 % on Kodak λ=0.0036).  Re-enable "
+            "with a small value (≤0.01) only if you see dead atoms."
         ),
     )
     p.add_argument(
         "--row-entropy-weight",
         type=float,
-        default=0.05,
+        default=0.3,
         help=(
             "β_row: weight on row_entropy = H_row (bits). "
-            "Positive → MINIMISE H_row (sparse per-pixel selection).  "
-            "Together with β_col this maximises I(pixel ; token) and was "
-            "MISSING in the pre-refactor loss → dictionary collapsed to "
-            "100% utilisation on every slice.  Set 0 to disable."
+            "Positive → MINIMISE H_row (sparse per-pixel selection).  Raised "
+            "from 0.05 → 0.3 alongside the cost-matrix and eps fixes: at the "
+            "old contrast (std(C)≈0.04) no β_row value could overcome the "
+            "structural smoothness of Sinkhorn; at the new contrast a stronger "
+            "push is needed to actually peak the routing.  Set 0 to disable."
         ),
     )
     p.add_argument(
@@ -953,6 +959,29 @@ def parse_args():
         type=int,
         default=20,
         help="Final epochs to train with STE instead of noise relaxation. 0=disabled.",
+    )
+    p.add_argument(
+        "--eps-warmup-epochs",
+        type=int,
+        default=5,
+        help=(
+            "Linearly anneal the eps warm-up bias from --eps-warmup-init-bias "
+            "to 0 over the first N epochs.  With the high-contrast cost matrix "
+            "(std(C)≈1) init eps=0.1 produces extremely peaked routing, which "
+            "over-commits to random init features.  Warm-up enlarges eps in "
+            "early epochs so routing starts smooth and sharpens as features "
+            "learn.  Set 0 to disable (no warm-up)."
+        ),
+    )
+    p.add_argument(
+        "--eps-warmup-init-bias",
+        type=float,
+        default=2.3,
+        help=(
+            "Initial bias added to log_eps at epoch 0.  Default 2.3 ≈ log(10), "
+            "so epoch-0 eps ≈ 10× the parameter-controlled value.  Decays "
+            "linearly to 0 over --eps-warmup-epochs."
+        ),
     )
     p.add_argument(
         "--gap-check-interval",
@@ -1164,6 +1193,16 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         ste_active = epoch >= args.epochs - args.last_epochs_with_ste
         accelerator.unwrap_model(model).use_ste = ste_active
+
+        # ── Eps warm-up annealing ─────────────────────────────────────────
+        # Linear decay of the log_eps bias from `eps_warmup_init_bias` at
+        # epoch 0 to 0 at epoch `eps_warmup_epochs`.  Held at 0 after.
+        if args.eps_warmup_epochs > 0:
+            frac = max(0.0, 1.0 - epoch / args.eps_warmup_epochs)
+            bias = args.eps_warmup_init_bias * frac
+        else:
+            bias = 0.0
+        accelerator.unwrap_model(model).set_dict_eps_anneal_bias(bias)
         if (
             accelerator.is_main_process
             and ste_active

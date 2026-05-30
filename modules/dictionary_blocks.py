@@ -164,34 +164,56 @@ class UnifiedDictionaryAttention(nn.Module):
         # Public mirror kept for backward compatibility with older logging.
         self.sinkhorn_divergence_count: int = 0
 
+        # ── Eps warm-up bias ────────────────────────────────────────────
+        # Added to log_eps INSIDE `_eps()` to softly enlarge eps during the
+        # first few epochs.  After fix #1 raised std(C) from ~0.04 to ~1,
+        # initial routing with eps=0.1 is ~22000× peaked, which over-commits
+        # to random init features and gets stuck.  The training loop sets
+        # this bias > 0 at epoch 0 and anneals it to 0 over a few epochs so
+        # learning starts with a smoother, more uniform routing.  Not
+        # persistent — a resumed checkpoint always starts at bias = 0.
+        self.register_buffer(
+            "_log_eps_bias", torch.zeros(1, dtype=torch.float32), persistent=False
+        )
+
     # -----------------------------------------------------------------------
-    # Bounded eps — fixes the "log_eps collapse" failure mode
+    # Bounded eps — log-space exp with hard clamp
     # -----------------------------------------------------------------------
     #
-    # Original parameterisation:    eps = softplus(log_eps) + 0.05
-    # ------------------------------------------------------------
-    # softplus is monotone and the optimiser is always rewarded for shrinking
-    # eps (sharper Sinkhorn ⇒ peaked routing ⇒ lower rate).  After a few
-    # thousand steps `softplus(log_eps)` saturates at 0, `log_eps` drifts to
-    # −∞, and the *gradient* through log_eps becomes vanishingly small.  The
-    # parameter is effectively dead, eps is pinned to the floor, and we have
-    # no eps adaptation at all.
+    # Previous parameterisations and their failure modes:
+    #   (a) eps = softplus(log_eps) + floor
+    #         → softplus saturates at 0 for negative inputs, so once eps
+    #           sits near the floor the gradient through log_eps vanishes.
+    #   (b) eps = floor + range · sigmoid(log_eps)            (the pre-fix)
+    #         → sigmoid saturates at BOTH ends.  Init log_eps = log(0.1)
+    #           sits in the saturating tail (sigmoid' ≈ 0.08), and as the
+    #           optimiser tries to drive eps toward the floor sigmoid'
+    #           collapses to ~0.007.  eps got stuck at ≈ 0.137 throughout
+    #           the 400-epoch run — too large to produce sharp routing on
+    #           a cost matrix with std(C) ≈ 1, so column-marginal entropy
+    #           pegged at ~93 % of max.
     #
-    # New parameterisation:        eps = EPS_FLOOR + EPS_RANGE · sigmoid(log_eps)
-    # -------------------------------------------------------------------------
-    # eps is bounded in [EPS_FLOOR, EPS_FLOOR + EPS_RANGE] = [0.05, 1.0], and
-    # sigmoid keeps a strictly positive derivative everywhere (no saturation
-    # rail).  log_eps stays trainable for the lifetime of the run.
-    #
-    # Default init log_eps = log(0.1) ≈ −2.30 gives:
-    #   sigmoid(-2.30) ≈ 0.091  →  eps ≈ 0.05 + 0.95·0.091 ≈ 0.137
-    # (within ~6 % of the legacy initial eps ≈ 0.146, so resumed checkpoints
-    # behave nearly identically.)
-    EPS_FLOOR: float = 0.05
-    EPS_RANGE: float = 0.95  # so eps ∈ [0.05, 1.00]
+    # Current parameterisation: eps = exp(log_eps), with log_eps clamped to
+    # [log(EPS_FLOOR), log(EPS_CAP)] for numerical safety.
+    #   • d eps / d log_eps = eps : RELATIVE gradient is identically 1, so
+    #     the parameter remains responsive across the full operating range
+    #     (no saturation tail).  The optimiser sees the same update size
+    #     in log-space whether eps is 0.01 or 1.0.
+    #   • Hard clamp only kicks in at the bounds — gradient is unaffected
+    #     in the interior.  EPS_FLOOR = 0.005 (10× lower than the legacy
+    #     floor) is needed to let Sinkhorn produce genuinely sharp routing.
+    EPS_FLOOR: float = 0.005
+    EPS_CAP: float = 5.0
 
     def _eps(self) -> torch.Tensor:
-        return self.EPS_FLOOR + self.EPS_RANGE * torch.sigmoid(self.log_eps)
+        log_eps_b = (self.log_eps + self._log_eps_bias).clamp(
+            min=math.log(self.EPS_FLOOR), max=math.log(self.EPS_CAP)
+        )
+        return torch.exp(log_eps_b)
+
+    def set_log_eps_bias(self, value: float) -> None:
+        """Set the warm-up bias added to log_eps inside _eps()."""
+        self._log_eps_bias.fill_(float(value))
 
     def sinkhorn_telemetry(self) -> dict:
         """Return current fallback statistics.  Safe to call any time."""
@@ -259,12 +281,23 @@ class UnifiedDictionaryAttention(nn.Module):
     def _cost_matrix(
         self, x: torch.Tensor, k: torch.Tensor, H: int, W: int
     ) -> torch.Tensor:
+        # Cost = −similarity, computed against the UNNORMALISED dictionary
+        # tokens.  QueryDictionaryGenerator returns L2-normalised atoms scaled
+        # by sqrt(dict_dim) (line 71), so ‖k‖ = sqrt(d).  Re-normalising k —
+        # as the pre-fix code did — undoes that scaling and caps std(C) at
+        # ~1/sqrt(d) ≈ 0.04 (d=640).  Sinkhorn then needs eps ≪ 0.04 to
+        # produce sharp routing, which the bounded `log_eps` parameterisation
+        # could not reach, so column-marginal entropy stuck at ~93 % of max
+        # and the dictionary collapsed to near-uniform routing.
+        #
+        # Keeping k at its native sqrt(d) scale and only normalising q gives
+        # std(C) ≈ 1 — a ~25× contrast increase at d=640 — which lets the
+        # Sinkhorn output respond to the row-entropy regulariser.
         B = x.shape[0]
         HW = H * W
         q = self.q_proj(x).view(B, -1, HW).transpose(1, 2)
         q_norm = F.normalize(q, p=2, dim=-1)
-        k_norm = F.normalize(k, p=2, dim=-1)
-        return 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))
+        return -torch.bmm(q_norm, k.transpose(1, 2))
 
     # -----------------------------------------------------------------------
     # Spatial TV regularisation

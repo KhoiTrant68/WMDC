@@ -48,18 +48,28 @@ ORTHO_WEIGHT=0.01  # OLP orthogonality regulariser weight (0 to disable)
 #   no_wls                — disable WLS/iWLS shortcuts (uses __SKIP_WLS__ sentinel)
 #   no_olp                — disable OLP orthogonality regulariser
 #   no_ste_y              — disable STE on y in the last training epochs
-#   no_col_entropy        — drop only −H_col (split of no_disp_bonus)
-#   no_row_entropy        — drop only +H_row (split of no_disp_bonus)
+#   no_col_entropy        — equivalent to `full` after the dict-util fix
+#                           (β_col default is now 0); kept for backward-compat
+#                           with old logs / RUNBOOK.md
+#   no_row_entropy        — drop only +H_row (sparsity loss)
 #   no_alignment          — drop only the complexity-alignment hinge
 #   no_alignment_margin   — keep alignment, set margin κ = 0 (sign-only)
 #   full_cond_marg        — toggle ON multi-marginal OT (α = 0.5)
 #   full_cond_marg_strong — multi-marginal OT with α = 0.9
+#   with_col_entropy      — re-enable β_col = 0.01 (the pre-fix default).
+#                           Use this to show the column-entropy term was
+#                           HURTING — i.e. justifies the new default of 0.
+#   weak_row_entropy      — β_row = 0.05 (the pre-fix default).  Shows that
+#                           the original sparsity weight was too small to
+#                           overcome Sinkhorn smoothness, motivating 0.3.
+#   no_eps_warmup         — disable the log_eps warm-up schedule.
 VARIANTS=(
     full
     no_ueot no_fdm no_stateful_mem no_bootstrap_M1
     no_disp_bonus no_col_entropy no_row_entropy no_alignment no_alignment_margin
     no_dict_penalty no_wls no_olp no_ste_y
     full_cond_marg full_cond_marg_strong
+    with_col_entropy weak_row_entropy no_eps_warmup
 )
 
 # ── Tools ────────────────────────────────────────────────────────────
@@ -86,6 +96,9 @@ variant_flags() {
         no_ste_y)                echo "--last-epochs-with-ste 0" ;;
         full_cond_marg)          echo "--use-conditional-marginals --cond-alpha 0.5" ;;
         full_cond_marg_strong)   echo "--use-conditional-marginals --cond-alpha 0.9" ;;
+        with_col_entropy)        echo "--column-entropy-weight 0.01" ;;
+        weak_row_entropy)        echo "--row-entropy-weight 0.05" ;;
+        no_eps_warmup)           echo "--eps-warmup-epochs 0" ;;
         *) echo "ERROR: unknown variant $1" >&2; return 1 ;;
     esac
 }
@@ -107,9 +120,11 @@ variant_eval_flags() {
         no_wls)                  echo "__SKIP_WLS__" ;;
         full_cond_marg)          echo "--use-conditional-marginals --cond-alpha 0.5" ;;
         full_cond_marg_strong)   echo "--use-conditional-marginals --cond-alpha 0.9" ;;
-        # Loss-only ablations (no_col_entropy, no_row_entropy, no_alignment,
-        # no_alignment_margin, no_dict_penalty, no_olp, no_ste_y, no_disp_bonus)
-        # do not change inference architecture — empty default is correct.
+        # Loss-only / training-only ablations do not change inference
+        # architecture — empty default is correct.  Covers: no_col_entropy,
+        # no_row_entropy, no_alignment, no_alignment_margin, no_dict_penalty,
+        # no_olp, no_ste_y, no_disp_bonus, with_col_entropy, weak_row_entropy,
+        # no_eps_warmup.
         *)                       echo "" ;;
     esac
 }
