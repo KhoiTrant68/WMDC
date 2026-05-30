@@ -931,6 +931,16 @@ class WMDC(CompressionModel):
                 log_b_override=log_b_override,
             )
 
+            # Safety guard: if the EOT pipeline produced NaN/Inf (e.g. routing
+            # fully collapsed to a single token and the bmm with v_norm hit a
+            # degenerate scale), zero the dict_info and let the rest of the
+            # slice run from the hyper-prior alone.  Without this the NaN
+            # propagates through cc_mean / cc_scale into the Gaussian
+            # conditional and every downstream pixel of x_hat becomes NaN —
+            # which the eval table then mis-reports as 100 dB.
+            if not torch.isfinite(dict_info).all():
+                dict_info = torch.zeros_like(dict_info)
+
             # Update cumulative column usage (no-grad).  Running average so it
             # stays a probability vector regardless of slice count.
             if self._cond_active and "col_mass" in attn_aux:

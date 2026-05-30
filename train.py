@@ -130,8 +130,8 @@ class RateDistortionLoss(nn.Module):
         self,
         lmbda: float = 1e-2,
         metric: str = "mse",
-        column_entropy_weight: float = 0.0,
-        row_entropy_weight: float = 0.3,
+        column_entropy_weight: float = 0.05,
+        row_entropy_weight: float = 0.1,
         alignment_weight: float = 0.2,
         alignment_margin: float = 0.2,
         dict_penalty_weight: float = 0.1,
@@ -810,28 +810,31 @@ def parse_args():
     p.add_argument(
         "--column-entropy-weight",
         type=float,
-        default=0.0,
+        default=0.05,
         help=(
-            "β_col: weight on column_neg_entropy = −H_col (bits). "
-            "Positive → MAXIMISE H_col (anti-dead-code).  Default 0: with the "
-            "fixed cost matrix (std(C)≈1) and the off-diagonal dictionary "
-            "penalty (--dict-penalty-weight) already preventing token "
-            "collapse, the column-entropy term was actively fighting row "
-            "sparsity (mean utilisation 93.6 % on Kodak λ=0.0036).  Re-enable "
-            "with a small value (≤0.01) only if you see dead atoms."
+            "β_col: weight on column_neg_entropy = −H_col (bits).  "
+            "Positive → MAXIMISE H_col (anti-collapse).  Critical: with the "
+            "post-fix high-contrast cost matrix, dropping this term lets the "
+            "optimiser route every pixel to the SAME single token (H_col=0, "
+            "H_row=0, util=0 %, downstream NaN on OOD).  dict_penalty only "
+            "orthogonalises the K tokens, it does NOT prevent routing collapse "
+            "to a single one of them.  Default 0.05 is the smallest value that "
+            "consistently keeps H_col away from zero in the 1000-image smoke "
+            "test."
         ),
     )
     p.add_argument(
         "--row-entropy-weight",
         type=float,
-        default=0.3,
+        default=0.1,
         help=(
-            "β_row: weight on row_entropy = H_row (bits). "
-            "Positive → MINIMISE H_row (sparse per-pixel selection).  Raised "
-            "from 0.05 → 0.3 alongside the cost-matrix and eps fixes: at the "
-            "old contrast (std(C)≈0.04) no β_row value could overcome the "
-            "structural smoothness of Sinkhorn; at the new contrast a stronger "
-            "push is needed to actually peak the routing.  Set 0 to disable."
+            "β_row: weight on row_entropy = H_row (bits).  "
+            "Positive → MINIMISE H_row (sparse per-pixel selection).  "
+            "Reduced from 0.3 → 0.1 after the smoke test showed full "
+            "collapse to one-hot routing within 1 epoch.  At the post-fix "
+            "cost-matrix contrast (std(C)≈1), 0.1 is enough push for "
+            "sparsification while leaving the column-entropy bonus room to "
+            "keep H_col > 0.  Set 0 to disable."
         ),
     )
     p.add_argument(
