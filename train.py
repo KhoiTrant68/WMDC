@@ -353,12 +353,13 @@ def train_one_epoch(
         out_criterion = criterion(out_net, d)
 
         # ── Single combined backward ───────────────────────────────────────
-        # Gộp RD loss + aux loss vào 1 backward để DDP chỉ chạy 1 reducer
-        # cycle/iter, tránh trường hợp 2 chu kỳ reducer rơi vào thứ tự khác
-        # nhau giữa các ranks → ALLREDUCE out-of-order → NCCL timeout.
-        # Aux loss chỉ có grad qua các .quantiles params (param-set rời với
-        # main_params), nên gộp vào tổng không ảnh hưởng trị số gradient
-        # của bất kỳ param nào.
+        # Combine RD loss + aux loss into ONE backward call so DDP runs a
+        # single reducer cycle per iter.  Two reducer cycles per iter can
+        # land in different orders across ranks → out-of-order ALLREDUCE
+        # → NCCL timeout.  The aux loss only has gradient through the
+        # .quantiles params (a disjoint param-set from main_params), so
+        # summing it into the total does not change the gradient value of
+        # any parameter.
         aux_loss = accelerator.unwrap_model(model).aux_loss()
         accelerator.backward(out_criterion["loss"] + aux_loss)
         if clip_max_norm > 0:
@@ -1005,11 +1006,12 @@ def main():
     )
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=find_unused,
-        # gradient_as_bucket_view=True cho phép bucket reduce ngay khi grad
-        # sẵn sàng (eager) → thứ tự ALLREDUCE phụ thuộc CUDA stream timing,
-        # có thể khác nhau giữa ranks khi có custom autograd (Mamba selective
-        # scan) → ranks lệch pha → NCCL timeout. Tắt để giữ thứ tự
-        # deterministic theo param index (cost: 1 lần copy grad/iter, ~1% perf).
+        # gradient_as_bucket_view=True lets DDP reduce buckets eagerly as
+        # gradients become ready → ALLREDUCE order depends on CUDA stream
+        # timing and can differ across ranks when there is custom autograd
+        # (Mamba selective scan) → ranks fall out of phase → NCCL timeout.
+        # Disabled to preserve a deterministic order by parameter index
+        # (cost: one extra grad copy per iter, ~1% perf).
         gradient_as_bucket_view=False,
         broadcast_buffers=False,
     )
