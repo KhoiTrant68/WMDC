@@ -1079,25 +1079,41 @@ class VSSBlock(nn.Module):
 
         self.drop_path = DropPath(drop_path)
 
+    # Safe range for LayerNorm input: x² < float32 max = 3.4e38.
+    # 1e6 gives x² ≤ 1e12, leaving 26 orders-of-magnitude headroom for
+    # `Var = E[x²] − E[x]²` to evaluate without overflowing.  Normal
+    # trained activations live in O(1–10²), so this clamp is a no-op
+    # for converged models and only kicks in when upstream blow-up
+    # (e.g. under-trained Mamba SSM accumulating to 1e24) threatens
+    # the variance computation.  FP64 was considered but rejected
+    # because T4 GPUs have 1/32× FP64 throughput.
+    _LN_CLAMP: float = 1.0e6
+
+    def _safe_layer_norm(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        FP32 LayerNorm with NaN/inf-safe input pre-processing.
+
+        Problem: standard `Var = E[x²] − E[x]²` overflows in FP32 when any
+        |x| > 1.85e19 (since x² > 3.4e38 = float32 max).  The (inf − inf)/N
+        intermediate becomes NaN.  Diagnostic showed `g_s.5.ll_mamba.norm`
+        receiving |x| ≈ 5e24 → 19 % of output positions became NaN.
+
+        Fix: `nan_to_num` clears any upstream NaN/inf, then `clamp(±1e6)`
+        guarantees x² < 1e12 ≪ float32_max, so variance is computable.
+        For normal activations (O(1–10²)) both ops are no-ops.
+
+        We deliberately avoid casting to FP64: on T4 hardware FP64 ops
+        run at 1/32× FP32 throughput, which would dominate per-step time.
+        """
+        x = torch.nan_to_num(x, nan=0.0, posinf=self._LN_CLAMP, neginf=-self._LN_CLAMP)
+        x = x.clamp(-self._LN_CLAMP, self._LN_CLAMP)
+        return self.norm(x)
+
     def _forward(self, input: torch.Tensor):
-        # Numerical safety on LayerNorm.  Diagnostic on Kodak {15, 18} with an
-        # under-trained checkpoint showed `g_s.5.ll_mamba.norm` receiving
-        # |x|_max ≈ 5e24, which overflows the standard variance formula
-        # Var = E[x²] − E[x]² in FP32 (any |x| > 1.85e19 makes x² > 3.4e38 =
-        # float32 max).  The (inf − inf)/N intermediate then becomes NaN at
-        # exactly the pixel positions whose channel vector contains an extreme
-        # value (matches the observed 19 % NaN frac).  FP64 raises the
-        # overflow ceiling from 3.4e38 to 1.8e308 — a 10⁸⁹× margin that
-        # covers any plausible upstream blow-up.  The normalised output is in
-        # a small range (~[-5, 5]) so the round-trip cast is lossless.
-        dt = input.dtype
         if self.post_norm:
-            op_out = self.op(input)
-            normed = self.norm(op_out.double()).to(dt)
-            x = input + self.drop_path(normed)
+            x = input + self.drop_path(self._safe_layer_norm(self.op(input)))
         else:
-            input_normed = self.norm(input.double()).to(dt)
-            x = input + self.drop_path(self.op(input_normed))
+            x = input + self.drop_path(self.op(self._safe_layer_norm(input)))
         return x
 
     def forward(self, input: torch.Tensor):
