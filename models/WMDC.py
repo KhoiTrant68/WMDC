@@ -964,11 +964,7 @@ class WMDC(CompressionModel):
 
             # ── Gaussian conditional ─────────────────────────────────────────
             support = torch.cat([query, dict_info], dim=1)  # (B, 3M+S, H, W)
-            # μ clamp matches compress()/decompress() for numerical safety.
-            # ±256 is far outside empirical y range (~±15 at λ=0.0036), so the
-            # clamp is a no-op on normal gradients but prevents OOD-image
-            # overflow during evaluation.
-            mu = self.cc_mean_transforms[i](support).clamp(-256.0, 256.0)
+            mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
@@ -1142,16 +1138,7 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            # Clamp μ to a sane dynamic range.  cc_mean_transforms is a 4-layer
-            # Conv stack with no normalisation; on OOD inputs (e.g. dict_info
-            # forced to zero by the probe hook, or extreme support statistics
-            # on textured / boundary slices) it occasionally outputs ±1e3,
-            # which the Gaussian conditional decodes as ±1e3 in y_hat.  g_s
-            # then overflows to ±inf, the final clamp(0, 1) does NOT clear
-            # NaN/inf, and the eval reports nan PSNR.  ±256 is well outside
-            # the empirical y range (±15 at λ=0.0036) but inside FP16 safe
-            # zone — a strict numerical safety net, NOT a learning bound.
-            mu = self.cc_mean_transforms[i](support).clamp(-256.0, 256.0)
+            mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             # Arithmetic encode
@@ -1269,9 +1256,7 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            # Identical μ clamp as compress() — required for byte-exact codec
-            # parity.  See compress() for the rationale.
-            mu = self.cc_mean_transforms[i](support).clamp(-256.0, 256.0)
+            mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
