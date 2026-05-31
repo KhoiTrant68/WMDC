@@ -1080,10 +1080,24 @@ class VSSBlock(nn.Module):
         self.drop_path = DropPath(drop_path)
 
     def _forward(self, input: torch.Tensor):
+        # Numerical safety on LayerNorm.  Diagnostic on Kodak {15, 18} with an
+        # under-trained checkpoint showed `g_s.5.ll_mamba.norm` receiving
+        # |x|_max ≈ 5e24, which overflows the standard variance formula
+        # Var = E[x²] − E[x]² in FP32 (any |x| > 1.85e19 makes x² > 3.4e38 =
+        # float32 max).  The (inf − inf)/N intermediate then becomes NaN at
+        # exactly the pixel positions whose channel vector contains an extreme
+        # value (matches the observed 19 % NaN frac).  FP64 raises the
+        # overflow ceiling from 3.4e38 to 1.8e308 — a 10⁸⁹× margin that
+        # covers any plausible upstream blow-up.  The normalised output is in
+        # a small range (~[-5, 5]) so the round-trip cast is lossless.
+        dt = input.dtype
         if self.post_norm:
-            x = input + self.drop_path(self.norm(self.op(input)))
+            op_out = self.op(input)
+            normed = self.norm(op_out.double()).to(dt)
+            x = input + self.drop_path(normed)
         else:
-            x = input + self.drop_path(self.op(self.norm(input)))
+            input_normed = self.norm(input.double()).to(dt)
+            x = input + self.drop_path(self.op(input_normed))
         return x
 
     def forward(self, input: torch.Tensor):
