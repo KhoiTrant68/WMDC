@@ -1079,41 +1079,11 @@ class VSSBlock(nn.Module):
 
         self.drop_path = DropPath(drop_path)
 
-    # Safe range for LayerNorm input: x² < float32 max = 3.4e38.
-    # 1e6 gives x² ≤ 1e12, leaving 26 orders-of-magnitude headroom for
-    # `Var = E[x²] − E[x]²` to evaluate without overflowing.  Normal
-    # trained activations live in O(1–10²), so this clamp is a no-op
-    # for converged models and only kicks in when upstream blow-up
-    # (e.g. under-trained Mamba SSM accumulating to 1e24) threatens
-    # the variance computation.  FP64 was considered but rejected
-    # because T4 GPUs have 1/32× FP64 throughput.
-    _LN_CLAMP: float = 1.0e6
-
-    def _safe_layer_norm(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        FP32 LayerNorm with NaN/inf-safe input pre-processing.
-
-        Problem: standard `Var = E[x²] − E[x]²` overflows in FP32 when any
-        |x| > 1.85e19 (since x² > 3.4e38 = float32 max).  The (inf − inf)/N
-        intermediate becomes NaN.  Diagnostic showed `g_s.5.ll_mamba.norm`
-        receiving |x| ≈ 5e24 → 19 % of output positions became NaN.
-
-        Fix: `nan_to_num` clears any upstream NaN/inf, then `clamp(±1e6)`
-        guarantees x² < 1e12 ≪ float32_max, so variance is computable.
-        For normal activations (O(1–10²)) both ops are no-ops.
-
-        We deliberately avoid casting to FP64: on T4 hardware FP64 ops
-        run at 1/32× FP32 throughput, which would dominate per-step time.
-        """
-        x = torch.nan_to_num(x, nan=0.0, posinf=self._LN_CLAMP, neginf=-self._LN_CLAMP)
-        x = x.clamp(-self._LN_CLAMP, self._LN_CLAMP)
-        return self.norm(x)
-
     def _forward(self, input: torch.Tensor):
         if self.post_norm:
-            x = input + self.drop_path(self._safe_layer_norm(self.op(input)))
+            x = input + self.drop_path(self.norm(self.op(input)))
         else:
-            x = input + self.drop_path(self.op(self._safe_layer_norm(input)))
+            x = input + self.drop_path(self.op(self.norm(input)))
         return x
 
     def forward(self, input: torch.Tensor):
