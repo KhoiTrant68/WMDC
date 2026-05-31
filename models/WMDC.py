@@ -931,6 +931,7 @@ class WMDC(CompressionModel):
                 log_b_override=log_b_override,
             )
 
+
             # Safety guard: if the EOT pipeline produced NaN/Inf (e.g. routing
             # fully collapsed to a single token and the bmm with v_norm hit a
             # degenerate scale), zero the dict_info and let the rest of the
@@ -963,7 +964,11 @@ class WMDC(CompressionModel):
 
             # ── Gaussian conditional ─────────────────────────────────────────
             support = torch.cat([query, dict_info], dim=1)  # (B, 3M+S, H, W)
-            mu = self.cc_mean_transforms[i](support)  # (B, S, H, W)
+            # μ clamp matches compress()/decompress() for numerical safety.
+            # ±256 is far outside empirical y range (~±15 at λ=0.0036), so the
+            # clamp is a no-op on normal gradients but prevents OOD-image
+            # overflow during evaluation.
+            mu = self.cc_mean_transforms[i](support).clamp(-256.0, 256.0)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
@@ -1117,6 +1122,13 @@ class WMDC(CompressionModel):
                 log_b_override=log_b_override,
             )
 
+            # NaN guard — parity with forward().  Without this, a single bad
+            # slice nukes the whole image; codec strings still get written
+            # because compress() never checks, but decompress() reads back
+            # a finite quantised value through extreme μ → overflow at g_s.
+            if not torch.isfinite(dict_info).all():
+                dict_info = torch.zeros_like(dict_info)
+
             if self._cond_active and "col_mass" in _aux:
                 col_mass_i = _aux["col_mass"].detach()
                 cum_col_usage = (
@@ -1130,7 +1142,16 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            mu = self.cc_mean_transforms[i](support)
+            # Clamp μ to a sane dynamic range.  cc_mean_transforms is a 4-layer
+            # Conv stack with no normalisation; on OOD inputs (e.g. dict_info
+            # forced to zero by the probe hook, or extreme support statistics
+            # on textured / boundary slices) it occasionally outputs ±1e3,
+            # which the Gaussian conditional decodes as ±1e3 in y_hat.  g_s
+            # then overflows to ±inf, the final clamp(0, 1) does NOT clear
+            # NaN/inf, and the eval reports nan PSNR.  ±256 is well outside
+            # the empirical y range (±15 at λ=0.0036) but inside FP16 safe
+            # zone — a strict numerical safety net, NOT a learning bound.
+            mu = self.cc_mean_transforms[i](support).clamp(-256.0, 256.0)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             # Arithmetic encode
@@ -1229,6 +1250,12 @@ class WMDC(CompressionModel):
                 log_b_override=log_b_override,
             )
 
+            # NaN guard — parity with forward() and compress().  Must match
+            # compress() byte-for-byte: if compress zeroed dict_info because
+            # of NaN, decompress must do the same to recover the same μ/σ.
+            if not torch.isfinite(dict_info).all():
+                dict_info = torch.zeros_like(dict_info)
+
             if self._cond_active and "col_mass" in _aux:
                 col_mass_i = _aux["col_mass"].detach()
                 cum_col_usage = (
@@ -1242,7 +1269,9 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            mu = self.cc_mean_transforms[i](support)
+            # Identical μ clamp as compress() — required for byte-exact codec
+            # parity.  See compress() for the rationale.
+            mu = self.cc_mean_transforms[i](support).clamp(-256.0, 256.0)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
@@ -1261,5 +1290,13 @@ class WMDC(CompressionModel):
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self._decode_latent(y_hat).clamp_(0, 1)
+        # Replace any residual NaN/inf BEFORE clamping.  torch.clamp does not
+        # touch NaN (nan stays nan, ±inf become bounds), so a single bad pixel
+        # otherwise propagates to the final image — and the eval script reports
+        # nan PSNR.  nan→0.5 (grey), +inf→1.0, −inf→0.0 are safe placeholders
+        # that at worst show up as a colour-block artifact in one image rather
+        # than nuking the entire RD point.
+        x_hat = self._decode_latent(y_hat)
+        x_hat = torch.nan_to_num(x_hat, nan=0.5, posinf=1.0, neginf=0.0)
+        x_hat = x_hat.clamp_(0, 1)
         return {"x_hat": x_hat}
