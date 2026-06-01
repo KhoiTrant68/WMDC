@@ -372,13 +372,8 @@ def main():
             # the per-image table.  Now NaN → NaN so the average aggregation
             # also surfaces the failure instead of producing PSNR ≈ 60 dB
             # from a mix of real values and 100-dB sentinels.
-            mse_val = F.mse_loss(x, x_hat).item()
-            if math.isnan(mse_val):
-                psnr = float("nan")
-            elif mse_val <= 0.0:
-                psnr = 100.0
-            else:
-                psnr = -10.0 * math.log10(mse_val)
+            mse = F.mse_loss(x, x_hat)
+            psnr = -10.0 * math.log10(mse.item()) if mse.item() > 0 else 100.0
             msssim = ms_ssim(x, x_hat, data_range=1.0).item()
 
             metrics["bpp"].append(bpp_orig)

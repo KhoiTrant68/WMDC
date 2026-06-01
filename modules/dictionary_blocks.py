@@ -297,7 +297,8 @@ class UnifiedDictionaryAttention(nn.Module):
         HW = H * W
         q = self.q_proj(x).view(B, -1, HW).transpose(1, 2)
         q_norm = F.normalize(q, p=2, dim=-1)
-        return -torch.bmm(q_norm, k.transpose(1, 2))
+        k_norm = F.normalize(k, p=2, dim=-1)
+        return 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))
 
     # -----------------------------------------------------------------------
     # Spatial TV regularisation

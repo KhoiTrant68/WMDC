@@ -964,7 +964,7 @@ class WMDC(CompressionModel):
 
             # ── Gaussian conditional ─────────────────────────────────────────
             support = torch.cat([query, dict_info], dim=1)  # (B, 3M+S, H, W)
-            mu = self.cc_mean_transforms[i](support).clamp(-100.0, 100.0)
+            mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
@@ -998,7 +998,7 @@ class WMDC(CompressionModel):
             lrp_support = torch.cat([support, y_hat_for_lrp], dim=1)
             residual = self.lrp_transforms[i](lrp_support)
             lrp_gate = F.softplus(self.lrp_scales[i])
-            y_hat_slice_lrp = (y_hat_for_lrp + lrp_gate * residual).clamp(-200.0, 200.0)
+            y_hat_slice_lrp = y_hat_for_lrp + lrp_gate * residual
 
             y_hat_slices.append(y_hat_slice_lrp)
             y_likelihood.append(y_slice_likelihood)
@@ -1138,7 +1138,7 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            mu = self.cc_mean_transforms[i](support).clamp(-100.0, 100.0)
+            mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             # Arithmetic encode
@@ -1156,7 +1156,7 @@ class WMDC(CompressionModel):
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             residual = self.lrp_transforms[i](lrp_support)
             lrp_gate = F.softplus(self.lrp_scales[i])
-            y_hat_slice_lrp = (y_hat_slice + lrp_gate * residual).clamp(-200.0, 200.0)
+            y_hat_slice_lrp = y_hat_slice + lrp_gate * residual
 
             y_hat_slices.append(y_hat_slice_lrp)
 
@@ -1256,7 +1256,7 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            mu = self.cc_mean_transforms[i](support).clamp(-100.0, 100.0)
+            mu = self.cc_mean_transforms[i](support)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
@@ -1267,7 +1267,7 @@ class WMDC(CompressionModel):
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             residual = self.lrp_transforms[i](lrp_support)
             lrp_gate = F.softplus(self.lrp_scales[i])
-            y_hat_slice_lrp = (y_hat_slice + lrp_gate * residual).clamp(-200.0, 200.0)
+            y_hat_slice_lrp = y_hat_slice + lrp_gate * residual
 
             y_hat_slices.append(y_hat_slice_lrp)
 
@@ -1275,13 +1275,5 @@ class WMDC(CompressionModel):
                 memory_state = self.memory_updaters[i](memory_state, y_hat_slice_lrp)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        # Replace any residual NaN/inf BEFORE clamping.  torch.clamp does not
-        # touch NaN (nan stays nan, ±inf become bounds), so a single bad pixel
-        # otherwise propagates to the final image — and the eval script reports
-        # nan PSNR.  nan→0.5 (grey), +inf→1.0, −inf→0.0 are safe placeholders
-        # that at worst show up as a colour-block artifact in one image rather
-        # than nuking the entire RD point.
-        x_hat = self._decode_latent(y_hat)
-        x_hat = torch.nan_to_num(x_hat, nan=0.5, posinf=1.0, neginf=0.0)
-        x_hat = x_hat.clamp_(0, 1)
+        x_hat = self._decode_latent(y_hat).clamp_(0, 1)
         return {"x_hat": x_hat}
