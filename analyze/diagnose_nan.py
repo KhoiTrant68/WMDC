@@ -96,11 +96,13 @@ class NaNTracker:
             if isinstance(output, torch.Tensor):
                 tensors = [(None, output)]
             elif isinstance(output, (tuple, list)):
-                tensors = [(i, t) for i, t in enumerate(output)
-                           if isinstance(t, torch.Tensor)]
+                tensors = [
+                    (i, t) for i, t in enumerate(output) if isinstance(t, torch.Tensor)
+                ]
             elif isinstance(output, dict):
-                tensors = [(k, t) for k, t in output.items()
-                           if isinstance(t, torch.Tensor)]
+                tensors = [
+                    (k, t) for k, t in output.items() if isinstance(t, torch.Tensor)
+                ]
             for key, t in tensors:
                 if not torch.isfinite(t).all():
                     in_stats = []
@@ -124,18 +126,24 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument(
-        "--routing-mode", type=str, default="unbalanced_eot",
+        "--routing-mode",
+        type=str,
+        default="unbalanced_eot",
         choices=["softmax", "balanced_eot", "unbalanced_eot"],
     )
     parser.add_argument("--ot-eps", type=float, default=0.1)
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument(
-        "--backbone", type=str, default="fdm",
+        "--backbone",
+        type=str,
+        default="fdm",
         choices=["fdm", "cnn", "swin", "ss2d", "fdm_reversed"],
     )
     parser.add_argument("--use-wls-shortcut", action="store_true")
     parser.add_argument(
-        "--memory-init", type=str, default="bootstrap",
+        "--memory-init",
+        type=str,
+        default="bootstrap",
         choices=["bootstrap", "zero"],
     )
     parser.add_argument("--content-adaptive", action="store_true")
@@ -176,9 +184,7 @@ def main():
             out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
             decompress_first_bad = tracker.first_bad
 
-            x_hat_has_nan = bool(
-                not torch.isfinite(out_dec["x_hat"]).all().item()
-            )
+            x_hat_has_nan = bool(not torch.isfinite(out_dec["x_hat"]).all().item())
 
         if compress_first_bad is None and decompress_first_bad is None:
             n_clean += 1
@@ -187,17 +193,21 @@ def main():
             n_nan += 1
             stage = "compress" if compress_first_bad else "decompress"
             bad = compress_first_bad or decompress_first_bad
-            print(f"  NAN ({stage:>10s})  {os.path.basename(path):>14s}  "
-                  f"first bad: {bad['module']:50s}  ({bad['class']})  "
-                  f"frac_nan={bad['output_stats'].get('frac_nan', 0):.2%}")
+            print(
+                f"  NAN ({stage:>10s})  {os.path.basename(path):>14s}  "
+                f"first bad: {bad['module']:50s}  ({bad['class']})  "
+                f"frac_nan={bad['output_stats'].get('frac_nan', 0):.2%}"
+            )
 
-        per_image.append({
-            "file": os.path.basename(path),
-            "resolution": f"{W}x{H}",
-            "x_hat_has_nan": x_hat_has_nan,
-            "compress_first_bad": compress_first_bad,
-            "decompress_first_bad": decompress_first_bad,
-        })
+        per_image.append(
+            {
+                "file": os.path.basename(path),
+                "resolution": f"{W}x{H}",
+                "x_hat_has_nan": x_hat_has_nan,
+                "compress_first_bad": compress_first_bad,
+                "decompress_first_bad": decompress_first_bad,
+            }
+        )
 
     tracker.remove()
 
@@ -212,8 +222,7 @@ def main():
     with open(args.output, "w") as f:
         json.dump(summary, f, indent=4)
 
-    print(f"\nClean: {n_clean}/{n_clean + n_nan}    "
-          f"NaN: {n_nan}/{n_clean + n_nan}")
+    print(f"\nClean: {n_clean}/{n_clean + n_nan}    " f"NaN: {n_nan}/{n_clean + n_nan}")
     print(f"Report → {args.output}")
 
 

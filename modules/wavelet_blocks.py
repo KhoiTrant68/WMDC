@@ -276,29 +276,20 @@ class FrequencyDisentangledMamba(nn.Module):
         x_target: torch.Tensor, params: torch.Tensor
     ) -> torch.Tensor:
         """
-        Affine FiLM: y = scale * x + shift.
-
-        `scale.clamp(max=10)` blocks a catastrophic positive-feedback loop:
-        γ is produced by an MLP whose input ultimately depends on
-        x_target (via context_mamba ← pre_context_proj ← cat with
-        x_ll_out), so on OOD or under-trained inputs γ scales with
-        x_target itself.  Then scale ≈ |γ| ∝ |x_target|, and
-        `x_target * scale ≈ x_target²` — a squaring operation per FDM
-        block.  With L = 3 FDM blocks in g_s, a single unit of input
-        grows as M₀^(2^L) = M₀^8, so M₀ = 10 → 10⁸ and M₀ = 10³ →
-        10²⁴ (matches the empirical g_s decoder trace
-        log₁₀|x| : 3.6 → 7.0 → 12.3 → 21.8 → 38.5 (∞) ).
-
-        Cap = 10 is mathematically generous:
-          • init: γ = log(e − 1) ≈ 0.541 → scale ≈ 1.0 (identity modulation)
-          • trained model: |γ| stays O(1) → scale O(1) → clamp is no-op
-          • triggers only when γ > log(e¹⁰ − 1) ≈ 10
-        With scale ≤ 10 per block: total amplification ≤ 10^L = 10³ for
-        g_s, keeping output well below fp32 overflow regardless of input.
+        Affine FiLM: y = scale * x + shift using a Smooth Soft-Clamp (tanh).
+        Ensures strict growth limitations to block decoder overflows (NaNs)
+        while maintaining active gradient propagation across all texture densities.
         """
         C = x_target.shape[1]
         gamma, beta = params[:, :C], params[:, C:]
-        scale = F.softplus(gamma)
+
+        # Compute the unbounded softplus scale factor
+        soft_scale = F.softplus(gamma)
+
+        # Smooth Soft-Clamping with an upper horizontal asymptote S_max = 10.0
+        S_max = 10.0
+        scale = S_max * torch.tanh(soft_scale / S_max)
+
         return x_target * scale + beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

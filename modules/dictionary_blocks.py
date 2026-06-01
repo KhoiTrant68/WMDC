@@ -281,42 +281,34 @@ class UnifiedDictionaryAttention(nn.Module):
     def _cost_matrix(
         self, x: torch.Tensor, k: torch.Tensor, H: int, W: int
     ) -> torch.Tensor:
-        # Cost = −similarity, computed against the UNNORMALISED dictionary
-        # tokens.  QueryDictionaryGenerator returns L2-normalised atoms scaled
-        # by sqrt(dict_dim) (line 71), so ‖k‖ = sqrt(d).  Re-normalising k —
-        # as the pre-fix code did — undoes that scaling and caps std(C) at
-        # ~1/sqrt(d) ≈ 0.04 (d=640).  Sinkhorn then needs eps ≪ 0.04 to
-        # produce sharp routing, which the bounded `log_eps` parameterisation
-        # could not reach, so column-marginal entropy stuck at ~93 % of max
-        # and the dictionary collapsed to near-uniform routing.
-        #
-        # Keeping k at its native sqrt(d) scale and only normalising q gives
-        # std(C) ≈ 1 — a ~25× contrast increase at d=640 — which lets the
-        # Sinkhorn output respond to the row-entropy regulariser.
+        """
+        Computes a stable, high-contrast cost matrix for Sinkhorn routing.
+        Balances routing sharpness against numerical underflow boundaries.
+        """
         B = x.shape[0]
         HW = H * W
-        
+
         # 1. Project and compute standard Cosine Distance [0, 2]
         q = self.q_proj(x).view(B, -1, HW).transpose(1, 2)
         q_norm = F.normalize(q, p=2, dim=-1)
         k_norm = F.normalize(k, p=2, dim=-1)
-        
+
         cos_dist = 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))
-        
+
         # 2. Contrast Scaling Factor
-        # Instead of multiplying blindly by sqrt(640) ≈ 25.3, we scale by 
-        # ln(dict_dim) ≈ 6.46. This safely expands std(C) to ~0.5 without 
+        # Instead of multiplying blindly by sqrt(640) ≈ 25.3, we scale by
+        # ln(dict_dim) ≈ 6.46. This safely expands std(C) to ~0.5 without
         # blowing up the absolute bounds of the matrix.
-        scale_factor = math.log(self.dict_dim) if hasattr(self, 'dict_dim') else 6.5
+        scale_factor = math.log(self.dict_dim) if hasattr(self, "dict_dim") else 6.5
         cost_matrix = cos_dist * scale_factor
-        
+
         # 3. Numerical Guardrail
-        # Explicitly clamp the matrix. This acts as an insurance policy 
-        # against underflow inside the log-domain Sinkhorn iterations, 
+        # Explicitly clamp the matrix. This acts as an insurance policy
+        # against underflow inside the log-domain Sinkhorn iterations,
         # completely preventing the circular wavelet artifacts.
         max_safe_cost = 15.0
         cost_matrix = torch.clamp(cost_matrix, min=0.0, max=max_safe_cost)
-        
+
         return cost_matrix
 
     # -----------------------------------------------------------------------

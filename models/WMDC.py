@@ -931,7 +931,6 @@ class WMDC(CompressionModel):
                 log_b_override=log_b_override,
             )
 
-
             # Safety guard: if the EOT pipeline produced NaN/Inf (e.g. routing
             # fully collapsed to a single token and the bmm with v_norm hit a
             # degenerate scale), zero the dict_info and let the rest of the

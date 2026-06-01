@@ -54,9 +54,7 @@ class MagnitudeTracker:
         for name, module in model.named_modules():
             if not name:
                 continue
-            self.handles.append(
-                module.register_forward_hook(self._make_hook(name))
-            )
+            self.handles.append(module.register_forward_hook(self._make_hook(name)))
 
     def remove(self) -> None:
         for h in self.handles:
@@ -70,13 +68,16 @@ class MagnitudeTracker:
         def hook(_module, _inputs, output):
             if isinstance(output, torch.Tensor):
                 t = output
-            elif isinstance(output, (tuple, list)) and isinstance(output[0], torch.Tensor):
+            elif isinstance(output, (tuple, list)) and isinstance(
+                output[0], torch.Tensor
+            ):
                 t = output[0]
             else:
                 return
             lm = _log10_abs_max(t)
             has_nonfinite = not torch.isfinite(t).all().item()
             self.records.append((name, lm, has_nonfinite))
+
         return hook
 
 
@@ -91,14 +92,17 @@ def main():
     parser.add_argument("--backbone", type=str, default="fdm")
     parser.add_argument("--use-wls-shortcut", action="store_true")
     parser.add_argument(
-        "--memory-init", type=str, default="bootstrap",
+        "--memory-init",
+        type=str,
+        default="bootstrap",
         choices=["bootstrap", "zero"],
     )
     parser.add_argument("--content-adaptive", action="store_true")
     parser.add_argument("--cluster-num", type=int, default=8)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument(
-        "--filter-decoder", action="store_true",
+        "--filter-decoder",
+        action="store_true",
         help="Only log modules under g_s.* (the decoder where NaN appears).",
     )
     args = parser.parse_args()
@@ -106,9 +110,11 @@ def main():
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
     model = load_model(
-        args.checkpoint, device=device,
+        args.checkpoint,
+        device=device,
         routing_mode=args.routing_mode,
-        ot_eps=args.ot_eps, sinkhorn_iters=args.sinkhorn_iters,
+        ot_eps=args.ot_eps,
+        sinkhorn_iters=args.sinkhorn_iters,
         backbone=args.backbone,
         use_wls_shortcut=args.use_wls_shortcut,
         memory_init=args.memory_init,
@@ -139,18 +145,23 @@ def main():
         )
         max_record = max(records, key=lambda r: r[1]) if records else None
 
-        per_image.append({
-            "file": os.path.basename(path),
-            "resolution": f"{W}x{H}",
-            "n_modules": len(records),
-            "first_nonfinite": records[first_bad_idx] if first_bad_idx is not None
-                              else None,
-            "max_log10_magnitude": max_record,
-            "trace_compressed": [
-                {"module": n, "log10_max": round(m, 2), "nonfinite": b}
-                for (n, m, b) in records[::4]  # subsample every 4th to keep JSON small
-            ],
-        })
+        per_image.append(
+            {
+                "file": os.path.basename(path),
+                "resolution": f"{W}x{H}",
+                "n_modules": len(records),
+                "first_nonfinite": (
+                    records[first_bad_idx] if first_bad_idx is not None else None
+                ),
+                "max_log10_magnitude": max_record,
+                "trace_compressed": [
+                    {"module": n, "log10_max": round(m, 2), "nonfinite": b}
+                    for (n, m, b) in records[
+                        ::4
+                    ]  # subsample every 4th to keep JSON small
+                ],
+            }
+        )
         print(
             f"{os.path.basename(path):>14s}  "
             f"max_log10|x|={max_record[1]:6.2f} at {max_record[0][:40]:40s}  "
