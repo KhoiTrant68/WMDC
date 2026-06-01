@@ -53,13 +53,25 @@ train_mode() {
 
     # Entropy weights overridden for the adaptive-eps patch
     # (modules/dictionary_blocks.py: _adaptive_eps + log_adaptive_range).
-    #   β_row = 0.0 : adaptive eps now provides per-pixel sharpening;
-    #                 an extra global +H_row penalty fights the routing,
-    #                 driving every pixel to one-hot → dict collapse.
-    #   β_col = 0.3 : single defence left against atom collapse.  The
-    #                 train.py default (0.1) is too weak; the dict
-    #                 utilisation experiments showed it pegs at ~21–26 %
-    #                 and slices 1–2 degenerate to ~2 effective atoms.
+    #
+    # History
+    # -------
+    #   v1 (pre-patch defaults col=0.1, row=0.3) → dict collapse, util 26 %,
+    #     5/24 catastrophic noise images.
+    #   v2 (col=0.3, row=0.0 + adaptive eps) → no noise, but routing
+    #     OVER-corrected to fully uniform: H_col = 7 bits (util 100 %),
+    #     BPP +19 %.  Cold-start cycle: cold dict → small margins →
+    #     adaptive eps maxes out soft → weak gradient to differentiate
+    #     atoms → atoms stay similar.
+    #   v3 (current) col=0.15, row=0.05 + adaptive eps:
+    #     β_row = 0.05 is a SMALL global sharpness baseline that
+    #       bootstraps atom differentiation during early training;
+    #       adaptive eps then modulates per-pixel around this baseline.
+    #     β_col = 0.15 still pushes atom dispersion but not so hard the
+    #       loss demands fully uniform H_col.
+    #     Hypothesis: the right operating point is β_col mildly > β_row,
+    #       both nonzero — the v2 "row=0" failure shows adaptive eps
+    #       CANNOT entirely replace β_row in cold-start.
     #
     # Adaptive-eps cụm 1–3 patches:
     #   --slice-coherence-weight 0.01 : B3 — per-slice k_dict orthogonality.
@@ -85,7 +97,7 @@ train_mode() {
         --last-epochs-with-ste "$LAST_EPOCHS_STE" \
         --ortho-weight "${ORTHO_WEIGHT:-0.01}" \
         --column-entropy-weight 0.3 \
-        --row-entropy-weight 0.0 \
+        --row-entropy-weight 0.1 \
         --slice-coherence-weight 0.01 \
         --revive-every-n-steps 500 \
         --use-adaptive-eps \
