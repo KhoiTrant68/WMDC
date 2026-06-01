@@ -23,10 +23,10 @@ RESULTS_DIR="$REPO/results"
 #     LAMBDAS_ABLATION=(0.0036 0.013 0.0483)                    # 3-point ablation
 #
 # Training in earnest with the values below will produce nonsense numbers.
-EPOCHS=40
+EPOCHS=12
 BATCH_SIZE=4
 LR_MILESTONES="8 10"
-LAST_EPOCHS_STE=2
+LAST_EPOCHS_STE=4
 
 # ── Lambdas ──────────────────────────────────────────────────────────
 # LAMBDAS_FULL=(0.0018 0.0036 0.0067 0.013 0.025 0.0483)   # full RD curve
