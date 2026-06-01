@@ -53,12 +53,8 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from analyze._common import (
-    compute_actual_bpp,
-    compute_psnr,  # noqa: E402
-    iter_dataset,
-    load_model,
-)
+from analyze._common import compute_psnr  # noqa: E402
+from analyze._common import compute_actual_bpp, iter_dataset, load_model
 from modules.dictionary_blocks import UnifiedDictionaryAttention  # noqa: E402
 
 

@@ -826,13 +826,13 @@ def parse_args():
     p.add_argument(
         "--row-entropy-weight",
         type=float,
-        default=0.1,
+        default=0.05,
         help=(
             "β_row: weight on row_entropy = H_row (bits).  "
             "Positive → MINIMISE H_row (sparse per-pixel selection).  "
-            "Reduced from 0.3 → 0.1 after the smoke test showed full "
+            "Reduced from 0.3 → 0.05 after the smoke test showed full "
             "collapse to one-hot routing within 1 epoch.  At the post-fix "
-            "cost-matrix contrast (std(C)≈1), 0.1 is enough push for "
+            "cost-matrix contrast (std(C)≈1), 0.05 is enough push for "
             "sparsification while leaving the column-entropy bonus room to "
             "keep H_col > 0.  Set 0 to disable."
         ),
