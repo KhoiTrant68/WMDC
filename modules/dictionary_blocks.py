@@ -122,6 +122,16 @@ class UnifiedDictionaryAttention(nn.Module):
 
         self.log_rho_col = nn.Parameter(torch.tensor(0.0))
 
+        # Adaptive per-pixel eps.  Each pixel's softness is scaled by
+        #   eps_pixel = base_eps · (range − (range − 1) · clarity)
+        # where clarity ∈ [0, 1] is an ABSOLUTE measure of how clear the
+        # best-atom margin is (clarity ≈ 1 ⇒ confident winner ⇒ sharp;
+        # clarity ≈ 0 ⇒ ambiguous ⇒ softer).  Init range = 3×.  Learnable
+        # so the model picks the spread; replaces hand-tuning the
+        # row-entropy penalty for SHARPNESS, but is orthogonal to
+        # column-entropy (dictionary spread) — keep β_col separately.
+        self.log_adaptive_range = nn.Parameter(torch.tensor(math.log(3.0)))
+
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
         self.out_proj = nn.Sequential(
             nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
@@ -332,6 +342,7 @@ class UnifiedDictionaryAttention(nn.Module):
         self,
         C_mat: torch.Tensor,
         log_b_override: torch.Tensor | None = None,
+        eps_pixel: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         log_b_override : optional (B, 1, N) tensor that *replaces* the uniform
@@ -340,13 +351,19 @@ class UnifiedDictionaryAttention(nn.Module):
                          dictionary atoms already heavily used by earlier ones.
                          When None (default), behaves identically to balanced
                          Sinkhorn with uniform b = 1/N.
+        eps_pixel      : optional (B, HW, 1) per-pixel epsilon from
+                         `_adaptive_eps`.  Scales the cost matrix per pixel
+                         (M = C / eps_pixel) so ambiguous pixels see a
+                         smoother routing.  Balanced OT has no row-marginal
+                         prox operator, so the per-pixel scaling is
+                         mathematically safe here.
         """
         B, HW, N = C_mat.shape
         self._sinkhorn_calls += 1
         eps = self._eps()
         log_a = -math.log(HW)
         log_b = log_b_override if log_b_override is not None else -math.log(N)
-        M = C_mat / eps
+        M = C_mat / (eps_pixel if eps_pixel is not None else eps)
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
@@ -412,12 +429,27 @@ class UnifiedDictionaryAttention(nn.Module):
         C_mat: torch.Tensor,
         rho_flat: torch.Tensor,
         log_b_override: torch.Tensor | None = None,
+        eps_pixel: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Unbalanced entropic OT in log-domain.
 
         log_b_override : optional (B, 1, N) tensor that *replaces* the uniform
                          column target marginal.  See `_route_balanced_eot`.
+        eps_pixel      : optional (B, HW, 1) per-pixel epsilon from
+                         `_adaptive_eps`.  ONLY used to scale the cost matrix
+                         (M = C / eps_pixel).  The proximal coefficients
+                         `shrink_row`, `shrink_col`, and the TV clamp bounds
+                         `rpe_row`, `rpe_col` deliberately keep the SCALAR
+                         `eps`.  Reason: shrink_row = ρ/(ρ+ε) is the closed-
+                         form prox of the KL marginal penalty.  Using
+                         eps_pixel there would (a) tighten the shrink on
+                         ambiguous pixels (eps_pixel large ⇒ shrink_row
+                         small ⇒ row_mass collapses faster), accelerating
+                         the dead-routing failure mode we are trying to
+                         avoid; and (b) break the fixed-point convergence
+                         guarantee of unbalanced Sinkhorn, which requires
+                         scalar ε in the prox operator.
         """
         B, HW, N = C_mat.shape
         self._sinkhorn_calls += 1
@@ -427,7 +459,7 @@ class UnifiedDictionaryAttention(nn.Module):
 
         log_a = -math.log(HW)
         log_b = log_b_override if log_b_override is not None else -math.log(N)
-        M = C_mat / eps
+        M = C_mat / (eps_pixel if eps_pixel is not None else eps)
 
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
@@ -475,10 +507,62 @@ class UnifiedDictionaryAttention(nn.Module):
         return torch.exp(log_P.clamp(min=-60.0))
 
     # -----------------------------------------------------------------------
+    # Content-adaptive per-pixel eps
+    # -----------------------------------------------------------------------
+
+    def _adaptive_eps(self, C_mat: torch.Tensor) -> torch.Tensor:
+        """
+        Return per-pixel eps shaped (B, HW, 1).
+
+        Absolute clarity (image-independent):
+            margin = cost_2nd_best − cost_best         (cost units)
+            clarity = tanh(margin / base_eps)          (∈ [0, 1))
+
+        Why absolute (not image-normalised):
+          Image-relative `clarity = margin / max_margin_in_image` always has
+          at least one pixel with clarity = 1, even when EVERY pixel is
+          ambiguous (OOD content where dict atoms all match poorly).  That
+          masks the OOD case — which is exactly the failure mode behind the
+          catastrophic-PSNR Kodak images.  Using tanh(margin / base_eps)
+          makes clarity ≈ 0 across the whole image when margins are small
+          relative to the routing temperature, so OOD pixels all get max
+          softness.
+
+          • Confident winner (margin ≫ ε):  tanh → 1   ⇒ eps_pixel = base_eps
+          • Ambiguous       (margin ≈ ε):   tanh ≈ tanh(1) ≈ 0.76
+          • OOD             (margin ≪ ε):  tanh → 0   ⇒ eps_pixel = range·base_eps
+
+        clarity is computed under no_grad — gradient flows only through
+        the learnable `log_adaptive_range` scalar, keeping Sinkhorn
+        differentiation clean.
+        """
+        base_eps = self._eps()
+        with torch.no_grad():
+            k = min(2, C_mat.shape[-1])
+            top2 = torch.topk(C_mat, k=k, dim=-1, largest=False).values  # (B,HW,k)
+            if k == 2:
+                margin = (top2[:, :, 1] - top2[:, :, 0]).clamp(min=0)
+            else:
+                margin = top2[:, :, 0].clamp(min=0)
+            # Absolute clarity: how many "eps units" is the winner ahead?
+            clarity = torch.tanh(margin / base_eps.detach().clamp(min=1e-6))
+
+        adaptive_range = F.softplus(self.log_adaptive_range) + 1.0  # ≥ 1
+        # eps_pixel ∈ [base_eps, range · base_eps]:
+        #   clarity = 1 ⇒ eps_pixel = base_eps
+        #   clarity = 0 ⇒ eps_pixel = range · base_eps
+        eps_pixel = base_eps * (adaptive_range - (adaptive_range - 1.0) * clarity)
+        return eps_pixel.unsqueeze(-1)  # (B, HW, 1)
+
+    # -----------------------------------------------------------------------
     # Softmax routing
     # -----------------------------------------------------------------------
 
-    def _route_softmax(self, C_mat: torch.Tensor) -> torch.Tensor:
+    def _route_softmax(
+        self, C_mat: torch.Tensor, eps_pixel: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if eps_pixel is not None:
+            return F.softmax(-C_mat / eps_pixel, dim=-1)
         tau = F.softplus(self.log_tau) + 0.01
         return F.softmax(-C_mat / tau, dim=-1)
 
@@ -537,16 +621,26 @@ class UnifiedDictionaryAttention(nn.Module):
 
         C_mat = self._cost_matrix(x, k, H, W).float()
 
+        # Per-pixel eps shared by all routing modes.  In unbalanced_eot it
+        # only re-scales M; shrink/clamp constants keep scalar eps for
+        # mathematical / convergence reasons (see _route_unbalanced_eot).
+        eps_pixel = self._adaptive_eps(C_mat)
+
         if self.routing_mode == "softmax":
-            P = self._route_softmax(C_mat)
+            P = self._route_softmax(C_mat, eps_pixel=eps_pixel)
         elif self.routing_mode == "balanced_eot":
-            P = self._route_balanced_eot(C_mat, log_b_override=log_b_override)
+            P = self._route_balanced_eot(
+                C_mat, log_b_override=log_b_override, eps_pixel=eps_pixel
+            )
             P = P * HW
         elif self.routing_mode == "unbalanced_eot":
             assert rho_spatial is not None, "rho_spatial required for unbalanced_eot"
             rho_flat = rho_spatial.view(B, HW).float().clamp(min=0.01)
             P = self._route_unbalanced_eot(
-                C_mat, rho_flat, log_b_override=log_b_override
+                C_mat,
+                rho_flat,
+                log_b_override=log_b_override,
+                eps_pixel=eps_pixel,
             )
             P = P * HW
         else:
@@ -580,13 +674,20 @@ class UnifiedDictionaryAttention(nn.Module):
             column_neg_entropy = self._dispersion_loss(P)
             row_entropy = self._row_entropy(P)
             if self.training:
+                # DDP parity: every learnable scalar that is NOT in the
+                # active routing path still needs a 0×grad to appear in the
+                # graph, otherwise DDP raises "param not used in fwd".
+                # `log_adaptive_range` is always used (via _adaptive_eps),
+                # so it does not need a parity term.
                 if self.routing_mode == "unbalanced_eot":
                     column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
                 elif self.routing_mode == "balanced_eot":
                     column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
                     column_neg_entropy = column_neg_entropy + self.log_rho_col * 0.0
                 else:  # softmax
-                    column_neg_entropy = column_neg_entropy + self.log_eps * 0.0
+                    # log_eps IS used (via _adaptive_eps → base_eps), but
+                    # log_tau and log_rho_col are dormant in this branch.
+                    column_neg_entropy = column_neg_entropy + self.log_tau * 0.0
                     column_neg_entropy = column_neg_entropy + self.log_rho_col * 0.0
         else:
             column_neg_entropy = zero
