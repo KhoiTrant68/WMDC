@@ -51,6 +51,15 @@ train_mode() {
 
     local arch_flags; arch_flags="$(common_arch_flags)"
 
+    # Entropy weights overridden for the adaptive-eps patch
+    # (modules/dictionary_blocks.py: _adaptive_eps + log_adaptive_range).
+    #   β_row = 0.0 : adaptive eps now provides per-pixel sharpening;
+    #                 an extra global +H_row penalty fights the routing,
+    #                 driving every pixel to one-hot → dict collapse.
+    #   β_col = 0.3 : single defence left against atom collapse.  The
+    #                 train.py default (0.1) is too weak; the dict
+    #                 utilisation experiments showed it pegs at ~21–26 %
+    #                 and slices 1–2 degenerate to ~2 effective atoms.
     # shellcheck disable=SC2086
     $LAUNCHER train.py \
         -d "$TRAIN_DATA" \
@@ -63,6 +72,8 @@ train_mode() {
         --lr-milestones $LR_MILESTONES \
         --last-epochs-with-ste "$LAST_EPOCHS_STE" \
         --ortho-weight "${ORTHO_WEIGHT:-0.01}" \
+        --column-entropy-weight 0.3 \
+        --row-entropy-weight 0.0 \
         $arch_flags \
         $resume_flag
 
