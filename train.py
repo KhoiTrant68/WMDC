@@ -335,6 +335,8 @@ def train_one_epoch(
     logger,
     writer,
     accelerator,
+    revive_every_n_steps: int = 0,
+    revive_agreement: int | None = None,
 ):
     model.train()
     criterion.train()
@@ -384,13 +386,15 @@ def train_one_epoch(
         # then dict_queries is broadcast to every rank so DDP stays in
         # sync.  _col_usage_ema is a registered persistent buffer →
         # accelerate's broadcast_buffers handles its sync on next fwd.
-        revive_n = getattr(args, "revive_every_n_steps", 0)
-        if revive_n and revive_n > 0 and (i + 1) % revive_n == 0:
+        if (
+            revive_every_n_steps
+            and revive_every_n_steps > 0
+            and (i + 1) % revive_every_n_steps == 0
+        ):
             unwrapped = accelerator.unwrap_model(model)
-            agreement = getattr(args, "revive_agreement", None)
             n_rev = 0
             if accelerator.is_main_process:
-                n_rev = unwrapped.revive_dead_atoms(agreement=agreement)
+                n_rev = unwrapped.revive_dead_atoms(agreement=revive_agreement)
             # Broadcast modified parameter to every rank.  Cheap (~80 KB
             # for dict_num=128, in_dim=192).  Skip when single-process.
             if accelerator.num_processes > 1:
@@ -1327,6 +1331,8 @@ def main():
             logger,
             writer,
             accelerator,
+            revive_every_n_steps=args.revive_every_n_steps,
+            revive_agreement=args.revive_agreement,
         )
 
         run_gap = (
