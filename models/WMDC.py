@@ -964,7 +964,7 @@ class WMDC(CompressionModel):
 
             # ── Gaussian conditional ─────────────────────────────────────────
             support = torch.cat([query, dict_info], dim=1)  # (B, 3M+S, H, W)
-            mu = self.cc_mean_transforms[i](support)
+            mu = self.cc_mean_transforms[i](support).clamp(-100.0, 100.0)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             y_hat_slice, y_slice_likelihood = self.gaussian_conditional(
@@ -998,7 +998,7 @@ class WMDC(CompressionModel):
             lrp_support = torch.cat([support, y_hat_for_lrp], dim=1)
             residual = self.lrp_transforms[i](lrp_support)
             lrp_gate = F.softplus(self.lrp_scales[i])
-            y_hat_slice_lrp = y_hat_for_lrp + lrp_gate * residual
+            y_hat_slice_lrp = (y_hat_for_lrp + lrp_gate * residual).clamp(-200.0, 200.0)
 
             y_hat_slices.append(y_hat_slice_lrp)
             y_likelihood.append(y_slice_likelihood)
@@ -1138,7 +1138,7 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            mu = self.cc_mean_transforms[i](support)
+            mu = self.cc_mean_transforms[i](support).clamp(-100.0, 100.0)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             # Arithmetic encode
@@ -1156,7 +1156,7 @@ class WMDC(CompressionModel):
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             residual = self.lrp_transforms[i](lrp_support)
             lrp_gate = F.softplus(self.lrp_scales[i])
-            y_hat_slice_lrp = y_hat_slice + lrp_gate * residual
+            y_hat_slice_lrp = (y_hat_slice + lrp_gate * residual).clamp(-200.0, 200.0)
 
             y_hat_slices.append(y_hat_slice_lrp)
 
@@ -1256,7 +1256,7 @@ class WMDC(CompressionModel):
                 self.eot_attentions[i].attn_probs = None
 
             support = torch.cat([query, dict_info], dim=1)
-            mu = self.cc_mean_transforms[i](support)
+            mu = self.cc_mean_transforms[i](support).clamp(-100.0, 100.0)
             scale = self.cc_scale_transforms[i](support).clamp(min=0.11)
 
             index = self.gaussian_conditional.build_indexes(scale)
@@ -1267,7 +1267,7 @@ class WMDC(CompressionModel):
             lrp_support = torch.cat([support, y_hat_slice], dim=1)
             residual = self.lrp_transforms[i](lrp_support)
             lrp_gate = F.softplus(self.lrp_scales[i])
-            y_hat_slice_lrp = y_hat_slice + lrp_gate * residual
+            y_hat_slice_lrp = (y_hat_slice + lrp_gate * residual).clamp(-200.0, 200.0)
 
             y_hat_slices.append(y_hat_slice_lrp)
 

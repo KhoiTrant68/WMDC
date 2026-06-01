@@ -299,6 +299,7 @@ class FrequencyDisentangledMamba(nn.Module):
         C = x_target.shape[1]
         gamma, beta = params[:, :C], params[:, C:]
         scale = F.softplus(gamma).clamp(max=10.0)
+        beta = beta.clamp(-20.0, 20.0)
         return x_target * scale + beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
