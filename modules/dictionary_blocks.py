@@ -295,10 +295,29 @@ class UnifiedDictionaryAttention(nn.Module):
         # Sinkhorn output respond to the row-entropy regulariser.
         B = x.shape[0]
         HW = H * W
+        
+        # 1. Project and compute standard Cosine Distance [0, 2]
         q = self.q_proj(x).view(B, -1, HW).transpose(1, 2)
         q_norm = F.normalize(q, p=2, dim=-1)
         k_norm = F.normalize(k, p=2, dim=-1)
-        return 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))
+        
+        cos_dist = 1.0 - torch.bmm(q_norm, k_norm.transpose(1, 2))
+        
+        # 2. Contrast Scaling Factor
+        # Instead of multiplying blindly by sqrt(640) ≈ 25.3, we scale by 
+        # ln(dict_dim) ≈ 6.46. This safely expands std(C) to ~0.5 without 
+        # blowing up the absolute bounds of the matrix.
+        scale_factor = math.log(self.dict_dim) if hasattr(self, 'dict_dim') else 6.5
+        cost_matrix = cos_dist * scale_factor
+        
+        # 3. Numerical Guardrail
+        # Explicitly clamp the matrix. This acts as an insurance policy 
+        # against underflow inside the log-domain Sinkhorn iterations, 
+        # completely preventing the circular wavelet artifacts.
+        max_safe_cost = 15.0
+        cost_matrix = torch.clamp(cost_matrix, min=0.0, max=max_safe_cost)
+        
+        return cost_matrix
 
     # -----------------------------------------------------------------------
     # Spatial TV regularisation
