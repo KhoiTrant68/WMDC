@@ -461,16 +461,15 @@ class WMDC(CompressionModel):
 
         # ── C1: per-slice range-bias predictors ─────────────────────────
         # Tiny MLP from pooled hyperprior summary → scalar log-range bias.
-        # Pool is (B, 2*N) after AdaptiveAvgPool2d(1) on the (B, 2*N, H, W)
-        # hyperprior; predictor input is fixed 2*N so it's slice-agnostic
-        # in shape but learned independently per slice.  Output clamped
-        # via tanh to ±1.0 (small enough not to override the global
-        # log_adaptive_range parameter).
+        # hyper_prior is cat([latent_scales, latent_means]) with shape
+        # (B, 2*M, Hz, Wz) — so the global-avg-pool summary is (B, 2*M).
+        # Output clamped via tanh(±1.0) so the per-image bias never
+        # overrides the global log_adaptive_range parameter.
         if self.image_conditional_range:
             self.range_bias_predictors = nn.ModuleList(
                 [
                     nn.Sequential(
-                        nn.Linear(2 * N, 32),
+                        nn.Linear(2 * M, 32),
                         nn.GELU(),
                         nn.Linear(32, 1),
                     )
