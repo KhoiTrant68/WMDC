@@ -70,6 +70,49 @@ class QueryDictionaryGenerator(nn.Module):
 
         return dt * self._sqrt_dict_dim, penalty
 
+    # -----------------------------------------------------------------------
+    # B2 — Atom revival
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def revive_queries(self, dead_mask: torch.Tensor, noise_scale: float = 0.5) -> int:
+        """
+        Re-initialise `dict_queries` rows flagged as dead.
+
+        Replacement = clone of a randomly-picked LIVE row + Gaussian noise
+        scaled by `noise_scale × std(live)`.  This escapes the collapse
+        basin without throwing away learned structure (the live atoms
+        already encode useful directions).
+
+        Returns the number of atoms revived.  Caller (WMDC.revive_dead_atoms)
+        should also reset the per-slice EMA via
+        UnifiedDictionaryAttention.reset_col_usage_ema().
+
+        Standard codebook-revival trick from VQ-VAE / SoundStream — a
+        proven escape mechanism for dead-code collapse in vector
+        quantisation.  Applied at the QUERY level here because k_dict_i =
+        k_proj_i(dt) shares dt across slices; modifying dt influences
+        every slice's atoms simultaneously.
+        """
+        if dead_mask.numel() == 0 or not dead_mask.any():
+            return 0
+        live_mask = ~dead_mask
+        if not live_mask.any():
+            # All atoms dead — re-init to standard normal.
+            self.dict_queries.data.normal_()
+            return int(dead_mask.numel())
+
+        live = self.dict_queries.data[0, live_mask, :]  # (Nl, in_dim)
+        live_std = live.std(dim=0, unbiased=False).clamp(min=1e-6)  # (in_dim,)
+        n_dead = int(dead_mask.sum())
+        # Sample with replacement from live rows.
+        idx = torch.randint(0, live.shape[0], (n_dead,), device=live.device)
+        replacements = live[idx] + noise_scale * live_std * torch.randn_like(
+            live[idx]
+        )
+        self.dict_queries.data[0, dead_mask, :] = replacements
+        return n_dead
+
 
 # ---------------------------------------------------------------------------
 # UnifiedDictionaryAttention
@@ -80,6 +123,30 @@ class UnifiedDictionaryAttention(nn.Module):
     """
     Unified Dictionary Attention with three routing modes.
     """
+
+    # ─────────────────────────────────────────────────────────────────
+    # Class-level numerical constants (tied to _cost_matrix bounds).
+    # Putting them here documents the contract between cost matrix
+    # range and the adaptive-eps clarity metric.
+    # ─────────────────────────────────────────────────────────────────
+    #
+    # _cost_matrix clamps cost into [0, max_safe_cost=15.0].  CLARITY_REF
+    # is the cost-margin scale at which a pixel is considered "confident":
+    # margin = CLARITY_REF ⇒ clarity ≈ tanh(1) ≈ 0.76.  Tied to a FIXED
+    # constant (not base_eps) so the adaptive-eps mechanism decouples from
+    # the learnable eps schedule — otherwise the optimiser could game the
+    # metric by shrinking base_eps to make every pixel look "confident".
+    CLARITY_REF: float = 3.75   # = max_safe_cost / 4
+    # adaptive_range = how many × base_eps an ambiguous pixel can stretch
+    # to.  Soft-clamped via tanh to RANGE_CAP — unbounded growth would
+    # let the optimiser hide a bad routing inside a near-uniform plan
+    # (inflated H_col, but useless for compression).
+    RANGE_CAP: float = 10.0
+    # Dead-atom detection: an atom whose EMA column mass is below this
+    # FRACTION of the uniform mass (1/N) is flagged dead.  threshold=0.05
+    # means an atom must carry < 5 % of its fair share to count as dead.
+    DEAD_FRACTION: float = 0.05
+    EMA_DECAY: float = 0.99       # column-usage EMA momentum
 
     def __init__(
         self,
@@ -95,6 +162,7 @@ class UnifiedDictionaryAttention(nn.Module):
         tv_weight: float = 0.0,
         store_attn_probs: bool = False,
         chunk_threshold: int = 2048,
+        use_adaptive_eps: bool = True,
     ):
         super().__init__()
         self.dict_num = dict_num
@@ -103,6 +171,7 @@ class UnifiedDictionaryAttention(nn.Module):
         self.iters = iters
         self.tv_weight = tv_weight
         self.chunk_threshold = chunk_threshold
+        self.use_adaptive_eps = bool(use_adaptive_eps)
 
         self.n_grad_iters = max(5, iters // 3)
         self.n_nograd_iters = max(0, iters - self.n_grad_iters)
@@ -185,6 +254,26 @@ class UnifiedDictionaryAttention(nn.Module):
         self.register_buffer(
             "_log_eps_bias", torch.zeros(1, dtype=torch.float32), persistent=False
         )
+
+        # ── Column-usage EMA (B2 dead-atom revival) ─────────────────────
+        # Tracks the long-run column marginal of P.  An atom whose EMA mass
+        # is far below the uniform target (1/N) for many steps is a
+        # candidate for revival.  Persistent so the moving average survives
+        # checkpoint resume — otherwise revival would over-fire right after
+        # a resume.
+        self.register_buffer(
+            "_col_usage_ema",
+            torch.full((dict_num,), 1.0 / dict_num, dtype=torch.float32),
+            persistent=True,
+        )
+
+        # ── Sinkhorn convergence audit (C3) ──────────────────────────────
+        # Set _audit_convergence=True externally to capture the last two
+        # log_P snapshots and report their inf-norm difference via
+        # `convergence_telemetry()`.  Off by default (no extra memory).
+        self._audit_convergence: bool = False
+        self._last_log_P: torch.Tensor | None = None
+        self._prev_log_P_diff: float = 0.0
 
     # -----------------------------------------------------------------------
     # Bounded eps — log-space exp with hard clamp
@@ -510,49 +599,182 @@ class UnifiedDictionaryAttention(nn.Module):
     # Content-adaptive per-pixel eps
     # -----------------------------------------------------------------------
 
-    def _adaptive_eps(self, C_mat: torch.Tensor) -> torch.Tensor:
+    def _adaptive_eps(
+        self,
+        C_mat: torch.Tensor,
+        range_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Return per-pixel eps shaped (B, HW, 1).
 
-        Absolute clarity (image-independent):
-            margin = cost_2nd_best − cost_best         (cost units)
-            clarity = tanh(margin / base_eps)          (∈ [0, 1))
+        ───────────────────────────────────────────────────────────────────
+        Theory: entropy-based ambiguity with FIXED reference scale
+        ───────────────────────────────────────────────────────────────────
+        Per-pixel "clarity" is derived from the entropy of a reference
+        softmax over the cost matrix:
 
-        Why absolute (not image-normalised):
-          Image-relative `clarity = margin / max_margin_in_image` always has
-          at least one pixel with clarity = 1, even when EVERY pixel is
-          ambiguous (OOD content where dict atoms all match poorly).  That
-          masks the OOD case — which is exactly the failure mode behind the
-          catastrophic-PSNR Kodak images.  Using tanh(margin / base_eps)
-          makes clarity ≈ 0 across the whole image when margins are small
-          relative to the routing temperature, so OOD pixels all get max
-          softness.
+            P_ref = softmax( -C_mat / CLARITY_REF, dim=-1 )   (B, HW, N)
+            H_ref = -Σ_j P_ref · log2 P_ref                   (B, HW)
+            ambiguity = H_ref / log2(N)        ∈ [0, 1]
+            clarity   = 1 - ambiguity          ∈ [0, 1]
 
-          • Confident winner (margin ≫ ε):  tanh → 1   ⇒ eps_pixel = base_eps
-          • Ambiguous       (margin ≈ ε):   tanh ≈ tanh(1) ≈ 0.76
-          • OOD             (margin ≪ ε):  tanh → 0   ⇒ eps_pixel = range·base_eps
+        Why entropy (A2 fix), not top-2 margin
+          Top-2 margin confuses "well-matched to two similar atoms"
+          (sharp routing among redundant atoms — fine) with "no good
+          atom" (true ambiguity).  Full-distribution entropy captures
+          the actual shape, so two similar atoms with a clear winner
+          group still yield low ambiguity → sharp eps.
 
-        clarity is computed under no_grad — gradient flows only through
-        the learnable `log_adaptive_range` scalar, keeping Sinkhorn
-        differentiation clean.
+        Why fixed CLARITY_REF, not learnable base_eps (A3 fix)
+          A learnable normalisation creates a feedback loop: optimiser
+          drives base_eps down → clarity inflates → fewer pixels get
+          softened → behaviour collapses back toward scalar eps.  Tying
+          to a fixed cost-matrix-bound constant guarantees clarity is a
+          STATIONARY feature of routing difficulty.
+
+        Why clamp adaptive_range (B1 fix)
+          Unbounded range lets the optimiser stretch ambiguous pixels'
+          eps arbitrarily wide, producing near-uniform P that inflates
+          H_col (faking compliance with β_col) while destroying
+          compression.  Soft-clamp via tanh keeps the gradient alive
+          near the cap, unlike a hard clamp.
+
+        Parameters
+        ----------
+        C_mat       : (B, HW, N) — Sinkhorn cost matrix
+        range_bias  : optional (B,) or (B, 1) tensor added to
+                      `log_adaptive_range` per image (C1: image-
+                      conditional range from hyperprior pooling).
+
+        Gradient note
+        -------------
+        `clarity` is computed under no_grad so the only learnable knob
+        is `log_adaptive_range` (and optionally `range_bias`).  This
+        keeps the Sinkhorn iterations' Jacobian clean — eps_pixel
+        gradients are 1-D rather than per-pixel.
         """
         base_eps = self._eps()
         with torch.no_grad():
-            k = min(2, C_mat.shape[-1])
-            top2 = torch.topk(C_mat, k=k, dim=-1, largest=False).values  # (B,HW,k)
-            if k == 2:
-                margin = (top2[:, :, 1] - top2[:, :, 0]).clamp(min=0)
-            else:
-                margin = top2[:, :, 0].clamp(min=0)
-            # Absolute clarity: how many "eps units" is the winner ahead?
-            clarity = torch.tanh(margin / base_eps.detach().clamp(min=1e-6))
+            N = C_mat.shape[-1]
+            # Reference softmax over cost — fixed scale, no learnable.
+            P_ref = F.softmax(-C_mat / self.CLARITY_REF, dim=-1)  # (B, HW, N)
+            log2_N = math.log2(N)
+            H_ref = -(P_ref * P_ref.clamp(min=1e-12).log2()).sum(dim=-1)
+            clarity = (1.0 - H_ref / log2_N).clamp(min=0.0, max=1.0)  # (B, HW)
 
-        adaptive_range = F.softplus(self.log_adaptive_range) + 1.0  # ≥ 1
-        # eps_pixel ∈ [base_eps, range · base_eps]:
-        #   clarity = 1 ⇒ eps_pixel = base_eps
-        #   clarity = 0 ⇒ eps_pixel = range · base_eps
-        eps_pixel = base_eps * (adaptive_range - (adaptive_range - 1.0) * clarity)
-        return eps_pixel.unsqueeze(-1)  # (B, HW, 1)
+        # Optional image-conditional bias added to log_adaptive_range.
+        log_range = self.log_adaptive_range
+        if range_bias is not None:
+            # broadcast (B,) or (B,1) over (B,HW)
+            if range_bias.dim() == 1:
+                range_bias = range_bias.unsqueeze(-1)  # (B, 1)
+            log_range = log_range + range_bias        # broadcasts to (B, 1)
+
+        raw_range = F.softplus(log_range) + 1.0       # ≥ 1, unbounded
+        # Tanh soft-clamp to RANGE_CAP — preserves gradient near the cap.
+        cap = float(self.RANGE_CAP)
+        adaptive_range = 1.0 + (cap - 1.0) * torch.tanh(
+            (raw_range - 1.0) / (cap - 1.0)
+        )  # ∈ [1, RANGE_CAP)
+
+        # eps_pixel ∈ [base_eps, adaptive_range · base_eps]:
+        #   clarity = 1 ⇒ eps_pixel = base_eps     (sharp)
+        #   clarity = 0 ⇒ eps_pixel = range·eps    (soft)
+        eps_pixel = base_eps * (
+            adaptive_range - (adaptive_range - 1.0) * clarity
+        )
+
+        # Shape normalisation: ensure (B, HW, 1) regardless of broadcasting.
+        if eps_pixel.dim() == 2:
+            eps_pixel = eps_pixel.unsqueeze(-1)
+        return eps_pixel
+
+    # -----------------------------------------------------------------------
+    # B2: Dead-atom diagnostics (column-usage EMA & dead mask)
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _update_col_usage_ema(self, P: torch.Tensor) -> None:
+        """
+        EMA update of the per-atom column marginal.  Called from forward()
+        in training mode.  No grad — purely a moving statistic.
+
+        P shape: (B, HW, N).  Per-batch column marginal is averaged across
+        batch before being mixed into the EMA buffer.
+        """
+        col_mass = P.sum(dim=1)                                 # (B, N)
+        col_mass = col_mass / col_mass.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        batch_mean = col_mass.mean(dim=0).detach().to(self._col_usage_ema.dtype)
+        self._col_usage_ema.mul_(self.EMA_DECAY).add_(
+            batch_mean, alpha=1.0 - self.EMA_DECAY
+        )
+
+    @torch.no_grad()
+    def dead_atom_mask(self) -> torch.Tensor:
+        """
+        Return (N,) bool mask: True where atom is "dead" by EMA criterion.
+
+        An atom is dead if its EMA mass is below DEAD_FRACTION · (1/N).
+        Default 0.05 ⇒ atom is dead if used < 5 % of its fair share.
+        """
+        uniform = 1.0 / self.dict_num
+        return self._col_usage_ema < (self.DEAD_FRACTION * uniform)
+
+    @torch.no_grad()
+    def reset_col_usage_ema(self) -> None:
+        """Reset EMA to uniform.  Call after revival to give revived atoms
+        a clean baseline."""
+        self._col_usage_ema.fill_(1.0 / self.dict_num)
+
+    # -----------------------------------------------------------------------
+    # B3: Per-slice k_dict coherence loss
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def k_coherence_loss(k_dict: torch.Tensor) -> torch.Tensor:
+        """
+        Welch-bound-style off-diagonal coherence on the per-slice
+        post-projection dictionary k_dict = k_proj_i(dt).
+
+        k_dict shape: (B, N, D).  We L2-normalise rows and compute
+        ‖S Sᵀ − I‖² mean over off-diagonals.  Minimising it forces the
+        per-slice atoms to be near-orthogonal in cosine space — directly
+        opposes the "2-cluster" degeneracy seen in slices 1, 2 of the
+        smoke-test eval (util 14.2 % with std=0 % across images).
+
+        Note: QueryDictionaryGenerator already applies a similar penalty
+        on dt itself, but that doesn't cover what each slice's k_proj
+        DOES to dt.  This term closes the gap.
+        """
+        S = F.normalize(k_dict, p=2, dim=-1)                    # (B, N, D)
+        gram = torch.bmm(S, S.transpose(1, 2))                  # (B, N, N)
+        N = S.shape[1]
+        I = torch.eye(N, device=S.device, dtype=S.dtype).unsqueeze(0)
+        return (gram - I).pow(2).mean()
+
+    # -----------------------------------------------------------------------
+    # C3: Sinkhorn convergence audit
+    # -----------------------------------------------------------------------
+
+    def convergence_telemetry(self) -> dict:
+        """Return last recorded log_P inf-norm diff between consecutive
+        forward calls.  Only populated when `_audit_convergence=True` is
+        set externally (no-op otherwise)."""
+        return {"last_log_P_diff_inf": float(self._prev_log_P_diff)}
+
+    def _maybe_record_log_P(self, log_P: torch.Tensor) -> None:
+        if not self._audit_convergence:
+            return
+        with torch.no_grad():
+            cur = log_P.detach().to(torch.float32)
+            if (
+                self._last_log_P is not None
+                and self._last_log_P.shape == cur.shape
+            ):
+                self._prev_log_P_diff = float(
+                    (cur - self._last_log_P).abs().max()
+                )
+            self._last_log_P = cur
 
     # -----------------------------------------------------------------------
     # Softmax routing
@@ -605,6 +827,7 @@ class UnifiedDictionaryAttention(nn.Module):
         rho_spatial: torch.Tensor | None,
         calc_disp: bool = False,
         log_b_override: torch.Tensor | None = None,
+        range_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """
         log_b_override : optional (B, 1, N) tensor.  When supplied, the column
@@ -624,7 +847,13 @@ class UnifiedDictionaryAttention(nn.Module):
         # Per-pixel eps shared by all routing modes.  In unbalanced_eot it
         # only re-scales M; shrink/clamp constants keep scalar eps for
         # mathematical / convergence reasons (see _route_unbalanced_eot).
-        eps_pixel = self._adaptive_eps(C_mat)
+        # Disabled when use_adaptive_eps=False — pass None so routing
+        # functions fall back to scalar eps (C2 ablation control).
+        eps_pixel = (
+            self._adaptive_eps(C_mat, range_bias=range_bias)
+            if self.use_adaptive_eps
+            else None
+        )
 
         if self.routing_mode == "softmax":
             P = self._route_softmax(C_mat, eps_pixel=eps_pixel)
@@ -645,6 +874,18 @@ class UnifiedDictionaryAttention(nn.Module):
             P = P * HW
         else:
             raise RuntimeError(f"Unknown routing_mode: {self.routing_mode!r}")
+
+        # B2: maintain column-usage EMA during training (cheap, no-grad).
+        # Skip in eval to keep statistics stable across runs.
+        if self.training:
+            self._update_col_usage_ema(P)
+
+        # C3: optional convergence audit — record log_P inf-norm diff
+        # between consecutive forwards (helps verify that per-pixel eps in
+        # M does not break Sinkhorn fixed-point convergence empirically).
+        if self._audit_convergence:
+            # P = exp(log_P) clamped; use log(P) for the audit norm.
+            self._maybe_record_log_P(P.clamp(min=1e-30).log())
 
         if not self.training and self.store_attn_probs:
             self.attn_probs = P.detach()

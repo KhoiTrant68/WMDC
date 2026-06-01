@@ -245,6 +245,9 @@ class WMDC(CompressionModel):
         use_wls_shortcut: bool = False,
         use_conditional_marginals: bool = False,
         cond_alpha: float = 0.5,
+
+        use_adaptive_eps: bool = True,
+        image_conditional_range: bool = True,
     ):
         super().__init__()
         self.N = N
@@ -276,6 +279,18 @@ class WMDC(CompressionModel):
             "balanced_eot",
             "unbalanced_eot",
         }
+
+        # ── C2: adaptive-eps master switch ───────────────────────────────
+        self.use_adaptive_eps = bool(use_adaptive_eps)
+        # ── C1: image-conditional adaptive_range bias ───────────────────
+        # When enabled, a per-slice tiny MLP predicts a scalar bias added
+        # to that slice's `log_adaptive_range` from a global summary of
+        # the hyperprior.  Lets simple images use a tighter spread (closer
+        # to scalar eps) and complex images a wider spread.  Wired only
+        # if adaptive eps is on — pointless otherwise.
+        self.image_conditional_range = (
+            bool(image_conditional_range) and self.use_adaptive_eps
+        )
 
         # DDP-safe, never silently reset on checkpoint resume.
         self.register_buffer("_use_ste_flag", torch.zeros(1, dtype=torch.bool))
@@ -438,10 +453,32 @@ class WMDC(CompressionModel):
                     routing_mode=routing_mode,
                     marginal_div=marginal_div,
                     tv_weight=tv_weight,
+                    use_adaptive_eps=self.use_adaptive_eps,
                 )
                 for i in range(num_slices)
             ]
         )
+
+        # ── C1: per-slice range-bias predictors ─────────────────────────
+        # Tiny MLP from pooled hyperprior summary → scalar log-range bias.
+        # Pool is (B, 2*N) after AdaptiveAvgPool2d(1) on the (B, 2*N, H, W)
+        # hyperprior; predictor input is fixed 2*N so it's slice-agnostic
+        # in shape but learned independently per slice.  Output clamped
+        # via tanh to ±1.0 (small enough not to override the global
+        # log_adaptive_range parameter).
+        if self.image_conditional_range:
+            self.range_bias_predictors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(2 * N, 32),
+                        nn.GELU(),
+                        nn.Linear(32, 1),
+                    )
+                    for _ in range(num_slices)
+                ]
+            )
+        else:
+            self.range_bias_predictors = None
 
         # ── Gated memory updaters (num_slices − 1, last slice has no successor) ─
         # Only created in stateful mode; dense-concat has no memory to update.
@@ -567,6 +604,59 @@ class WMDC(CompressionModel):
         if not terms:
             return torch.zeros((), device=next(self.parameters()).device)
         return torch.stack(terms).mean()
+
+    # =========================================================================
+    # B2 — Dead-atom revival (called periodically from the training loop)
+    # =========================================================================
+
+    @torch.no_grad()
+    def revive_dead_atoms(self, agreement: int | None = None) -> int:
+        """
+        Aggregate per-slice dead-atom masks; atoms flagged dead by at
+        least `agreement` slices are revived in QueryDictionaryGenerator.
+
+        Parameters
+        ----------
+        agreement : int | None
+            How many slices must agree an atom is dead before revival.
+            Default = num_slices (atom must be dead EVERYWHERE — most
+            conservative).  Set to e.g. num_slices // 2 + 1 for majority
+            voting (more aggressive revival).
+
+        Returns the number of atoms revived.
+
+        After revival, every slice's column-usage EMA is reset to give
+        the new atoms a fresh start in the dead-detector accounting.
+        """
+        if agreement is None:
+            agreement = self.num_slices
+        masks = []
+        for attn in self.eot_attentions:
+            masks.append(attn.dead_atom_mask())
+        if not masks:
+            return 0
+        stacked = torch.stack(masks, dim=0).int().sum(dim=0)  # (N,)
+        global_dead = stacked >= int(agreement)
+        n_revived = self.hyper_to_dict.revive_queries(global_dead)
+        if n_revived > 0:
+            for attn in self.eot_attentions:
+                attn.reset_col_usage_ema()
+        return int(n_revived)
+
+    # =========================================================================
+    # B3 — Per-slice k_dict coherence loss
+    # =========================================================================
+
+    def slice_coherence_loss(self) -> torch.Tensor:
+        """Sum of k_dict_i coherence losses from the LAST forward pass.
+
+        Populated by `forward()` via `self._last_slice_coherence`.  Returns
+        zero before any forward call (e.g., during model construction tests).
+        """
+        v = getattr(self, "_last_slice_coherence", None)
+        if v is None:
+            return torch.zeros((), device=next(self.parameters()).device)
+        return v
 
     def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
         """Run g_a, optionally with WLS multi-scale shortcuts.
@@ -888,10 +978,18 @@ class WMDC(CompressionModel):
         total_col_neg_H = zero
         total_row_H = zero
         total_tv = zero
+        total_slice_coh = zero  # B3: per-slice k_dict coherence accumulator
         row_mass_list: list[torch.Tensor] = []
         # Running mean of column marginals over previously-decoded slices
         # (no_grad — only used to build log_b for the next slice).
         cum_col_usage: torch.Tensor | None = None
+
+        # C1: pooled hyperprior summary for image-conditional range bias.
+        # AdaptiveAvgPool2d(1) → (B, 2N) — one summary per image.
+        if self.image_conditional_range and self.range_bias_predictors is not None:
+            pooled_hp = hyper_prior.mean(dim=(-2, -1))  # (B, 2N)
+        else:
+            pooled_hp = None
 
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
@@ -922,6 +1020,15 @@ class WMDC(CompressionModel):
             log_b_override = self._conditional_log_b(
                 cum_col_usage, query.size(0), query.device, query.dtype
             )
+            # C1: image-conditional log_adaptive_range bias from pooled hp.
+            # tanh-bounded to ±1.0 (sub-octave bias on top of the global
+            # learnable scalar).  None when image-conditional is disabled.
+            if pooled_hp is not None:
+                range_bias_i = torch.tanh(
+                    self.range_bias_predictors[i](pooled_hp).squeeze(-1)
+                )
+            else:
+                range_bias_i = None
             dict_info, attn_aux = self.eot_attentions[i](
                 query,
                 k_dict,
@@ -929,7 +1036,14 @@ class WMDC(CompressionModel):
                 rho_spatial,
                 calc_disp=self.training,
                 log_b_override=log_b_override,
+                range_bias=range_bias_i,
             )
+
+            # B3: accumulate per-slice k_dict coherence (cheap, ~N² flops).
+            if self.training:
+                total_slice_coh = total_slice_coh + (
+                    UnifiedDictionaryAttention.k_coherence_loss(k_dict)
+                )
 
             # Safety guard: if the EOT pipeline produced NaN/Inf (e.g. routing
             # fully collapsed to a single token and the bmm with v_norm hit a
@@ -1014,6 +1128,9 @@ class WMDC(CompressionModel):
         column_neg_entropy = total_col_neg_H / S
         row_entropy = total_row_H / S
         tv_loss = total_tv / S
+        slice_coherence = total_slice_coh / S  # B3: averaged across slices
+        # Stash for slice_coherence_loss() accessor (used by ablation tools).
+        self._last_slice_coherence = slice_coherence.detach() if not self.training else slice_coherence
         row_mass = torch.stack(row_mass_list, dim=1)  # (B, S, Hz*Wz)
 
         return {
@@ -1029,6 +1146,7 @@ class WMDC(CompressionModel):
             "row_mass": row_mass,
             "complexity": complexity,
             "dict_penalty": dict_penalty,
+            "slice_coherence": slice_coherence,
             "tv_loss": tv_loss,
         }
 
@@ -1090,6 +1208,12 @@ class WMDC(CompressionModel):
 
         cum_col_usage: torch.Tensor | None = None
 
+        # C1: pooled hyperprior summary for image-conditional range bias.
+        if self.image_conditional_range and self.range_bias_predictors is not None:
+            pooled_hp = hyper_prior.mean(dim=(-2, -1))
+        else:
+            pooled_hp = None
+
         for i, y_slice in enumerate(y_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
             rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
@@ -1108,6 +1232,11 @@ class WMDC(CompressionModel):
             log_b_override = self._conditional_log_b(
                 cum_col_usage, query.size(0), query.device, query.dtype
             )
+            range_bias_i = (
+                torch.tanh(self.range_bias_predictors[i](pooled_hp).squeeze(-1))
+                if pooled_hp is not None
+                else None
+            )
             dict_info, _aux = self.eot_attentions[i](
                 query,
                 k_dict,
@@ -1115,6 +1244,7 @@ class WMDC(CompressionModel):
                 rho_spatial,
                 calc_disp=False,
                 log_b_override=log_b_override,
+                range_bias=range_bias_i,
             )
 
             # NaN guard — parity with forward().  Without this, a single bad
@@ -1209,6 +1339,12 @@ class WMDC(CompressionModel):
 
         cum_col_usage: torch.Tensor | None = None
 
+        # C1: pooled hyperprior summary for image-conditional range bias.
+        if self.image_conditional_range and self.range_bias_predictors is not None:
+            pooled_hp = hyper_prior.mean(dim=(-2, -1))
+        else:
+            pooled_hp = None
+
         for i in range(self.num_slices):
             rho_out = self._compute_rho_spatial(i, hyper_prior, y_hat_slices)
             rho_spatial = rho_out if self.routing_mode == "unbalanced_eot" else None
@@ -1227,6 +1363,11 @@ class WMDC(CompressionModel):
             log_b_override = self._conditional_log_b(
                 cum_col_usage, query.size(0), query.device, query.dtype
             )
+            range_bias_i = (
+                torch.tanh(self.range_bias_predictors[i](pooled_hp).squeeze(-1))
+                if pooled_hp is not None
+                else None
+            )
             dict_info, _aux = self.eot_attentions[i](
                 query,
                 k_dict,
@@ -1234,6 +1375,7 @@ class WMDC(CompressionModel):
                 rho_spatial,
                 calc_disp=False,
                 log_b_override=log_b_override,
+                range_bias=range_bias_i,
             )
 
             # NaN guard — parity with forward() and compress().  Must match

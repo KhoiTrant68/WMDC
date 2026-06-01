@@ -66,6 +66,7 @@ def measure_convergence(
     max_iters: int,
     *,
     eps_value: float | None = None,
+    use_adaptive_eps: bool | None = None,
 ) -> dict:
     """
     For iter counts 1..max_iters, run the unbalanced Sinkhorn solver on
@@ -116,22 +117,38 @@ def measure_convergence(
     kl_col_costs: list[float] = []
 
     # Determine effective epsilon.
+    # NOTE: _eps() in the current code is exp(log_eps).clamp(EPS_FLOOR,EPS_CAP).
+    # The previous `softplus(log_eps)+0.01` mapping was from a legacy
+    # parameterisation — using it here gave the wrong eps_val for the KL
+    # primal-cost reporting.  Switch to the production `_eps()` directly.
     if eps_value is None:
-        eps_val = F.softplus(attn.log_eps).item() + 0.01
+        eps_val = float(attn._eps().detach().item())
     else:
         eps_val = eps_value
 
     # Save and override solver state so we can sweep iter count.
     original = (attn.iters, attn.n_grad_iters, attn.n_nograd_iters)
     if eps_value is not None:
-        # Temporarily override learned eps. We rebuild from log_eps so we
-        # can restore exactly.
+        # Temporarily override learned eps via the current `exp(log_eps)`
+        # parameterisation: log_eps ← log(target).
         original_log_eps = attn.log_eps.detach().clone()
-        # log_eps + 0.01 → softplus^{-1}(eps - 0.01)
-        target_softplus = max(eps_value - 0.01, 1e-6)
-        new_log = torch.log(torch.exp(torch.tensor(target_softplus)) - 1.0)
+        new_log = torch.tensor(
+            torch.log(torch.tensor(max(eps_value, 1e-6))).item(),
+            dtype=attn.log_eps.dtype,
+            device=attn.log_eps.device,
+        )
         with torch.no_grad():
             attn.log_eps.copy_(new_log)
+
+    # C3: optionally toggle adaptive eps for this measurement.
+    original_use_adaptive_eps = attn.use_adaptive_eps
+    if use_adaptive_eps is not None:
+        attn.use_adaptive_eps = bool(use_adaptive_eps)
+
+    # Compute eps_pixel ONCE (it depends on C_mat only); pass into
+    # _route_unbalanced_eot so each iter-count solve uses the same
+    # temperature schedule.
+    eps_pixel = attn._adaptive_eps(C_mat) if attn.use_adaptive_eps else None
 
     try:
         for n in iter_counts:
@@ -140,7 +157,9 @@ def measure_convergence(
             attn.n_nograd_iters = 0
 
             with torch.no_grad():
-                P = attn._route_unbalanced_eot(C_mat, rho_flat)
+                P = attn._route_unbalanced_eot(
+                    C_mat, rho_flat, eps_pixel=eps_pixel
+                )
 
                 transport = (C_mat * P).sum(dim=(1, 2))  # (B,)
 
@@ -168,6 +187,7 @@ def measure_convergence(
         if eps_value is not None:
             with torch.no_grad():
                 attn.log_eps.copy_(original_log_eps)
+        attn.use_adaptive_eps = original_use_adaptive_eps
 
     final = primal_costs[-1] if primal_costs else float("nan")
     return {
@@ -179,6 +199,11 @@ def measure_convergence(
         "relative_primal": [c / (final + 1e-12) for c in primal_costs],
         "eps_value": eps_val,
         "final_cost": final,
+        "use_adaptive_eps": bool(
+            use_adaptive_eps
+            if use_adaptive_eps is not None
+            else original_use_adaptive_eps
+        ),
     }
 
 
@@ -220,6 +245,19 @@ def main():
         dest="use_wls_shortcut",
         help="Enable WLS/iWLS multi-scale shortcuts (must match checkpoint).",
     )
+    p.add_argument(
+        "--adaptive-eps-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off", "both"],
+        help=(
+            "C3 patch: sweep the adaptive-eps switch alongside ε.  "
+            "'auto' → respect the loaded model's setting; "
+            "'on'/'off' → force; "
+            "'both' → run the eps sweep TWICE, once with adaptive off and "
+            "once on, so you can compare convergence trajectories."
+        ),
+    )
     args = p.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
@@ -237,22 +275,43 @@ def main():
     )
     _x, x_padded, _H, _W = load_image(args.image, device=device)
 
+    if args.adaptive_eps_mode == "off":
+        adaptive_modes = [False]
+    elif args.adaptive_eps_mode == "on":
+        adaptive_modes = [True]
+    elif args.adaptive_eps_mode == "both":
+        adaptive_modes = [False, True]
+    else:  # auto
+        adaptive_modes = [None]  # None = respect model state
+
     all_results = {}
-    for eps in args.eps_sweep:
-        print(f"\n== ε = {eps} ==")
-        res = measure_convergence(model, x_padded, args.max_iters, eps_value=eps)
-        all_results[f"{eps:.4f}"] = res
-        costs = res["primal_cost"]
-
-        def _cost_at(n: int) -> str:
-            return f"{costs[n - 1]:.6f}" if n <= len(costs) else "n/a"
-
-        print(
-            f"  cost @ iter 3:  {_cost_at(3)}\n"
-            f"  cost @ iter 10: {_cost_at(10)}\n"
-            f"  cost @ iter 20: {_cost_at(20)}\n"
-            f"  cost @ iter {args.max_iters}: {res['final_cost']:.6f}"
+    for adaptive in adaptive_modes:
+        tag = (
+            "adaptive" if adaptive is True
+            else "scalar"   if adaptive is False
+            else "model"
         )
+        for eps in args.eps_sweep:
+            print(f"\n== mode={tag}  ε = {eps} ==")
+            res = measure_convergence(
+                model,
+                x_padded,
+                args.max_iters,
+                eps_value=eps,
+                use_adaptive_eps=adaptive,
+            )
+            all_results[f"{tag}_{eps:.4f}"] = res
+            costs = res["primal_cost"]
+
+            def _cost_at(n: int) -> str:
+                return f"{costs[n - 1]:.6f}" if n <= len(costs) else "n/a"
+
+            print(
+                f"  cost @ iter 3:  {_cost_at(3)}\n"
+                f"  cost @ iter 10: {_cost_at(10)}\n"
+                f"  cost @ iter 20: {_cost_at(20)}\n"
+                f"  cost @ iter {args.max_iters}: {res['final_cost']:.6f}"
+            )
 
     # ── Plot ─────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))

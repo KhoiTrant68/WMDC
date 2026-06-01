@@ -136,6 +136,7 @@ class RateDistortionLoss(nn.Module):
         alignment_margin: float = 0.2,
         dict_penalty_weight: float = 0.1,
         ortho_weight: float = 0.01,
+        slice_coherence_weight: float = 0.01,
     ):
         super().__init__()
         self.mse = nn.MSELoss()
@@ -147,6 +148,7 @@ class RateDistortionLoss(nn.Module):
         self.alignment_margin = float(alignment_margin)
         self.dict_penalty_weight = float(dict_penalty_weight)
         self.ortho_weight = float(ortho_weight)
+        self.slice_coherence_weight = float(slice_coherence_weight)
 
         if metric == "ms-ssim" and lmbda < 1.0:
             warnings.warn(
@@ -284,6 +286,13 @@ class RateDistortionLoss(nn.Module):
             if self.training and self.ortho_weight > 0.0:
                 loss = loss + self.ortho_weight * ortho
 
+        # ── Per-slice k_dict coherence (B3 patch) ──────────────────────────
+        sc = output.get("slice_coherence")
+        if sc is not None:
+            out["slice_coherence"] = sc.detach() if sc.requires_grad else sc
+            if self.training and self.slice_coherence_weight > 0.0:
+                loss = loss + self.slice_coherence_weight * sc
+
         out["loss"] = loss
         return out
 
@@ -369,6 +378,31 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(main_params, clip_max_norm)
         optimizer.step()
         aux_optimizer.step()
+
+        # B2: periodic dead-atom revival.
+        # Done on rank-0 only (random ops would diverge across ranks),
+        # then dict_queries is broadcast to every rank so DDP stays in
+        # sync.  _col_usage_ema is a registered persistent buffer →
+        # accelerate's broadcast_buffers handles its sync on next fwd.
+        revive_n = getattr(args, "revive_every_n_steps", 0)
+        if revive_n and revive_n > 0 and (i + 1) % revive_n == 0:
+            unwrapped = accelerator.unwrap_model(model)
+            agreement = getattr(args, "revive_agreement", None)
+            n_rev = 0
+            if accelerator.is_main_process:
+                n_rev = unwrapped.revive_dead_atoms(agreement=agreement)
+            # Broadcast modified parameter to every rank.  Cheap (~80 KB
+            # for dict_num=128, in_dim=192).  Skip when single-process.
+            if accelerator.num_processes > 1:
+                import torch.distributed as dist
+                dist.broadcast(
+                    unwrapped.hyper_to_dict.dict_queries.data, src=0
+                )
+            accelerator.wait_for_everyone()
+            if n_rev > 0 and logger is not None:
+                logger.info(
+                    f"[revive] step {i+1}: replaced {n_rev} dead atom(s)"
+                )
 
         rd_meter.update(out_criterion["loss"].item())
         aux_meter.update(aux_loss.item())
@@ -932,6 +966,69 @@ def parse_args():
             "any prior slice are floored at b_unif·1e-2.  Default 0.5."
         ),
     )
+    # ── Adaptive eps + dictionary revival (Cụm 1-3 patches) ─────────────
+    p.add_argument(
+        "--use-adaptive-eps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="use_adaptive_eps",
+        help=(
+            "Per-pixel entropic temperature based on cost-matrix ambiguity "
+            "(entropy of softmax(-C/CLARITY_REF)).  Replaces β_row "
+            "sharpening with content-adaptive softening: OOD pixels get a "
+            "softer routing instead of collapsing to a one-hot wrong "
+            "atom.  Disable with --no-use-adaptive-eps for ablation."
+        ),
+    )
+    p.add_argument(
+        "--image-conditional-range",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="image_conditional_range",
+        help=(
+            "Per-image bias on adaptive_range from a pooled-hyperprior MLP. "
+            "Lets simple images use a tighter spread (closer to scalar eps) "
+            "and complex images a wider spread.  Ignored if "
+            "--no-use-adaptive-eps."
+        ),
+    )
+    p.add_argument(
+        "--slice-coherence-weight",
+        type=float,
+        default=0.01,
+        dest="slice_coherence_weight",
+        help=(
+            "Weight on per-slice k_dict coherence loss "
+            "‖S_i S_iᵀ − I‖² (B3 patch).  Forces each slice's "
+            "post-projection dictionary to stay near-orthogonal, "
+            "preventing the '2-cluster' degeneracy seen at slices 1, 2 "
+            "in the smoke-test eval.  Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--revive-every-n-steps",
+        type=int,
+        default=500,
+        dest="revive_every_n_steps",
+        help=(
+            "Frequency (in optimiser steps) of dead-atom revival in the "
+            "shared QueryDictionaryGenerator (B2 patch).  Atoms whose EMA "
+            "column mass is below DEAD_FRACTION·(1/N) in ALL slices get "
+            "their dt-row replaced by a noised clone of a live row.  "
+            "Set 0 to disable revival."
+        ),
+    )
+    p.add_argument(
+        "--revive-agreement",
+        type=int,
+        default=None,
+        dest="revive_agreement",
+        help=(
+            "How many slices must agree an atom is dead before it is "
+            "revived.  Default = num_slices (most conservative — atom is "
+            "dead EVERYWHERE).  Lower = more aggressive revival."
+        ),
+    )
     p.add_argument(
         "--memory-init",
         type=str,
@@ -1114,6 +1211,8 @@ def main():
         use_wls_shortcut=args.use_wls_shortcut,
         use_conditional_marginals=args.use_conditional_marginals,
         cond_alpha=args.cond_alpha,
+        use_adaptive_eps=args.use_adaptive_eps,
+        image_conditional_range=args.image_conditional_range,
     )
 
     optimizer, aux_optimizer = configure_optimizers(model, args)
@@ -1133,6 +1232,7 @@ def main():
         alignment_margin=args.alignment_margin,
         dict_penalty_weight=args.dict_penalty_weight,
         ortho_weight=args.ortho_weight,
+        slice_coherence_weight=args.slice_coherence_weight,
     ).to(accelerator.device)
 
     (

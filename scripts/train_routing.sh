@@ -60,6 +60,18 @@ train_mode() {
     #                 train.py default (0.1) is too weak; the dict
     #                 utilisation experiments showed it pegs at ~21–26 %
     #                 and slices 1–2 degenerate to ~2 effective atoms.
+    #
+    # Adaptive-eps cụm 1–3 patches:
+    #   --slice-coherence-weight 0.01 : B3 — per-slice k_dict orthogonality.
+    #                                   Direct counter to the 2-cluster
+    #                                   degeneracy at slices 1, 2.
+    #   --revive-every-n-steps 500    : B2 — dead-atom revival.  Atoms
+    #                                   below 5 % of fair share in EVERY
+    #                                   slice get re-init from a live row.
+    #   --use-adaptive-eps            : C2 — per-pixel ε with entropy-
+    #                                   based ambiguity, fixed CLARITY_REF.
+    #   --image-conditional-range     : C1 — per-image bias on
+    #                                   log_adaptive_range from pooled hp.
     # shellcheck disable=SC2086
     $LAUNCHER train.py \
         -d "$TRAIN_DATA" \
@@ -74,6 +86,10 @@ train_mode() {
         --ortho-weight "${ORTHO_WEIGHT:-0.01}" \
         --column-entropy-weight 0.3 \
         --row-entropy-weight 0.0 \
+        --slice-coherence-weight 0.01 \
+        --revive-every-n-steps 500 \
+        --use-adaptive-eps \
+        --image-conditional-range \
         $arch_flags \
         $resume_flag
 
