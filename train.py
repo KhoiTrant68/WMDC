@@ -810,7 +810,7 @@ def parse_args():
     p.add_argument(
         "--column-entropy-weight",
         type=float,
-        default=0.05,
+        default=0.1,
         help=(
             "β_col: weight on column_neg_entropy = −H_col (bits).  "
             "Positive → MAXIMISE H_col (anti-collapse).  Critical: with the "
@@ -826,7 +826,7 @@ def parse_args():
     p.add_argument(
         "--row-entropy-weight",
         type=float,
-        default=0.05,
+        default=0.3,
         help=(
             "β_row: weight on row_entropy = H_row (bits).  "
             "Positive → MINIMISE H_row (sparse per-pixel selection).  "
@@ -966,7 +966,7 @@ def parse_args():
     p.add_argument(
         "--eps-warmup-epochs",
         type=int,
-        default=5,
+        default=2,
         help=(
             "Linearly anneal the eps warm-up bias from --eps-warmup-init-bias "
             "to 0 over the first N epochs.  With the high-contrast cost matrix "

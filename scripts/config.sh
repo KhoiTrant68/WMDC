@@ -6,7 +6,7 @@
 
 # ── Paths (edit me) ─────────────────────────────────────────────────
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TRAIN_DATA="/kaggle/input/datasets/khitrnminh/dataset-20000-test/dataset"
+TRAIN_DATA="/kaggle/input/datasets/tranjohan/data-1000-test/dataset_1000_test"
 KODAK_DIR="/kaggle/input/datasets/khitrnminh/kodak-test"
 CHECKPOINT_ROOT="$REPO/wmdc_runs"
 RESULTS_DIR="$REPO/results"
