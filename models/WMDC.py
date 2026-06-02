@@ -27,6 +27,7 @@ def _make_backbone(
     drop_path: float = 0.1,
     use_content_adaptive: bool = False,
     cluster_num: int = 8,
+    use_layer_scale: bool = True,
 ) -> nn.Module:
     """
     Construct an FDM-replacement block by name. Used by the Table 2
@@ -38,6 +39,7 @@ def _make_backbone(
             drop_path=drop_path,
             use_content_adaptive=use_content_adaptive,
             cluster_num=cluster_num,
+            use_layer_scale=use_layer_scale,
         )
     # Lazy import — the ablation_models package only needs to exist when
     # a non-FDM backbone is requested.
@@ -248,6 +250,12 @@ class WMDC(CompressionModel):
 
         use_adaptive_eps: bool = True,
         image_conditional_range: bool = True,
+        # ── ε-scaled OT router + weighted dict + bounded dict_info ─────
+        use_eps_scaling: bool = True,
+        eps_scaling_levels: int = 5,
+        use_weighted_dict: bool = True,
+        # ── LayerScale residual on FrequencyDisentangledMamba ──────────
+        use_layer_scale: bool = True,
     ):
         super().__init__()
         self.N = N
@@ -282,6 +290,11 @@ class WMDC(CompressionModel):
 
         # ── C2: adaptive-eps master switch ───────────────────────────────
         self.use_adaptive_eps = bool(use_adaptive_eps)
+        # ── ε-scaling / weighted-dict / LayerScale flags ─────────────────
+        self.use_eps_scaling = bool(use_eps_scaling)
+        self.eps_scaling_levels = int(eps_scaling_levels)
+        self.use_weighted_dict = bool(use_weighted_dict)
+        self.use_layer_scale = bool(use_layer_scale)
         # ── C1: image-conditional adaptive_range bias ───────────────────
         # When enabled, a per-slice tiny MLP predicts a scalar bias added
         # to that slice's `log_adaptive_range` from a global summary of
@@ -307,6 +320,7 @@ class WMDC(CompressionModel):
                 drop_path=0.1,
                 use_content_adaptive=use_content_adaptive,
                 cluster_num=cluster_num,
+                use_layer_scale=self.use_layer_scale,
             ),
             conv(N, N, kernel_size=5, stride=2),
             _make_backbone(
@@ -315,6 +329,7 @@ class WMDC(CompressionModel):
                 drop_path=0.1,
                 use_content_adaptive=use_content_adaptive,
                 cluster_num=cluster_num,
+                use_layer_scale=self.use_layer_scale,
             ),
             conv(N, N, kernel_size=5, stride=2),
             _make_backbone(
@@ -323,6 +338,7 @@ class WMDC(CompressionModel):
                 drop_path=0.1,
                 use_content_adaptive=use_content_adaptive,
                 cluster_num=cluster_num,
+                use_layer_scale=self.use_layer_scale,
             ),
             conv(N, M, kernel_size=5, stride=2),
         )
@@ -336,6 +352,7 @@ class WMDC(CompressionModel):
                 drop_path=0.1,
                 use_content_adaptive=use_content_adaptive,
                 cluster_num=cluster_num,
+                use_layer_scale=self.use_layer_scale,
             ),
             deconv(N, N, kernel_size=5, stride=2),
             _make_backbone(
@@ -344,6 +361,7 @@ class WMDC(CompressionModel):
                 drop_path=0.1,
                 use_content_adaptive=use_content_adaptive,
                 cluster_num=cluster_num,
+                use_layer_scale=self.use_layer_scale,
             ),
             deconv(N, N, kernel_size=5, stride=2),
             _make_backbone(
@@ -352,6 +370,7 @@ class WMDC(CompressionModel):
                 drop_path=0.1,
                 use_content_adaptive=use_content_adaptive,
                 cluster_num=cluster_num,
+                use_layer_scale=self.use_layer_scale,
             ),
             deconv(N, 3, kernel_size=5, stride=2),
         )
@@ -454,6 +473,9 @@ class WMDC(CompressionModel):
                     marginal_div=marginal_div,
                     tv_weight=tv_weight,
                     use_adaptive_eps=self.use_adaptive_eps,
+                    use_eps_scaling=self.use_eps_scaling,
+                    eps_scaling_levels=self.eps_scaling_levels,
+                    use_weighted_dict=self.use_weighted_dict,
                 )
                 for i in range(num_slices)
             ]
@@ -718,6 +740,21 @@ class WMDC(CompressionModel):
         for attn in self.eot_attentions:
             attn.set_log_eps_bias(value)
 
+    def last_dt(self) -> torch.Tensor | None:
+        """Return the most recent dictionary frame `dt` (B, N, D) computed by
+        `hyper_to_dict` during forward/compress/decompress.  None until the
+        first forward.  Used by Prop. B coherence telemetry."""
+        return getattr(self, "_last_dt", None)
+
+    def coherence_stats(self) -> dict | None:
+        """Convenience wrapper: returns Welch-bound / tight-frame stats of
+        the last `dt`.  None if forward has not been called.  Forwards to
+        `QueryDictionaryGenerator.coherence_stats`."""
+        dt = self.last_dt()
+        if dt is None:
+            return None
+        return QueryDictionaryGenerator.coherence_stats(dt)
+
     def sinkhorn_telemetry(self) -> dict:
         """
         Aggregate Sinkhorn-stability telemetry across all slice attentions.
@@ -946,6 +983,10 @@ class WMDC(CompressionModel):
 
         # ── Hyper-prior ───────────────────────────────────────────────────────
         dt, dict_penalty = self.hyper_to_dict(z_hat)
+        # Stash for Prop. B coherence telemetry — detached, no grad surface.
+        # Accessor: `model.last_dt()` (used by analyze/plot_prop_b_coherence.py
+        # and the val-epoch coherence logging in train.py).
+        self._last_dt = dt.detach()
         latent_scales, latent_means = self._hyper_decode(z_hat)
         hyper_prior = torch.cat([latent_scales, latent_means], dim=1)  # (B, 2M, H, W)
         Hz, Wz = hyper_prior.shape[-2:]

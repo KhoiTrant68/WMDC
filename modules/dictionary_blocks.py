@@ -9,6 +9,20 @@ import torch.nn.functional as F
 
 from modules.utils import OLP
 
+
+class _ChannelLayerNorm(nn.Module):
+    """LayerNorm over the channel dim of a (B,C,H,W) tensor — bounds the
+    magnitude of `dict_info` so weighted aggregation cannot let it drift."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B,C,H,W) → (B,H,W,C) → norm → (B,C,H,W)
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # QueryDictionaryGenerator
 # ---------------------------------------------------------------------------
@@ -69,6 +83,63 @@ class QueryDictionaryGenerator(nn.Module):
             penalty = (sim_matrix - I).pow(2).mean()
 
         return dt * self._sqrt_dict_dim, penalty
+
+    # -----------------------------------------------------------------------
+    # Welch-bound / tight-frame coherence diagnostics (Prop. B)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    @torch.no_grad()
+    def coherence_stats(dt: torch.Tensor) -> dict:
+        """
+        Frame-theoretic diagnostics for the content-adaptive dictionary
+        `dt` of shape (B, N, D).  All quantities are averaged over the
+        batch.  Used by Prop. B's claim that `‖SSᵀ − I‖_F²` is a convex
+        surrogate that drives the frame toward the Welch bound (when
+        overcomplete, N > D) or toward orthonormality (when undercomplete,
+        N ≤ D).
+
+        Returns
+        -------
+        coherence_mu      : max_{i≠j} |⟨dᵢ,dⱼ⟩|, mean over batch.
+        welch_bound       : √((N−D)/(D(N−1))) when N > D, else 0.
+                            (Welch is a lower bound only in the
+                             overcomplete regime — undercomplete frames
+                             admit μ=0 via orthonormality.)
+        etf_gap           : max(0, μ − welch_bound).  Zero ⟺ Equiangular
+                            Tight Frame (Welch-bound equality sequence).
+        frame_potential   : Σ_{i,j} ⟨dᵢ,dⱼ⟩² = ‖SSᵀ‖_F²; minimum is
+                            max(N²/D, N) (tight frame / orthonormal).
+        tightness_ratio   : frame_potential / fp_min ∈ [1, ∞).  Equals 1
+                            ⟺ tight (Parseval) frame.
+        n_atoms, atom_dim : (N, D) for logging.
+        """
+        S = F.normalize(dt, p=2, dim=-1)                   # (B, N, D)
+        gram = torch.bmm(S, S.transpose(1, 2))             # (B, N, N)
+        B, N, _ = gram.shape
+        D = S.shape[-1]
+        eye = torch.eye(N, device=gram.device, dtype=gram.dtype).unsqueeze(0)
+        off_diag = (gram - eye).abs()                      # zeros the diagonal
+        mu = off_diag.flatten(1).amax(dim=-1).mean()       # mean of per-batch max
+
+        if N > D:
+            welch = math.sqrt(max(0.0, (N - D) / (D * (N - 1))))
+            fp_min = (N * N) / D
+        else:
+            welch = 0.0                                    # orthonormal achievable
+            fp_min = float(N)                              # SSᵀ = I_N
+
+        fp = (gram ** 2).sum(dim=(1, 2)).mean()
+        etf_gap = float(max(0.0, float(mu) - welch))
+        return {
+            "coherence_mu": float(mu),
+            "welch_bound": float(welch),
+            "etf_gap": etf_gap,
+            "frame_potential": float(fp),
+            "tightness_ratio": float(fp / max(fp_min, 1e-9)),
+            "n_atoms": int(N),
+            "atom_dim": int(D),
+        }
 
     # -----------------------------------------------------------------------
     # B2 — Atom revival
@@ -148,6 +219,11 @@ class UnifiedDictionaryAttention(nn.Module):
     DEAD_FRACTION: float = 0.05
     EMA_DECAY: float = 0.99       # column-usage EMA momentum
 
+    # ε-scaling (Schmitzer-style homotopy) constants.  Θ(ε_0)=osc(C)/ε_0
+    # ≤ 15/1 = 15 ≪ 88 keeps LSE safe at the warm-up level.
+    EPS_SCALE_EPS0: float = 1.0
+    EPS_SCALE_RATIO: float = 2.0
+
     def __init__(
         self,
         input_dim: int,
@@ -163,6 +239,9 @@ class UnifiedDictionaryAttention(nn.Module):
         store_attn_probs: bool = False,
         chunk_threshold: int = 2048,
         use_adaptive_eps: bool = True,
+        use_eps_scaling: bool = True,
+        eps_scaling_levels: int = 5,
+        use_weighted_dict: bool = True,
     ):
         super().__init__()
         self.dict_num = dict_num
@@ -172,6 +251,9 @@ class UnifiedDictionaryAttention(nn.Module):
         self.tv_weight = tv_weight
         self.chunk_threshold = chunk_threshold
         self.use_adaptive_eps = bool(use_adaptive_eps)
+        self.use_eps_scaling = bool(use_eps_scaling)
+        self.eps_scaling_levels = int(eps_scaling_levels)
+        self.use_weighted_dict = bool(use_weighted_dict)
 
         self.n_grad_iters = max(5, iters // 3)
         self.n_nograd_iters = max(0, iters - self.n_grad_iters)
@@ -202,10 +284,16 @@ class UnifiedDictionaryAttention(nn.Module):
         self.log_adaptive_range = nn.Parameter(torch.tensor(math.log(3.0)))
 
         self.q_proj = nn.Conv2d(input_dim, dict_dim, 1)
+        # Final LayerNorm bounds `dict_info` magnitude by construction —
+        # decouples the conditioning amplitude from the OT row-mass and the
+        # weighted-aggregation rescale (use_weighted_dict).  Without this,
+        # the new aggregation can let `out` drift to arbitrary scale because
+        # the row-mass gating no longer caps it.
         self.out_proj = nn.Sequential(
             nn.Conv2d(dict_dim, dict_dim, 3, 1, 1, groups=dict_dim),
             nn.GELU(),
             nn.Conv2d(dict_dim, output_dim, 1),
+            _ChannelLayerNorm(output_dim),
         )
 
         self.store_attn_probs: bool = store_attn_probs
@@ -274,6 +362,11 @@ class UnifiedDictionaryAttention(nn.Module):
         self._audit_convergence: bool = False
         self._last_log_P: torch.Tensor | None = None
         self._prev_log_P_diff: float = 0.0
+        # Populated each forward when `_audit_convergence=True`; contains
+        # `osc_M`, `log_f_diff_per_iter`, `eps_target`, `rho_col`,
+        # `theoretical_kappa`, `marginal_div`.  Used by Prop. A's empirical
+        # contraction-rate plot.
+        self._convergence_trace: dict | None = None
 
     # -----------------------------------------------------------------------
     # Bounded eps — log-space exp with hard clamp
@@ -399,16 +492,14 @@ class UnifiedDictionaryAttention(nn.Module):
         # ln(dict_dim) ≈ 6.46. This safely expands std(C) to ~0.5 without
         # blowing up the absolute bounds of the matrix.
         scale_factor = math.log(self.dict_dim) if hasattr(self, "dict_dim") else 6.5
-        cost_matrix = cos_dist * scale_factor
+        cost_matrix = F.relu(cos_dist * scale_factor)
 
-        # 3. Numerical Guardrail
-        # Explicitly clamp the matrix. This acts as an insurance policy
-        # against underflow inside the log-domain Sinkhorn iterations,
-        # completely preventing the circular wavelet artifacts.
-        max_safe_cost = 15.0
-        cost_matrix = torch.clamp(cost_matrix, min=0.0, max=max_safe_cost)
-
-        return cost_matrix
+        # 3. Smooth, 1-Lipschitz bound: C = C_max · tanh(C / C_max).  Same
+        # absolute upper bound (15) as the previous hard clamp but keeps the
+        # gradient alive on the saturated set, so contrast can still update
+        # where the old `torch.clamp` froze it.
+        C_MAX = 15.0
+        return C_MAX * torch.tanh(cost_matrix / C_MAX)
 
     # -----------------------------------------------------------------------
     # Spatial TV regularisation
@@ -510,7 +601,91 @@ class UnifiedDictionaryAttention(nn.Module):
         return log_f, log_g
 
     # -----------------------------------------------------------------------
-    # Unbalanced Sinkhorn
+    # ε-scaling homotopy helpers
+    # -----------------------------------------------------------------------
+
+    def _eps_scaling_schedule(self, eps_target: float) -> list[float]:
+        """
+        Geometric homotopy [ε_0, …, ε_L = ε_target] descending toward the
+        target.  Returns `[eps_target]` (no homotopy) when ε_target is
+        already well-conditioned (≥ EPS_SCALE_EPS0) or the feature is off.
+        """
+        if not self.use_eps_scaling or eps_target >= self.EPS_SCALE_EPS0:
+            return [eps_target]
+        sched = [eps_target]
+        e = eps_target
+        while e < self.EPS_SCALE_EPS0 and len(sched) < self.eps_scaling_levels:
+            e = min(e * self.EPS_SCALE_RATIO, self.EPS_SCALE_EPS0)
+            sched.append(e)
+        sched.reverse()  # [ε_0, …, ε_target]
+        return sched
+
+    def _ueot_marginal_fns(
+        self,
+        rho_flat: torch.Tensor,
+        rho_col: torch.Tensor,
+        eps_scalar: torch.Tensor | float,
+    ):
+        """
+        Build (col_fn, row_fn) for one level of unbalanced Sinkhorn under the
+        current marginal divergence.  These prox operators must use a SCALAR
+        eps (per-pixel eps would break fixed-point convergence), so they take
+        the level's scalar eps regardless of any per-pixel scaling on M.
+        """
+        if self.marginal_div == "kl":
+            sr = (rho_flat / (rho_flat + eps_scalar)).unsqueeze(2)  # (B,HW,1)
+            sc = rho_col / (rho_col + eps_scalar)
+            return (lambda lse: sc * lse), (lambda lse: sr * lse)
+        # TV
+        rr = (rho_flat / eps_scalar).unsqueeze(2)
+        rc = rho_col / eps_scalar
+        return (
+            lambda lse: torch.clamp(lse, -rc, rc),
+            lambda lse: torch.clamp(lse, -rr, rr),
+        )
+
+    def _run_sinkhorn(
+        self, log_f, log_g, M, log_a, log_b, n_iters, col_fn, row_fn,
+        trace: list | None = None,
+    ):
+        """
+        Optional `trace` (list) is populated with ‖log_f_{k+1} − log_f_k‖_∞
+        per iteration — used by Proposition A's empirical contraction-rate
+        check.  Pass None to skip (zero-overhead in production).
+        """
+        for _ in range(n_iters):
+            if trace is not None:
+                log_f_prev = log_f.detach()
+            lse_g = self._logsumexp_spatial(log_f - M)
+            log_g = log_b - col_fn(lse_g)
+            lse_f = (log_g - M).logsumexp(dim=2, keepdim=True)
+            log_f = log_a - row_fn(lse_f)
+            if trace is not None:
+                trace.append(float((log_f.detach() - log_f_prev).abs().max()))
+        return log_f, log_g
+
+    def _run_ueot_level(
+        self,
+        log_f, log_g, C_mat,
+        rho_flat, rho_col,
+        eps_k, eps_pixel, base_eps,
+        log_a, log_b, n_iters,
+    ):
+        # When per-pixel ε is active, scale it by the same factor as the
+        # scalar at this homotopy level so the warm-up still operates on a
+        # smoother M than the final solve.
+        if eps_pixel is not None:
+            eff = eps_pixel * (eps_k / base_eps)
+        else:
+            eff = eps_k
+        M = C_mat / eff
+        col_fn, row_fn = self._ueot_marginal_fns(rho_flat, rho_col, eps_k)
+        return self._run_sinkhorn(
+            log_f, log_g, M, log_a, log_b, n_iters, col_fn, row_fn
+        )
+
+    # -----------------------------------------------------------------------
+    # Unbalanced Sinkhorn — ε-scaling homotopy, fallback-free
     # -----------------------------------------------------------------------
 
     def _route_unbalanced_eot(
@@ -521,77 +696,112 @@ class UnifiedDictionaryAttention(nn.Module):
         eps_pixel: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Unbalanced entropic OT in log-domain.
+        Unbalanced entropic OT with Schmitzer-style ε-scaling homotopy.
+
+        No-grad warm-up sweeps ε down a geometric schedule
+        (ε_0=1.0 → … → ε_target), then a single grad-bearing solve runs at
+        ε_target.  Removes the softmax fallback in favour of a tripwire that
+        zeros offending entries — by Prop. 1 (THEORY.md) the fallback is
+        unreachable when M stays bounded, so any hit is a regression to be
+        surfaced via `sinkhorn_telemetry()`.
 
         log_b_override : optional (B, 1, N) tensor that *replaces* the uniform
                          column target marginal.  See `_route_balanced_eot`.
         eps_pixel      : optional (B, HW, 1) per-pixel epsilon from
-                         `_adaptive_eps`.  ONLY used to scale the cost matrix
-                         (M = C / eps_pixel).  The proximal coefficients
-                         `shrink_row`, `shrink_col`, and the TV clamp bounds
-                         `rpe_row`, `rpe_col` deliberately keep the SCALAR
-                         `eps`.  Reason: shrink_row = ρ/(ρ+ε) is the closed-
-                         form prox of the KL marginal penalty.  Using
-                         eps_pixel there would (a) tighten the shrink on
-                         ambiguous pixels (eps_pixel large ⇒ shrink_row
-                         small ⇒ row_mass collapses faster), accelerating
-                         the dead-routing failure mode we are trying to
-                         avoid; and (b) break the fixed-point convergence
-                         guarantee of unbalanced Sinkhorn, which requires
-                         scalar ε in the prox operator.
+                         `_adaptive_eps`.  ONLY scales the cost matrix
+                         (M = C / eps_pixel).  Proximal coefficients keep the
+                         scalar ε of the current homotopy level (fixed-point
+                         convergence requires scalar ε in the prox operator).
         """
         B, HW, N = C_mat.shape
         self._sinkhorn_calls += 1
-        eps = self._eps()
 
-        rho_col = F.softplus(self.log_rho_col) + 0.01  # strictly positive scalar
+        eps = self._eps()                                    # ε_target tensor
+        rho_col = F.softplus(self.log_rho_col) + 0.01
 
         log_a = -math.log(HW)
         log_b = log_b_override if log_b_override is not None else -math.log(N)
-        M = C_mat / (eps_pixel if eps_pixel is not None else eps)
+
+        base_eps = float(eps.detach())
+        schedule = self._eps_scaling_schedule(base_eps)      # [ε_0, …, ε_target]
 
         log_f = C_mat.new_zeros(B, HW, 1)
         log_g = C_mat.new_zeros(B, 1, N)
 
-        if self.marginal_div == "kl":
-            shrink_row = (rho_flat / (rho_flat + eps)).unsqueeze(2)  # (B, HW, 1)
-            shrink_col = rho_col / (rho_col + eps)
-            log_f, log_g = self._sinkhorn_loop(
-                log_f,
-                log_g,
-                M,
-                log_a,
-                log_b,
-                col_fn=lambda lse: shrink_col * lse,
-                row_fn=lambda lse: shrink_row * lse,
+        # Homotopy warm-up (no grad): condition potentials down to ε_target.
+        warm = schedule[:-1]
+        if warm:
+            w_iters = max(3, self.n_nograd_iters // len(warm))
+            with torch.no_grad():
+                eps_prev = None
+                for eps_k in warm:
+                    if eps_prev is not None:                 # cost-unit rescale
+                        r = eps_prev / eps_k                 # > 1 (ε shrinks)
+                        log_f, log_g = log_f * r, log_g * r
+                    log_f, log_g = self._run_ueot_level(
+                        log_f, log_g, C_mat,
+                        rho_flat, rho_col,
+                        eps_k, eps_pixel, base_eps,
+                        log_a, log_b, w_iters,
+                    )
+                    eps_prev = eps_k
+                # Final rescale from the last warm level down to ε_target.
+                r = eps_prev / base_eps
+                log_f, log_g = log_f * r, log_g * r
+
+        # Final solve at ε_target — gradient-bearing.
+        eff = eps_pixel if eps_pixel is not None else eps
+        M = C_mat / eff
+        col_fn, row_fn = self._ueot_marginal_fns(rho_flat, rho_col, eps)
+        n_final = self.n_grad_iters if self.training else self.iters
+
+        if self._audit_convergence:
+            # Prop. A audit: record per-iter ‖log_f_{k+1} − log_f_k‖_∞ for the
+            # empirical contraction rate, and the theoretical bound
+            #   κ_theo ≤ tanh(osc(M)/4) · (ρ/(ρ+ε))²
+            # against which the empirical rate must lie.
+            trace: list[float] = []
+            log_f, log_g = self._run_sinkhorn(
+                log_f, log_g, M, log_a, log_b, n_final,
+                col_fn, row_fn, trace=trace,
             )
-        else:  # tv
-            rpe_row = (rho_flat / eps).unsqueeze(2)  # (B, HW, 1)
-            rpe_col = rho_col / eps
-            log_f, log_g = self._sinkhorn_loop(
-                log_f,
-                log_g,
-                M,
-                log_a,
-                log_b,
-                col_fn=lambda lse: torch.clamp(lse, -rpe_col, rpe_col),
-                row_fn=lambda lse: torch.clamp(lse, -rpe_row, rpe_row),
+            with torch.no_grad():
+                osc_M = float((M.max() - M.min()).item())
+                rho_c = float(rho_col.item())
+                eps_v = float(eps.item())
+                # KL prox shrink factor is ρ/(ρ+ε); for TV it is 1, so the
+                # second factor is set to 1 when marginal_div == "tv".
+                shrink = rho_c / (rho_c + eps_v) if self.marginal_div == "kl" else 1.0
+                kappa_theo = math.tanh(osc_M / 4.0) * (shrink ** 2)
+            self._convergence_trace = {
+                "osc_M": osc_M,
+                "log_f_diff_per_iter": trace,
+                "eps_target": eps_v,
+                "rho_col": rho_c,
+                "theoretical_kappa": kappa_theo,
+                "marginal_div": self.marginal_div,
+            }
+        else:
+            log_f, log_g = self._run_sinkhorn(
+                log_f, log_g, M, log_a, log_b, n_final, col_fn, row_fn,
             )
 
         log_P = log_f + log_g - M
 
-        if torch.isnan(log_P).any():
+        # Tripwire: by Prop. 1 (bounded M ⇒ no divergence) this branch is
+        # unreachable.  Any hit increments the fallback counter so a
+        # regression is surfaced rather than masked by a softmax detour.
+        if not torch.isfinite(log_P).all():
             self._record_fallback(eps, M, rho_col=rho_col)
             warnings.warn(
-                f"[UnbalancedEOT/{self.marginal_div.upper()}] NaN detected "
-                f"(eps={eps.item():.4f}, rho_col={rho_col.item():.4f}, "
-                f"max|M|={float(M.abs().max()):.1f}, "
-                f"count={self.sinkhorn_divergence_count}). Falling back to softmax."
+                f"[UnbalancedEOT/{self.marginal_div.upper()}] non-finite "
+                f"log_P at ε_target={eps.item():.4f} (max|M|="
+                f"{float(M.abs().max()):.1f}, count="
+                f"{self.sinkhorn_divergence_count}). Zeroing offending entries."
             )
-            fallback_P = self._route_softmax(C_mat)
-            if self.training:
-                fallback_P = fallback_P + (rho_flat * 0.0).sum() + self.log_eps * 0.0
-            return fallback_P / HW
+            log_P = torch.nan_to_num(
+                log_P, nan=-60.0, posinf=0.0, neginf=-60.0
+            )
 
         return torch.exp(log_P.clamp(min=-60.0))
 
@@ -762,6 +972,27 @@ class UnifiedDictionaryAttention(nn.Module):
         set externally (no-op otherwise)."""
         return {"last_log_P_diff_inf": float(self._prev_log_P_diff)}
 
+    def convergence_trace(self) -> dict | None:
+        """
+        Return the per-iter Sinkhorn convergence trace from the LAST forward
+        call when `_audit_convergence=True`, else None.
+
+        Keys:
+          osc_M                — oscillation of M = C/ε at the final solve
+          log_f_diff_per_iter  — list[float], ‖log_f_{k+1} − log_f_k‖_∞ per
+                                  iteration of the grad-bearing solve
+          eps_target           — float, ε at the final solve
+          rho_col              — float, KL marginal radius
+          theoretical_kappa    — float, Prop. A bound: tanh(osc_M/4)·(ρ/(ρ+ε))²
+                                  (for KL; ·1 for TV)
+          marginal_div         — "kl" or "tv"
+
+        Empirical contraction rate is recovered from `log_f_diff_per_iter[k+1]
+        / log_f_diff_per_iter[k]` once the trace has ≥3 entries.  Plot script
+        should verify that the empirical rate stays ≤ theoretical_kappa.
+        """
+        return self._convergence_trace
+
     def _maybe_record_log_P(self, log_P: torch.Tensor) -> None:
         if not self._audit_convergence:
             return
@@ -908,7 +1139,15 @@ class UnifiedDictionaryAttention(nn.Module):
             tv_loss = self._spatial_tv(P, H, W) * self.tv_weight
 
         v_norm = F.normalize(v, p=2, dim=-1) * self._sqrt_dict_dim
-        out = torch.bmm(P, v_norm).transpose(1, 2).contiguous().view(B, -1, H, W)
+        agg = torch.bmm(P, v_norm)                                # (B, HW, dict_dim)
+        if self.use_weighted_dict:
+            # Convex combination of value atoms — decouples `out`'s magnitude
+            # from the OT row-mass.  The gating signal itself is still
+            # exposed via aux["row_mass"], so downstream code that depends
+            # on mass-as-gating still sees it.
+            denom = P.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            agg = agg / denom
+        out = agg.transpose(1, 2).contiguous().view(B, -1, H, W)
 
         zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if calc_disp:

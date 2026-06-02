@@ -125,6 +125,32 @@ VARIANTS: dict[str, dict] = {
         "--use-conditional-marginals": True,
         "--cond-alpha": 0.9,
     },
+    # ── ε-scaled OT router + weighted dict + LayerScale FDM ──────────
+    "no_eps_scaling": {
+        # Disable Schmitzer ε-scaling homotopy; falls back to a single-
+        # level Sinkhorn at ε_target.  Isolates the OT-stability gain.
+        "--no-use-eps-scaling": True,
+    },
+    "no_weighted_dict": {
+        # Drop the convex-combination aggregation; revert to the bare
+        # bmm(P, v_norm) so `out` magnitude is again tied to row-mass.
+        # Isolates the mass/magnitude decoupling claim.
+        "--no-use-weighted-dict": True,
+    },
+    "no_layer_scale": {
+        # Disable LayerScale residual on FDM (α removed).
+        "--no-use-layer-scale": True,
+    },
+    "with_row_entropy": {
+        # Re-enable β_row = 0.3 to test whether the row-entropy penalty
+        # is still useful once the ε-scaled router handles sharpness.
+        "--row-entropy-weight": 0.3,
+    },
+    "fixed_eps": {
+        # Per-pixel adaptive ε disabled — falls back to scalar ε.
+        # Pairs with `no_eps_scaling` for the full eps-stability table.
+        "--no-use-adaptive-eps": True,
+    },
 }
 
 # Order in which to run the variants (full first as the reference).
@@ -145,6 +171,12 @@ RUN_ORDER = [
     "no_ste_y",
     "full_cond_marg",
     "full_cond_marg_strong",
+    # ε-scaled OT + weighted dict + LayerScale FDM ablations
+    "no_eps_scaling",
+    "no_weighted_dict",
+    "no_layer_scale",
+    "with_row_entropy",
+    "fixed_eps",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -163,6 +195,11 @@ RUN_ORDER = [
 #   --dict-penalty-weight   <float>                     (δ: token diversity)
 #   --use-conditional-marginals                         (B8: multi-marginal OT)
 #   --cond-alpha            <float>                     (α: cross-slice coupling)
+#   --use-eps-scaling / --no-use-eps-scaling            (ε-scaling homotopy)
+#   --eps-scaling-levels    <int>                       (homotopy depth)
+#   --use-weighted-dict / --no-use-weighted-dict        (weighted aggregation)
+#   --use-layer-scale / --no-use-layer-scale            (LayerScale FDM)
+#   --use-adaptive-eps / --no-use-adaptive-eps          (per-pixel adaptive ε)
 #
 # When in doubt about a flag's effect, search train.py for the existing
 # wiring in RateDistortionLoss and follow the same pattern.

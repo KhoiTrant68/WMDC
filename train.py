@@ -756,12 +756,27 @@ def test_epoch(
             f" | Sinkhorn fb: {sk['total_fallbacks']}/{sk['total_calls']} "
             f"({100.0 * sk['fallback_rate']:.3f}%)"
         )
+        # Prop. B telemetry — Welch / tight-frame coherence of the dictionary
+        # frame from the LAST val batch (cheap, no extra forward).  Drives the
+        # paper's Section 4 figure "coherence_mu → Welch bound over epochs".
+        coh = accelerator.unwrap_model(model).coherence_stats()
+        coh_str = ""
+        if coh is not None:
+            coh_str = (
+                f" | μ(D): {coh['coherence_mu']:.4f}"
+                f" (Welch {coh['welch_bound']:.4f},"
+                f" tight {coh['tightness_ratio']:.3f})"
+            )
+            if writer is not None:
+                writer.add_scalar("Val/coherence_mu", coh["coherence_mu"], epoch)
+                writer.add_scalar("Val/tightness_ratio", coh["tightness_ratio"], epoch)
+                writer.add_scalar("Val/etf_gap", coh["etf_gap"], epoch)
         if logger:
             logger.info(
                 f"[Val] Epoch {epoch} | Loss: {loss_meter.avg:.4f} "
                 f"| PSNR(est): {psnr_meter.avg:.2f} dB "
                 f"| BPP(est): {bpp_meter.avg:.4f}"
-                f"{real_str}{gap_str}{sk_str}"
+                f"{real_str}{gap_str}{sk_str}{coh_str}"
             )
         if writer:
             writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
@@ -864,15 +879,14 @@ def parse_args():
     p.add_argument(
         "--row-entropy-weight",
         type=float,
-        default=0.3,
+        default=0.0,
         help=(
             "β_row: weight on row_entropy = H_row (bits).  "
             "Positive → MINIMISE H_row (sparse per-pixel selection).  "
-            "Reduced from 0.3 → 0.05 after the smoke test showed full "
-            "collapse to one-hot routing within 1 epoch.  At the post-fix "
-            "cost-matrix contrast (std(C)≈1), 0.05 is enough push for "
-            "sparsification while leaving the column-entropy bonus room to "
-            "keep H_col > 0.  Set 0 to disable."
+            "Default lowered to 0.0 now that the ε-scaled OT router (see "
+            "--use-eps-scaling) handles routing sharpness self-consistently; "
+            "set > 0 only to ablate whether β_row is still needed.  Set 0 "
+            "to disable."
         ),
     )
     p.add_argument(
@@ -996,6 +1010,56 @@ def parse_args():
             "--no-use-adaptive-eps."
         ),
     )
+    # ── ε-scaled OT router + weighted dict + LayerScale FDM ──────────────
+    p.add_argument(
+        "--use-eps-scaling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="use_eps_scaling",
+        help=(
+            "Schmitzer-style ε-scaling homotopy inside unbalanced Sinkhorn: "
+            "no-grad warm-up from ε_0=1.0 down to ε_target along a geometric "
+            "schedule, then a single grad-bearing solve at ε_target.  Makes "
+            "the softmax fallback unreachable (tripwire only).  Disable for "
+            "the `no_eps_scaling` ablation."
+        ),
+    )
+    p.add_argument(
+        "--eps-scaling-levels",
+        type=int,
+        default=5,
+        dest="eps_scaling_levels",
+        help=(
+            "Maximum number of homotopy levels in the ε-scaling schedule. "
+            "Geometric ratio 2.0 (class attr EPS_SCALE_RATIO); at default 5 "
+            "the schedule covers ε_target up to 16× ε_target before being "
+            "capped at EPS_SCALE_EPS0=1.0.  Ignored if --no-use-eps-scaling."
+        ),
+    )
+    p.add_argument(
+        "--use-weighted-dict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="use_weighted_dict",
+        help=(
+            "Weighted-average value aggregation: out = bmm(P, v_norm) / "
+            "row_mass instead of the bare bmm sum.  Decouples `out` "
+            "magnitude from the OT row-mass; the gating signal is still "
+            "exposed via aux['row_mass'].  Disable for `no_weighted_dict`."
+        ),
+    )
+    p.add_argument(
+        "--use-layer-scale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        dest="use_layer_scale",
+        help=(
+            "LayerScale gated residual on FrequencyDisentangledMamba: "
+            "y = x + α ⊙ (idwt(fused) − x) with α init = 1.0 (exact init "
+            "reproduces original transform), then learnable per-channel.  "
+            "Disable for the `no_layer_scale` ablation."
+        ),
+    )
     p.add_argument(
         "--slice-coherence-weight",
         type=float,
@@ -1067,14 +1131,13 @@ def parse_args():
     p.add_argument(
         "--eps-warmup-epochs",
         type=int,
-        default=2,
+        default=0,
         help=(
             "Linearly anneal the eps warm-up bias from --eps-warmup-init-bias "
-            "to 0 over the first N epochs.  With the high-contrast cost matrix "
-            "(std(C)≈1) init eps=0.1 produces extremely peaked routing, which "
-            "over-commits to random init features.  Warm-up enlarges eps in "
-            "early epochs so routing starts smooth and sharpens as features "
-            "learn.  Set 0 to disable (no warm-up)."
+            "to 0 over the first N epochs.  Default lowered to 0 now that "
+            "ε-scaling homotopy (see --use-eps-scaling) handles the smooth→"
+            "sharp transition INSIDE every Sinkhorn call, making the per-"
+            "epoch log_eps bias redundant.  Set > 0 only to ablate."
         ),
     )
     p.add_argument(
@@ -1217,6 +1280,10 @@ def main():
         cond_alpha=args.cond_alpha,
         use_adaptive_eps=args.use_adaptive_eps,
         image_conditional_range=args.image_conditional_range,
+        use_eps_scaling=args.use_eps_scaling,
+        eps_scaling_levels=args.eps_scaling_levels,
+        use_weighted_dict=args.use_weighted_dict,
+        use_layer_scale=args.use_layer_scale,
     )
 
     optimizer, aux_optimizer = configure_optimizers(model, args)

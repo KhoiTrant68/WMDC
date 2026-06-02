@@ -229,11 +229,21 @@ class FrequencyDisentangledMamba(nn.Module):
         drop_path: float = 0.1,
         use_content_adaptive: bool = False,
         cluster_num: int = 8,
+        use_layer_scale: bool = True,
     ):
         super().__init__()
         self.dwt = DWT_2D(wave="bior4.4")
         self.idwt = IDWT_2D(wave="bior4.4")
         self.dim = dim
+        self.use_layer_scale = bool(use_layer_scale)
+        if self.use_layer_scale:
+            # LayerScale gated residual: y = x + α ⊙ (idwt(fused) − x).
+            # α init = 1.0 ⇒ exactly reproduces the original transform on
+            # the first forward, then learnable per-channel so the optimiser
+            # can attenuate the block where that stabilises training.
+            self.layer_scale = nn.Parameter(torch.ones(1, dim, 1, 1))
+        else:
+            self.layer_scale = None
 
         if use_content_adaptive:
             mamba_cls = lambda: ContentAdaptiveVSSBlock(
@@ -314,7 +324,13 @@ class FrequencyDisentangledMamba(nn.Module):
         )
 
         fused = self.fusion_pw(self.fusion_act(self.fusion_dw(merged))) + merged
-        return self.idwt(fused)
+        out = self.idwt(fused)
+        if self.use_layer_scale:
+            # α gates the deviation from identity (idwt(fused) already
+            # carries the full signal via perfect reconstruction + identity-
+            # init fusion), so a naive x + α·Block would double-count x.
+            return x + self.layer_scale * (out - x)
+        return out
 
 
 # ==============================================================================

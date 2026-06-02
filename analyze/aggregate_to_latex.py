@@ -301,6 +301,12 @@ def cmd_table4(args):
         "no_bootstrap_M1": r"Bootstrap $M_1$ from $\Phi$ $\to$ zero init",
         "no_disp_bonus": r"Remove dispersion bonus $-\alpha \mathcal{H}(\bar m)$",
         "no_dict_penalty": r"Remove dictionary penalty $\beta \mathcal{P}_{\text{dict}}$",
+        # ε-scaled OT router + weighted dict + LayerScale FDM ablations
+        "no_eps_scaling": r"Disable $\varepsilon$-scaling homotopy",
+        "no_weighted_dict": r"Bare $P v$ aggregation (no row-mass divide)",
+        "no_layer_scale": r"Remove LayerScale residual on FDM",
+        "with_row_entropy": r"Re-enable $\beta_{\text{row}} = 0.3$",
+        "fixed_eps": r"Scalar $\varepsilon$ (disable per-pixel adaptive)",
     }
 
     rows_by_variant = {r["variant"]: r for r in bd["rows"]}
@@ -319,10 +325,93 @@ def cmd_table4(args):
         "no_bootstrap_M1",
         "no_disp_bonus",
         "no_dict_penalty",
+        "no_eps_scaling",
+        "no_weighted_dict",
+        "no_layer_scale",
+        "with_row_entropy",
+        "fixed_eps",
     ]:
         r = rows_by_variant.get(tag, {})
         bd_pct = r.get("bd_rate_pct")
+        # Skip rows missing from the BD-rate JSON (e.g. partial reruns) so the
+        # table renders cleanly instead of KeyError-ing on a tag that wasn't
+        # trained yet.
+        if not r:
+            continue
         line = f"\\quad {label_map[tag]} & {_fmt_pct(bd_pct)} \\\\"
+        out_lines.append(line)
+
+    out_lines += [r"\bottomrule", r"\end{tabular}"]
+    tex = "\n".join(out_lines)
+    with open(args.output_tex, "w") as f:
+        f.write(tex)
+    print(tex)
+    print(f"\nSaved → {args.output_tex}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Table-stability — numerical-stability evidence for the ε-scaled router
+# ──────────────────────────────────────────────────────────────────────────
+def cmd_table_stability(args):
+    """
+    Build the stability table: BD-rate vs full + Sinkhorn telemetry
+    (fallback_rate, mean row entropy, peak |x|) for each variant.
+
+    Inputs
+    ------
+    --bd-rate-json   : BD-rate report keyed on variant (anchor=full).
+    --telemetry-json : optional dict {variant: {fallback_rate, mean_H_row,
+                       peak_abs_x_log10}}.  Missing fields render as "—".
+    """
+    with open(args.bd_rate_json) as f:
+        bd = json.load(f)
+    telemetry = {}
+    if args.telemetry_json:
+        with open(args.telemetry_json) as f:
+            telemetry = json.load(f)
+
+    label_map = {
+        "full": r"Full WMDC (reference)",
+        "no_eps_scaling": r"\quad No $\varepsilon$-scaling homotopy",
+        "no_weighted_dict": r"\quad No weighted-dict aggregation",
+        "no_layer_scale": r"\quad No LayerScale FDM",
+        "fixed_eps": r"\quad Scalar $\varepsilon$",
+        "with_row_entropy": r"\quad With $\beta_{\text{row}} = 0.3$",
+    }
+    order = [
+        "full",
+        "no_eps_scaling",
+        "no_weighted_dict",
+        "no_layer_scale",
+        "fixed_eps",
+        "with_row_entropy",
+    ]
+
+    rows_by_variant = {r["variant"]: r for r in bd["rows"]}
+    out_lines = [
+        r"\begin{tabular}{lcccc}",
+        r"\toprule",
+        r"\textbf{Variant} & \textbf{$\Delta$ BD-rate} & "
+        r"\textbf{Fallback rate} & \textbf{Mean $H_{\text{row}}$} & "
+        r"\textbf{$\log_{10} \max |x|$} \\",
+        r"\midrule",
+    ]
+    for tag in order:
+        if tag != "full" and tag not in rows_by_variant and tag not in telemetry:
+            continue
+        bd_pct = rows_by_variant.get(tag, {}).get("bd_rate_pct")
+        t = telemetry.get(tag, {})
+        fb = t.get("fallback_rate")
+        h_row = t.get("mean_H_row")
+        peak = t.get("peak_abs_x_log10")
+        bd_str = "0.00\\,\\%" if tag == "full" else _fmt_pct(bd_pct)
+        fb_str = _fmt_num(fb, 4) if fb is not None else "—"
+        h_row_str = _fmt_num(h_row, 3) if h_row is not None else "—"
+        peak_str = _fmt_num(peak, 2) if peak is not None else "—"
+        line = (
+            f"{label_map.get(tag, tag)} & "
+            f"{bd_str} & {fb_str} & {h_row_str} & {peak_str} \\\\"
+        )
         out_lines.append(line)
 
     out_lines += [r"\bottomrule", r"\end{tabular}"]
@@ -362,6 +451,20 @@ def main():
     p4.add_argument("--bd-rate-json", required=True)
     p4.add_argument("--output-tex", required=True)
     p4.set_defaults(func=cmd_table4)
+
+    p5 = sub.add_parser("table-stability")
+    p5.add_argument("--bd-rate-json", required=True)
+    p5.add_argument(
+        "--telemetry-json",
+        default=None,
+        help=(
+            "Optional JSON {variant: {fallback_rate, mean_H_row, "
+            "peak_abs_x_log10}} from analyze/diagnose_nan.py + "
+            "trace_magnitudes.py.  Missing fields render as '—'."
+        ),
+    )
+    p5.add_argument("--output-tex", required=True)
+    p5.set_defaults(func=cmd_table_stability)
 
     args = parser.parse_args()
     args.func(args)

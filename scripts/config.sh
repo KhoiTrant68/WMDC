@@ -62,14 +62,24 @@ ORTHO_WEIGHT=0.01  # OLP orthogonality regulariser weight (0 to disable)
 #   weak_row_entropy      — β_row = 0.05 (the pre-fix default).  Shows that
 #                           the original sparsity weight was too small to
 #                           overcome Sinkhorn smoothness, motivating 0.3.
-#   no_eps_warmup         — disable the log_eps warm-up schedule.
+#   no_eps_scaling        — disable Schmitzer ε-scaling homotopy in UEOT
+#                           (single-level Sinkhorn at ε_target).
+#   no_weighted_dict      — revert to bare bmm(P,v_norm) aggregation
+#                           (no decoupling of magnitude from row-mass).
+#   no_layer_scale        — disable LayerScale residual on FDM.
+#   with_row_entropy      — re-enable β_row = 0.3 to test if the sparsity
+#                           penalty is still needed with ε-scaled routing.
+#   fixed_eps             — disable per-pixel adaptive ε (scalar ε only).
+# REMOVED: no_eps_warmup  — replaced by ε-scaling homotopy (warm-up bias
+#                           defaults to 0 now and the variant is meaningless).
 VARIANTS=(
     full
     no_ueot no_fdm no_stateful_mem no_bootstrap_M1
     no_disp_bonus no_col_entropy no_row_entropy no_alignment no_alignment_margin
     no_dict_penalty no_wls no_olp no_ste_y
     full_cond_marg full_cond_marg_strong
-    with_col_entropy weak_row_entropy no_eps_warmup
+    with_col_entropy weak_row_entropy
+    no_eps_scaling no_weighted_dict no_layer_scale with_row_entropy fixed_eps
 )
 
 # ── Tools ────────────────────────────────────────────────────────────
@@ -98,7 +108,11 @@ variant_flags() {
         full_cond_marg_strong)   echo "--use-conditional-marginals --cond-alpha 0.9" ;;
         with_col_entropy)        echo "--column-entropy-weight 0.01" ;;
         weak_row_entropy)        echo "--row-entropy-weight 0.05" ;;
-        no_eps_warmup)           echo "--eps-warmup-epochs 0" ;;
+        no_eps_scaling)          echo "--no-use-eps-scaling" ;;
+        no_weighted_dict)        echo "--no-use-weighted-dict" ;;
+        no_layer_scale)          echo "--no-use-layer-scale" ;;
+        with_row_entropy)        echo "--row-entropy-weight 0.3" ;;
+        fixed_eps)               echo "--no-use-adaptive-eps" ;;
         *) echo "ERROR: unknown variant $1" >&2; return 1 ;;
     esac
 }
@@ -120,11 +134,25 @@ variant_eval_flags() {
         no_wls)                  echo "__SKIP_WLS__" ;;
         full_cond_marg)          echo "--use-conditional-marginals --cond-alpha 0.5" ;;
         full_cond_marg_strong)   echo "--use-conditional-marginals --cond-alpha 0.9" ;;
+        # Architectural variants from the ε-scaled OT router patch:
+        #   no_layer_scale removes a Parameter (FDM α);
+        #   no_weighted_dict changes the aggregation magnitude regime;
+        #   fixed_eps disables _adaptive_eps wiring.
+        # All three must be replayed at eval time so the rebuilt model
+        # matches the trained state_dict.
+        no_layer_scale)          echo "--no-use-layer-scale" ;;
+        no_weighted_dict)        echo "--no-use-weighted-dict" ;;
+        fixed_eps)               echo "--no-use-adaptive-eps" ;;
+        # no_eps_scaling: only the solver schedule changes (no new/missing
+        # params), so eval can use the default (homotopy enabled) — but to
+        # reproduce the trained convergence trajectory exactly we still
+        # replay the flag.
+        no_eps_scaling)          echo "--no-use-eps-scaling" ;;
         # Loss-only / training-only ablations do not change inference
         # architecture — empty default is correct.  Covers: no_col_entropy,
         # no_row_entropy, no_alignment, no_alignment_margin, no_dict_penalty,
         # no_olp, no_ste_y, no_disp_bonus, with_col_entropy, weak_row_entropy,
-        # no_eps_warmup.
+        # with_row_entropy.
         *)                       echo "" ;;
     esac
 }
