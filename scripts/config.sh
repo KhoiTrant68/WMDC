@@ -41,7 +41,7 @@ ROUTING_MODES=(unbalanced_eot balanced_eot softmax)
 CONTENT_ADAPTIVE=1 # set to 0 to disable ContentAdaptiveVSSBlock
 CLUSTER_NUM=8
 USE_WLS_SHORTCUT=1 # CMIC-style wavelet multi-scale shortcut (1=on, 0=off)
-ORTHO_WEIGHT=0.01  # OLP orthogonality regulariser weight (0 to disable)
+ORTHO_WEIGHT=0.05  # OLP orthogonality regulariser weight (0 to disable)
 
 # ── Ablation variants ────────────────────────────────────────────────
 # Original 7 (Table 4) + CMIC components + Phase-B8 cond. marginals.
