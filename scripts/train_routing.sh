@@ -96,8 +96,8 @@ train_mode() {
         --lr-milestones $LR_MILESTONES \
         --last-epochs-with-ste "$LAST_EPOCHS_STE" \
         --ortho-weight "${ORTHO_WEIGHT:-0.01}" \
-        --column-entropy-weight 0.3 \
-        --row-entropy-weight 0.1 \
+        --column-entropy-weight 0 \
+        --row-entropy-weight 0 \
         --slice-coherence-weight 0.01 \
         --revive-every-n-steps 500 \
         --use-adaptive-eps \
