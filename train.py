@@ -524,19 +524,20 @@ def measure_train_inference_gap(model, batch: torch.Tensor, device: str) -> floa
 
     return psnr_train - psnr_dec
 
-
 def _bytes_from_strings(strings) -> int:
-    """Sum byte length over the nested 'strings' structure returned by compress()."""
-    n = 0
-    for s_or_list in strings:
-        if isinstance(s_or_list, (list, tuple)):
-            for s in s_or_list:
-                n += len(s)
-        else:
-            n += len(s_or_list)
-    return n
-
-
+    """Recursively sum byte lengths of all byte strings in nested structure.
+    
+    compress() returns [y_strings, z_strings] where:
+      y_strings = [[slice0_bytes], [slice1_bytes], ...]  (list of lists)
+      z_strings = [z_bytes]
+    Must recurse fully to reach the actual bytes objects.
+    """
+    if isinstance(strings, (bytes, bytearray)):
+        return len(strings)
+    if isinstance(strings, (list, tuple)):
+        return sum(_bytes_from_strings(s) for s in strings)
+    return 0
+    
 # ---------------------------------------------------------------------------
 # Validation epoch
 # ---------------------------------------------------------------------------
